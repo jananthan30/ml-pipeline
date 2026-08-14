@@ -1,0 +1,19 @@
+{
+  "name": "ml-pipeline",
+  "interface": {
+    "displayName": "ML Pipeline"
+  },
+  "plugins": [
+    {
+      "name": "ml-pipeline",
+      "source": {
+        "source": "local",
+        "path": "./"
+      },
+      "policy": {
+        "installation": "AVAILABLE"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

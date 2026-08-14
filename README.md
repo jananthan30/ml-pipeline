@@ -20,7 +20,14 @@ plugin forces a strict, data-first 16-step pipeline with explicit user-permissio
 The skill activates automatically on any ML training/tuning/evaluation task, or invoke it
 directly with `/ml-pipeline`.
 
-**Codex CLI / Kimi Code CLI**
+**Codex CLI**
+
+```
+codex plugin marketplace add jananthan30/ml-pipeline
+codex plugin add ml-pipeline@ml-pipeline
+```
+
+**Kimi Code CLI** (or Codex without plugins)
 
 ```bash
 git clone https://github.com/jananthan30/ml-pipeline && cd ml-pipeline && ./install-other-tools.sh

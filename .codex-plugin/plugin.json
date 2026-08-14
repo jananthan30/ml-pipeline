@@ -1,0 +1,10 @@
+{
+  "name": "ml-pipeline",
+  "version": "0.1.1",
+  "description": "Data-first ML discipline: forces coding agents through a strict 16-step pipeline — inspect and understand the raw data, define the prediction problem, clean, engineer, and split it BEFORE any model training — with explicit user-permission gates, marimo notebooks, and matplotlib visuals at every step.",
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "ML Pipeline",
+    "description": "Stops coding agents from jumping straight to model training. 16 strict steps, 4 permission gates, visuals at every step."
+  }
+}
