@@ -1,0 +1,18 @@
+{
+  "name": "ml-pipeline",
+  "version": "0.1.0",
+  "description": "Data-first ML discipline: forces coding agents through a strict 16-step pipeline — inspect and understand the raw data, define the prediction problem, clean, engineer, and split it BEFORE any model training — with explicit user-permission gates, marimo notebooks, and matplotlib visuals at every step.",
+  "author": {
+    "name": "Jananthan Paramsothy"
+  },
+  "keywords": [
+    "machine-learning",
+    "ml-pipeline",
+    "eda",
+    "data-cleaning",
+    "data-leakage",
+    "marimo",
+    "matplotlib",
+    "workflow-discipline"
+  ]
+}

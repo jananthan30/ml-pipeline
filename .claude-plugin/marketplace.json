@@ -1,0 +1,14 @@
+{
+  "name": "ml-pipeline",
+  "description": "Data-first ML discipline plugin: a strict 16-step pipeline with user-permission gates that stops coding agents from jumping straight to model training.",
+  "owner": {
+    "name": "Jananthan Paramsothy"
+  },
+  "plugins": [
+    {
+      "name": "ml-pipeline",
+      "source": "./",
+      "description": "Forces any ML task through inspect → EDA → problem definition → clean → engineer → split → features → preprocess → baseline → train → tune → evaluate → error analysis → final test → deploy → monitor, with explicit permission gates and marimo/matplotlib visuals."
+    }
+  ]
+}
