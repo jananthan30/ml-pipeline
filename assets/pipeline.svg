@@ -1,0 +1,169 @@
+<svg viewBox="0 0 960 660" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
+  <!-- background -->
+  <rect x="0" y="0" width="960" height="660" rx="16" fill="#f8fafc"/>
+
+  <!-- header -->
+  <rect x="24" y="20" width="912" height="66" rx="12" fill="#1e293b"/>
+  <text x="48" y="49" font-size="22" font-weight="700" fill="#ffffff">ml-pipeline</text>
+  <text x="48" y="72" font-size="13" fill="#cbd5e1">Data-first discipline for coding agents — no model training until the data is understood and you approved it.</text>
+
+  <!-- raw data chip -->
+  <rect x="24" y="100" width="100" height="26" rx="13" fill="#e2e8f0"/>
+  <text x="74" y="117" font-size="11" font-weight="700" fill="#334155" text-anchor="middle">RAW DATA</text>
+  <path d="M 124 113 L 133 113 L 130 109 M 133 113 L 130 117" stroke="#64748b" stroke-width="1.5" fill="none"/>
+
+  <!-- ================= PHASE A ================= -->
+  <rect x="24" y="136" width="218" height="266" rx="12" fill="#eff6ff" stroke="#bfdbfe"/>
+  <rect x="24" y="136" width="218" height="36" rx="12" fill="#2563eb"/>
+  <rect x="24" y="158" width="218" height="14" fill="#2563eb"/>
+  <text x="133" y="159" font-size="12" font-weight="700" fill="#ffffff" text-anchor="middle">PHASE A · UNDERSTAND</text>
+
+  <circle cx="48" cy="198" r="11" fill="#2563eb"/>
+  <text x="48" y="202" font-size="11" font-weight="700" fill="#ffffff" text-anchor="middle">1</text>
+  <text x="68" y="202" font-size="12" fill="#1f2937">Data inspection</text>
+
+  <circle cx="48" cy="240" r="11" fill="#2563eb"/>
+  <text x="48" y="244" font-size="11" font-weight="700" fill="#ffffff" text-anchor="middle">2</text>
+  <text x="68" y="244" font-size="12" fill="#1f2937">Exploratory data analysis</text>
+
+  <circle cx="48" cy="282" r="11" fill="#2563eb"/>
+  <text x="48" y="286" font-size="11" font-weight="700" fill="#ffffff" text-anchor="middle">3</text>
+  <text x="68" y="279" font-size="12" fill="#1f2937">Define the prediction</text>
+  <text x="68" y="293" font-size="12" fill="#1f2937">problem — target, metric,</text>
+  <text x="68" y="307" font-size="12" fill="#1f2937">population, horizon</text>
+
+  <text x="133" y="345" font-size="11" fill="#475569" text-anchor="middle">figures: distributions, missing</text>
+  <text x="133" y="360" font-size="11" fill="#475569" text-anchor="middle">map, correlations, target balance</text>
+
+  <!-- gate A -->
+  <rect x="24" y="416" width="218" height="34" rx="17" fill="#fef2f2" stroke="#dc2626"/>
+  <text x="133" y="437" font-size="11.5" font-weight="700" fill="#b91c1c" text-anchor="middle">⛔ GATE A — your explicit OK</text>
+
+  <!-- arrow A→B -->
+  <path d="M 242 269 L 258 269 M 258 269 L 253 264 M 258 269 L 253 274" stroke="#64748b" stroke-width="2" fill="none"/>
+
+  <!-- ================= PHASE B ================= -->
+  <rect x="262" y="136" width="218" height="266" rx="12" fill="#f0fdf4" stroke="#bbf7d0"/>
+  <rect x="262" y="136" width="218" height="36" rx="12" fill="#16a34a"/>
+  <rect x="262" y="158" width="218" height="14" fill="#16a34a"/>
+  <text x="371" y="159" font-size="12" font-weight="700" fill="#ffffff" text-anchor="middle">PHASE B · PREPARE</text>
+
+  <circle cx="286" cy="198" r="11" fill="#16a34a"/>
+  <text x="286" y="202" font-size="11" font-weight="700" fill="#ffffff" text-anchor="middle">4</text>
+  <text x="306" y="202" font-size="12" fill="#1f2937">Data cleaning</text>
+
+  <circle cx="286" cy="238" r="11" fill="#16a34a"/>
+  <text x="286" y="242" font-size="11" font-weight="700" fill="#ffffff" text-anchor="middle">5</text>
+  <text x="306" y="242" font-size="12" fill="#1f2937">Data engineering</text>
+
+  <circle cx="286" cy="278" r="11" fill="#16a34a"/>
+  <text x="286" y="282" font-size="11" font-weight="700" fill="#ffffff" text-anchor="middle">6</text>
+  <text x="306" y="275" font-size="12" font-weight="700" fill="#1f2937">Train / val / test split</text>
+  <text x="306" y="289" font-size="11" fill="#475569">before any fitting</text>
+
+  <circle cx="286" cy="318" r="11" fill="#16a34a"/>
+  <text x="286" y="322" font-size="11" font-weight="700" fill="#ffffff" text-anchor="middle">7</text>
+  <text x="306" y="322" font-size="12" fill="#1f2937">Feature engineering</text>
+
+  <circle cx="286" cy="358" r="11" fill="#16a34a"/>
+  <text x="286" y="362" font-size="11" font-weight="700" fill="#ffffff" text-anchor="middle">8</text>
+  <text x="306" y="355" font-size="12" fill="#1f2937">Preprocessing</text>
+  <text x="306" y="369" font-size="11" fill="#475569">fit on train only</text>
+
+  <!-- gate B -->
+  <rect x="262" y="416" width="218" height="34" rx="17" fill="#fef2f2" stroke="#dc2626"/>
+  <text x="371" y="437" font-size="11.5" font-weight="700" fill="#b91c1c" text-anchor="middle">⛔ GATE B — your explicit OK</text>
+
+  <!-- arrow B→C -->
+  <path d="M 480 269 L 496 269 M 496 269 L 491 264 M 496 269 L 491 274" stroke="#64748b" stroke-width="2" fill="none"/>
+
+  <!-- ================= PHASE C ================= -->
+  <rect x="500" y="136" width="218" height="266" rx="12" fill="#f5f3ff" stroke="#ddd6fe"/>
+  <rect x="500" y="136" width="218" height="36" rx="12" fill="#7c3aed"/>
+  <rect x="500" y="158" width="218" height="14" fill="#7c3aed"/>
+  <text x="609" y="159" font-size="12" font-weight="700" fill="#ffffff" text-anchor="middle">PHASE C · MODEL</text>
+
+  <circle cx="524" cy="198" r="11" fill="#7c3aed"/>
+  <text x="524" y="202" font-size="11" font-weight="700" fill="#ffffff" text-anchor="middle">9</text>
+  <text x="544" y="195" font-size="12" font-weight="700" fill="#1f2937">Baseline model first</text>
+  <text x="544" y="209" font-size="11" fill="#475569">dummy + simple model</text>
+
+  <circle cx="524" cy="240" r="11" fill="#7c3aed"/>
+  <text x="524" y="244" font-size="10" font-weight="700" fill="#ffffff" text-anchor="middle">10</text>
+  <text x="544" y="244" font-size="12" fill="#1f2937">Model training</text>
+
+  <circle cx="524" cy="282" r="11" fill="#7c3aed"/>
+  <text x="524" y="286" font-size="10" font-weight="700" fill="#ffffff" text-anchor="middle">11</text>
+  <text x="544" y="279" font-size="12" fill="#1f2937">Hyperparameter tuning</text>
+  <text x="544" y="293" font-size="11" fill="#475569">on validation only</text>
+
+  <circle cx="524" cy="324" r="11" fill="#7c3aed"/>
+  <text x="524" y="328" font-size="10" font-weight="700" fill="#ffffff" text-anchor="middle">12</text>
+  <text x="544" y="321" font-size="12" fill="#1f2937">Evaluation vs baseline</text>
+  <text x="544" y="335" font-size="11" fill="#475569">curves + contract metric</text>
+
+  <!-- gate C -->
+  <rect x="500" y="416" width="218" height="34" rx="17" fill="#fef2f2" stroke="#dc2626"/>
+  <text x="609" y="437" font-size="11.5" font-weight="700" fill="#b91c1c" text-anchor="middle">⛔ GATE C — your explicit OK</text>
+
+  <!-- arrow C→D -->
+  <path d="M 718 269 L 734 269 M 734 269 L 729 264 M 734 269 L 729 274" stroke="#64748b" stroke-width="2" fill="none"/>
+
+  <!-- ================= PHASE D ================= -->
+  <rect x="738" y="136" width="198" height="266" rx="12" fill="#fffbeb" stroke="#fde68a"/>
+  <rect x="738" y="136" width="198" height="36" rx="12" fill="#d97706"/>
+  <rect x="738" y="158" width="198" height="14" fill="#d97706"/>
+  <text x="837" y="159" font-size="12" font-weight="700" fill="#ffffff" text-anchor="middle">PHASE D · PROVE &amp; SHIP</text>
+
+  <circle cx="762" cy="198" r="11" fill="#d97706"/>
+  <text x="762" y="202" font-size="10" font-weight="700" fill="#ffffff" text-anchor="middle">13</text>
+  <text x="782" y="202" font-size="12" fill="#1f2937">Error analysis</text>
+
+  <circle cx="762" cy="240" r="11" fill="#d97706"/>
+  <text x="762" y="244" font-size="10" font-weight="700" fill="#ffffff" text-anchor="middle">14</text>
+  <text x="782" y="237" font-size="12" font-weight="700" fill="#1f2937">Final test</text>
+  <text x="782" y="251" font-size="11" fill="#475569">test set touched ONCE</text>
+
+  <circle cx="762" cy="282" r="11" fill="#d97706"/>
+  <text x="762" y="286" font-size="10" font-weight="700" fill="#ffffff" text-anchor="middle">15</text>
+  <text x="782" y="279" font-size="12" fill="#1f2937">Deployment</text>
+  <text x="782" y="293" font-size="11" fill="#475569">only when you ask</text>
+
+  <circle cx="762" cy="324" r="11" fill="#d97706"/>
+  <text x="762" y="328" font-size="10" font-weight="700" fill="#ffffff" text-anchor="middle">16</text>
+  <text x="782" y="321" font-size="12" fill="#1f2937">Monitoring +</text>
+  <text x="782" y="335" font-size="12" fill="#1f2937">retraining plan</text>
+
+  <!-- gate D -->
+  <rect x="738" y="416" width="198" height="34" rx="17" fill="#fef2f2" stroke="#dc2626"/>
+  <text x="837" y="437" font-size="11.5" font-weight="700" fill="#b91c1c" text-anchor="middle">⛔ GATE D — final report</text>
+
+  <!-- what a gate means -->
+  <rect x="24" y="470" width="912" height="58" rx="12" fill="#ffffff" stroke="#e2e8f0"/>
+  <text x="48" y="494" font-size="12" font-weight="700" fill="#1f2937">At every gate the agent stops and reports in plain language:</text>
+  <text x="48" y="514" font-size="12" fill="#475569">what it did · what it found (with figures) · what comes next — then waits for your explicit permission before continuing.</text>
+
+  <!-- guarantee chips -->
+  <rect x="24" y="546" width="200" height="30" rx="15" fill="#f1f5f9" stroke="#cbd5e1"/>
+  <text x="124" y="565" font-size="11" fill="#334155" text-anchor="middle">Test set touched exactly once</text>
+
+  <rect x="236" y="546" width="176" height="30" rx="15" fill="#f1f5f9" stroke="#cbd5e1"/>
+  <text x="324" y="565" font-size="11" fill="#334155" text-anchor="middle">All fitting on train data only</text>
+
+  <rect x="424" y="546" width="222" height="30" rx="15" fill="#f1f5f9" stroke="#cbd5e1"/>
+  <text x="535" y="565" font-size="11" fill="#334155" text-anchor="middle">Baseline before any complex model</text>
+
+  <rect x="658" y="546" width="278" height="30" rx="15" fill="#f1f5f9" stroke="#cbd5e1"/>
+  <text x="797" y="565" font-size="11" fill="#334155" text-anchor="middle">marimo notebooks + matplotlib figures per step</text>
+
+  <rect x="24" y="586" width="298" height="30" rx="15" fill="#f1f5f9" stroke="#cbd5e1"/>
+  <text x="173" y="605" font-size="11" fill="#334155" text-anchor="middle">Resumes across sessions via ml_pipeline/PIPELINE.md</text>
+
+  <rect x="334" y="586" width="300" height="30" rx="15" fill="#f1f5f9" stroke="#cbd5e1"/>
+  <text x="484" y="605" font-size="11" fill="#334155" text-anchor="middle">Temporal data → time split · repeated entities → group split</text>
+
+  <rect x="646" y="586" width="290" height="30" rx="15" fill="#f1f5f9" stroke="#cbd5e1"/>
+  <text x="791" y="605" font-size="11" fill="#334155" text-anchor="middle">"Just train it" → risk explained, explicit override logged</text>
+
+  <text x="480" y="644" font-size="10" fill="#94a3b8" text-anchor="middle">Works with Claude Code (plugin/skill) · Codex CLI · Kimi Code CLI (AGENTS.md + skill)</text>
+</svg>
