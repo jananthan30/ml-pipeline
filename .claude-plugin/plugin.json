@@ -5,6 +5,7 @@
   "author": {
     "name": "Jananthan Paramsothy"
   },
+  "license": "Apache-2.0",
   "keywords": [
     "machine-learning",
     "ml-pipeline",

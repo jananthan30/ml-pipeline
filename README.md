@@ -58,4 +58,4 @@ enforcement section to each tool's global `AGENTS.md`.
 
 ## License
 
-MIT
+Apache-2.0
