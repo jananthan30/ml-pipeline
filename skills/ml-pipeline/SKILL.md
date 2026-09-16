@@ -43,7 +43,8 @@ At each gate, STOP and give the user, in plain non-jargon language:
 2. **What was found** — key findings, with the visuals that show them.
 3. **Decisions made and why** — e.g. "dropped 312 duplicate rows", "chose time-based split
    because the data has dates".
-4. **What comes next** — the next phase's steps, in one short list.
+4. **What comes next** — the next phase's steps, in one short list. At Gate B this section
+   includes the `Model rationale:` block (format under Progress tracking).
 5. **The question** — ask for explicit permission to continue. Wait for a clear yes.
    Silence, ambiguity, or "hmm" is not a yes. If the user redirects, incorporate it.
 
@@ -74,6 +75,18 @@ After recording a gate approval in a git repository, checkpoint it:
 `git add -A && git commit -m "ml-pipeline: Gate X approved" && git tag -f gate-X`. Every approved
 phase is then a reproducible point to return to.
 
+Before recording `Gate B: approved`, PIPELINE.md must contain a model rationale in exactly this shape
+(the hook checks the five bullets exist; the user judges their content):
+
+```
+Model rationale:
+- traits: binary, 1,428 rows (small), minority 11.4%, has_datetime, no groups
+- baseline: majority-class dummy + logistic regression (class_weight=balanced)
+- candidates: gradient boosting with small trees; regularized logistic
+- ruled out: neural nets (small data); k-NN (mixed scales, weak on tabular); random split (temporal)
+- metric: PR-AUC primary, recall at fixed precision secondary
+```
+
 ## Tools: marimo notebooks + matplotlib visuals
 
 - **The workbench is a marimo notebook**, not loose scripts. Keep notebooks in
@@ -89,15 +102,25 @@ phase is then a reproducible point to return to.
 
 ## What each step must produce
 
-1. **Data inspection** — load raw data read-only. Report: rows × columns, column types,
-   first rows, memory size, unique counts, obvious junk. No modification yet.
-2. **EDA** — distributions of every variable, missing-value map, correlations,
-   target balance, time trends if temporal, group structure (repeated entities?).
-   Output: figures + a short list of hypotheses and problems spotted.
+1. **Data inspection** — copy the plugin's guard library to `ml_pipeline/guard.py` (its path is given at
+   session start; in Codex/Kimi it is `skills/ml-pipeline/lib/mlpipeline_guard.py` next to this file),
+   load the raw data read-only, and run `guard.profile(df, target=..., time_col=..., group_col=...)`.
+   Read `ml_pipeline/data_profile.json` before anything else: its `leakage_suspects` and `traits`
+   decide the split, the metric, and the model family. Report rows × columns, column kinds, missing
+   values, duplicates, and every leakage suspect. For images or text, build a manifest table first
+   (path, label, size or length) and profile that. No modification yet.
+2. **EDA** — `guard.eda_figures(df, target=..., time_col=...)` writes the required figures
+   (`01_missingness`, `02_target_balance`, `02_distributions`, `02_correlations`, `02_temporal_coverage`
+   when a date column exists) with explanations computed from the data; add any others with
+   `guard.fig(step, name, figure, explanation)`. If matplotlib is missing, install it — text
+   descriptions are not figures and the gate will not accept them. Output: the figures, your
+   interpretation of each, and a short list of hypotheses and problems spotted.
 3. **Define the prediction problem** — write a short contract: target (exact definition,
    units), prediction unit and population, prediction time/horizon, information actually
    available at prediction time, objective, evaluation metric, constraints. **The user must
-   approve this contract at Gate A** — it controls everything after.
+   approve this contract at Gate A** — it controls everything after. Consult
+   `references/model-selection.md` with the profile's traits when choosing the metric and the
+   candidate model families.
 4. **Data cleaning** — missing values, duplicates, invalid/impossible values, inconsistent
    categories, unit/format issues. Report before/after counts for every rule. Document every
    rule in PIPELINE.md. Prefer preserving data over deleting. Never use information from the
@@ -151,6 +174,13 @@ Edit, and notebook tool call, scans the code for fitting and training calls, and
 - **fitting on the test split** (`X_test`, `df_test`, `test_*`) — always, at every gate.
 - **evaluating on the test split** — `.predict/.score` or a metric function whose arguments name
   `X_test`, `df_test`, `test_*` — until `Gate C: approved …` (or `Override: Gate C …`).
+- **recording a gate before its artifacts exist** — `Gate A` needs `data_profile.json`, one `01_*.png`
+  and two `02_*.png`; `Gate B` needs a `04_*.png` and the `Model rationale:` block; `Gate C` a
+  `12_*.png`; `Gate D` a `13_*.png` and the `Step 14 final test:` line. Every PNG must be larger than
+  1 KB and have its `- Figure <file>:` line. The denial lists exactly what is missing.
+- **red flags the profile can prove** — `neural-net-small-data`, `random-split-temporal`,
+  `group-split`, `accuracy-imbalanced`, `resample-before-split` (see `references/model-selection.md`).
+  Override one only after the user agreed: `- Override: red flag <name> - user approved <what> YYYY-MM-DD - reason: <why>`.
 
 A PostToolUse hook also warns (never blocks) when a result looks too good to be honest
 (accuracy/AUC/F1 ≥ 0.98) or when `train_test_split()` is called without `stratify=` or on data that
@@ -167,6 +197,8 @@ have no hook support, so there the same rules apply as instructions only.
 
 - Selection leakage is the one that matters most: the test set is never used to pick a model, a
   seed, a feature, or a threshold. Validation only.
+- Every gate is recorded with its figures on disk and their explanations in PIPELINE.md. A figure
+  that was described but not drawn does not exist.
 - Test set is used exactly once. No tuning, no peeking, no "just checking".
 - All fitting (cleaning statistics, features, preprocessing, models) uses training data only.
 - Temporal data gets temporal splits; repeated entities get group splits.

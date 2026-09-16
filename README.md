@@ -60,6 +60,15 @@ ignores class balance or time. And at step 6 the agent switches to `guard.split(
 `guard.final_test()`, a small runtime library that drops duplicates, refuses random splits on
 temporal data, and lets the frozen test set be scored exactly once.
 
+It also refuses to let understanding be skipped. `guard.profile()` writes a data profile — column
+kinds, missingness, duplicates, class balance, temporal coverage, and **leakage suspects** — and
+`guard.eda_figures()` draws the required figures with explanations computed from the data. Gate A
+can't be recorded without them; Gate B can't be recorded without a written model rationale (traits
+→ baseline → candidates → what was ruled out and why → metric). And five provably wrong applications
+are denied outright from the profile: a neural net on a small table, a random split on temporal
+data, a non-group split on grouped data, accuracy as the selection metric on an imbalanced target,
+and resampling before the split.
+
 Prove it on the **canary**: `examples/canary/canary.csv` has a known honest ceiling of 0.80
 accuracy. Beat it and you leaked. `ML_PIPELINE_ENFORCE=0` switches enforcement off for non-ML
 projects. Codex and Kimi get the same rules as instructions (no hook support there).
