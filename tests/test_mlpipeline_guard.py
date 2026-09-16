@@ -81,5 +81,55 @@ class Split(unittest.TestCase):
             guard.split(frame(), target="y", test_size=0.6, val_size=0.5, state_dir=self.state)
 
 
+
+class FinalTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.state = Path(self.tmp.name) / "ml_pipeline"
+        self.md = self.state / "PIPELINE.md"
+        self.tr, self.va, self.te = guard.split(frame(), target="y", state_dir=self.state)
+        self.md.write_text("- Gate C: approved 2026-09-18\n")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    @staticmethod
+    def acc(y_true, y_pred):
+        return float((y_true == y_pred).mean())
+
+    @staticmethod
+    def predict(X):
+        return np.zeros(len(X), dtype=int)
+
+    def _run(self, test):
+        return guard.final_test(self.predict, test, target="y", metric_fn=self.acc,
+                                state_dir=self.state, pipeline_md=self.md)
+
+    def test_first_touch_scores_logs_and_counts(self):
+        score = self._run(self.te)
+        self.assertAlmostEqual(score, 1 - self.te.y.mean(), places=6)
+        self.assertIn("Step 14 final test: acc=", self.md.read_text())
+        self.assertEqual(json.loads((self.state / guard.STATE_FILE).read_text())["test_touches"], 1)
+
+    def test_second_touch_raises(self):
+        self._run(self.te)
+        with self.assertRaises(guard.TestSetAlreadyUsed):
+            self._run(self.te)
+
+    def test_override_line_permits_second_touch(self):
+        self._run(self.te)
+        self.md.write_text(self.md.read_text() +
+                           "- Override: final test - user approved a second evaluation 2026-09-18 - reason: new strategy\n")
+        self._run(self.te)
+
+    def test_tampered_test_set_raises(self):
+        with self.assertRaises(guard.TestSetTampered):
+            self._run(self.va)
+
+    def test_no_split_state_raises(self):
+        (self.state / guard.STATE_FILE).unlink()
+        with self.assertRaises(guard.LeakageError):
+            self._run(self.te)
+
 if __name__ == "__main__":
     unittest.main()

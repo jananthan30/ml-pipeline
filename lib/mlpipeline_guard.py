@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from datetime import date
 from pathlib import Path
 
@@ -154,3 +155,61 @@ def split(
         "created": date.today().isoformat(),
     }, indent=2))
     return train, val, test
+
+
+class TestSetAlreadyUsed(LeakageError):
+    """final_test() was called more than once without a recorded override."""
+
+
+class TestSetTampered(LeakageError):
+    """The frame handed to final_test() is not the one frozen at split time."""
+
+
+_NEGATED = re.compile(r"\b(?:not|pending|awaiting|todo)\b", re.I)
+
+
+def _override_allows(pipeline_md: Path, what: str) -> bool:
+    if not pipeline_md.is_file():
+        return False
+    line = re.compile(r"^.*\boverrid(?:e|den)\b.*\b" + re.escape(what) + r"\b.*$", re.I | re.M)
+    return any(not _NEGATED.search(m.group(0)) for m in line.finditer(pipeline_md.read_text()))
+
+
+def final_test(
+    predict_fn,
+    test: pd.DataFrame,
+    *,
+    target: str,
+    metric_fn,
+    state_dir: str | Path = "ml_pipeline",
+    pipeline_md: str | Path = "ml_pipeline/PIPELINE.md",
+) -> float:
+    """Step 14: score ``predict_fn`` on the frozen test set, once, and log the number.
+
+    A second call needs an ``- Override: final test - ...`` line in PIPELINE.md, which the skill
+    only writes after the user agreed a new test strategy.
+    """
+    state_path = Path(state_dir) / STATE_FILE
+    pipeline_md = Path(pipeline_md)
+    if not state_path.is_file():
+        raise LeakageError("no frozen test set: call guard.split() at step 6 first")
+    state = json.loads(state_path.read_text())
+    if _fingerprint(test) != state["test_fingerprint"]:
+        raise TestSetTampered("this is not the test set frozen at step 6")
+    if state["test_touches"] >= 1 and not _override_allows(pipeline_md, "final test"):
+        raise TestSetAlreadyUsed(
+            "the test set has already been evaluated once; agree a new test strategy with the user "
+            "and record `- Override: final test - ...` in PIPELINE.md before evaluating again"
+        )
+
+    features = test.drop(columns=[target])
+    score = float(metric_fn(test[target].to_numpy(), np.asarray(predict_fn(features))))
+
+    state["test_touches"] += 1
+    state_path.write_text(json.dumps(state, indent=2))
+    name = getattr(metric_fn, "__name__", "metric")
+    line = f"- Step 14 final test: {name}={score:.4f} (touch {state['test_touches']}, {date.today().isoformat()})\n"
+    pipeline_md.parent.mkdir(parents=True, exist_ok=True)
+    existing = pipeline_md.read_text().rstrip("\n") + "\n" if pipeline_md.is_file() else ""
+    pipeline_md.write_text(existing + line)
+    return score
