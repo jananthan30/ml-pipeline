@@ -51,13 +51,18 @@ enforcement section to each tool's global `AGENTS.md`.
 
 ## Enforced, not just instructed
 
-In Claude Code the plugin ships a `PreToolUse` hook. Before any command, file write, or
-notebook edit runs, it scans the code for training calls and **denies** them unless
-`ml_pipeline/PIPELINE.md` records the gate that unlocks them: nothing is fit before Gate A,
-no model is trained before Gate B, and the test split is never fit on. A denied call tells
-the agent exactly which steps are missing — so "just train it" fails closed until you have
-approved the gate. `ML_PIPELINE_ENFORCE=0` switches it off for non-ML projects. Codex and
-Kimi get the same rules as instructions (no hook support there).
+In Claude Code the plugin ships hooks. Before any command, file write, or notebook edit runs, a
+`PreToolUse` hook scans the code and **denies**: any fitting before Gate A; model training before
+Gate B; evaluating on the test split before Gate C; fitting on the test split, ever. A denied call
+tells the agent exactly which steps are missing — so "just train it" fails closed until you have
+approved the gate. A `PostToolUse` hook warns when a metric looks too good to be honest or a split
+ignores class balance or time. And at step 6 the agent switches to `guard.split()` /
+`guard.final_test()`, a small runtime library that drops duplicates, refuses random splits on
+temporal data, and lets the frozen test set be scored exactly once.
+
+Prove it on the **canary**: `examples/canary/canary.csv` has a known honest ceiling of 0.80
+accuracy. Beat it and you leaked. `ML_PIPELINE_ENFORCE=0` switches enforcement off for non-ML
+projects. Codex and Kimi get the same rules as instructions (no hook support there).
 
 ## License
 

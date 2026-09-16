@@ -70,6 +70,10 @@ parses it:
 
 A line that says a gate is `todo`, `pending`, or `not yet approved` never counts as approval.
 
+After recording a gate approval in a git repository, checkpoint it:
+`git add -A && git commit -m "ml-pipeline: Gate X approved" && git tag -f gate-X`. Every approved
+phase is then a reproducible point to return to.
+
 ## Tools: marimo notebooks + matplotlib visuals
 
 - **The workbench is a marimo notebook**, not loose scripts. Keep notebooks in
@@ -101,9 +105,13 @@ A line that says a gate is `todo`, `pending`, or `not yet approved` never counts
 5. **Data engineering** — joins/integration, aggregation, time alignment to an index date,
    business rules, one-row-per-prediction-unit feature table, data-quality checks
    (row counts, uniqueness, ranges).
-6. **Split before any fitting** — time-based split if the data is temporal, group-based if
-   the same entity appears in multiple rows, stratified random otherwise. Freeze the test
-   set now; it is touched exactly once, at step 14.
+6. **Split before any fitting** — copy the plugin's guard library to `ml_pipeline/guard.py`
+   (its path is given at session start; in Codex/Kimi it is `skills/ml-pipeline/lib/mlpipeline_guard.py`
+   next to this file) and split with it:
+   `train, val, test = guard.split(df, target=..., time_col=<col> if the data is temporal, group_col=<col> if the same entity appears in multiple rows)`.
+   It drops exact duplicates, refuses a random split when a datetime column exists, keeps groups
+   together, checks that no row lands in two splits, and freezes a fingerprint of the test set.
+   The test set is touched exactly once, at step 14, through `guard.final_test()`.
 7. **Feature engineering** — design features on the training set's statistics only, then
    apply the same transformations to validation/test.
 8. **Preprocessing** — scalers, encoders, imputers fit on train only, wrapped in a pipeline
@@ -120,9 +128,11 @@ A line that says a gate is `todo`, `pending`, or `not yet approved` never counts
     baseline. Figures required.
 13. **Error analysis** — worst predictions, performance by slice/subgroup, calibration,
     where the model fails and a hypothesis for why.
-14. **Final test** — run the chosen model on the untouched test set ONCE. Report the number
-    honestly, even if it is worse than validation. No going back to tune on it — if the
-    result forces changes, a new test strategy must be agreed with the user.
+14. **Final test** — `score = guard.final_test(model.predict, test, target=..., metric_fn=...)`.
+    It verifies the frame is the frozen test set, refuses a second call, and logs the result to
+    PIPELINE.md. Report the number honestly, even if it is worse than validation. No going back to
+    tune on it — if the result forces changes, agree a new test strategy with the user and record
+    `- Override: final test - user approved a second evaluation YYYY-MM-DD - reason: <why>`.
 15. **Deployment** — only when the user asks. Save the full pipeline artifact
     (preprocessing + model together), verify a reloaded artifact reproduces predictions,
     document the inference input contract.
@@ -139,6 +149,14 @@ Edit, and notebook tool call, scans the code for fitting and training calls, and
   line. With no `ml_pipeline/PIPELINE.md` at all, training is denied with a pointer to step 1.
 - **any fitting** — scalers, encoders, imputers included — until `Gate A: approved …`.
 - **fitting on the test split** (`X_test`, `df_test`, `test_*`) — always, at every gate.
+- **evaluating on the test split** — `.predict/.score` or a metric function whose arguments name
+  `X_test`, `df_test`, `test_*` — until `Gate C: approved …` (or `Override: Gate C …`).
+
+A PostToolUse hook also warns (never blocks) when a result looks too good to be honest
+(accuracy/AUC/F1 ≥ 0.98) or when `train_test_split()` is called without `stratify=` or on data that
+mentions dates. To prove a pipeline does not leak, run it on `examples/canary/canary.csv`: honest
+test accuracy cannot exceed 0.80, and `mlpipeline_canary.verdict(score, n_test)` says whether a
+number is above the ceiling.
 
 A denial is not an obstacle to route around: do the missing steps, get the user's explicit
 approval, record the gate line, and retry. The hook fails open on its own errors, and
@@ -147,6 +165,8 @@ have no hook support, so there the same rules apply as instructions only.
 
 ## Non-negotiables
 
+- Selection leakage is the one that matters most: the test set is never used to pick a model, a
+  seed, a feature, or a threshold. Validation only.
 - Test set is used exactly once. No tuning, no peeking, no "just checking".
 - All fitting (cleaning statistics, features, preprocessing, models) uses training data only.
 - Temporal data gets temporal splits; repeated entities get group splits.

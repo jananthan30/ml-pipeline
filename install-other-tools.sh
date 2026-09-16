@@ -34,6 +34,8 @@ install_for() {
   [ -d "$home_dir" ] || { echo "skip: $name not found ($home_dir missing)"; return 0; }
   mkdir -p "$home_dir/skills/ml-pipeline"
   cp "$SKILL" "$home_dir/skills/ml-pipeline/SKILL.md"
+  mkdir -p "$home_dir/skills/ml-pipeline/lib"
+  cp "$HERE"/lib/mlpipeline_guard.py "$HERE"/lib/mlpipeline_canary.py "$home_dir/skills/ml-pipeline/lib/"
   if ! grep -q "ML pipeline enforcement" "$home_dir/AGENTS.md" 2>/dev/null; then
     enforcement_section "$home_dir/skills/ml-pipeline/SKILL.md" >> "$home_dir/AGENTS.md"
   fi
