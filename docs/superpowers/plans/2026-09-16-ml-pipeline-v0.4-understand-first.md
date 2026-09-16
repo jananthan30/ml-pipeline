@@ -23,13 +23,13 @@
 
 ## TODO (master checklist)
 
-- [ ] Task 1 — Guard: `profile()` → `data_profile.json`
-- [ ] Task 2 — Guard: `fig()` and `eda_figures()` with the ledger
-- [ ] Task 3 — Hook: gate-recording check (artifacts, ledger, rationale block)
-- [ ] Task 4 — Hook: red flags from profile traits
-- [ ] Task 5 — PostToolUse: trait-aware warnings
-- [ ] Task 6 — Playbook + skill / README / SessionStart / installer
-- [ ] Task 7 — Eval case `understand-first`
+- [x] Task 1 — Guard: `profile()` → `data_profile.json`
+- [x] Task 2 — Guard: `fig()` and `eda_figures()` with the ledger
+- [x] Task 3 — Hook: gate-recording check (artifacts, ledger, rationale block)
+- [x] Task 4 — Hook: red flags from profile traits
+- [x] Task 5 — PostToolUse: trait-aware warnings
+- [x] Task 6 — Playbook + skill / README / SessionStart / installer
+- [x] Task 7 — Eval case `understand-first`
 - [ ] Task 8 — Release 0.4.0
 
 ---
@@ -43,7 +43,7 @@
 **Interfaces:**
 - Produces: `profile(df, *, target, time_col=None, group_col=None, state_dir="ml_pipeline") -> dict` writing `<state_dir>/data_profile.json`; constants `PROFILE_FILE = "data_profile.json"`, `SMALL_DATA_ROWS`, `IMBALANCE_MINORITY`, `HIGH_CARD_LEVELS`, `LEAK_CORR`, `LEAK_PURITY`, `SAMPLE_ROWS`. The dict has keys `schema_version, created, shape, target, columns, duplicates, constant_columns, high_cardinality_categoricals, datetime_columns, time_col, group_col, entity_candidates, leakage_suspects, traits` exactly as in spec §1. Tasks 4–5 read `traits`.
 
-- [ ] **Step 1: Write the failing tests** — append to `tests/test_mlpipeline_guard.py` before the `if __name__` block:
+- [x] **Step 1: Write the failing tests** — append to `tests/test_mlpipeline_guard.py` before the `if __name__` block:
 
 ```python
 class Profile(unittest.TestCase):
@@ -137,12 +137,12 @@ class Profile(unittest.TestCase):
         self.assertEqual(p["shape"]["n_rows"], 1000)
 ```
 
-- [ ] **Step 2: Run to verify they fail**
+- [x] **Step 2: Run to verify they fail**
 
 Run: `.venv/bin/python -m unittest tests.test_mlpipeline_guard.Profile 2>&1 | tail -3`
 Expected: `AttributeError: module 'mlpipeline_guard' has no attribute 'profile'`.
 
-- [ ] **Step 3: Implement** — append to `lib/mlpipeline_guard.py`:
+- [x] **Step 3: Implement** — append to `lib/mlpipeline_guard.py`:
 
 ```python
 # ------------------------------------------------------------------ profile (step 1)
@@ -323,12 +323,12 @@ def profile(
     return result
 ```
 
-- [ ] **Step 4: Run to verify they pass**
+- [x] **Step 4: Run to verify they pass**
 
 Run: `.venv/bin/python -m unittest tests/test_mlpipeline_guard.py -v 2>&1 | tail -4`
 Expected: `OK`, 20 tests.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add lib/mlpipeline_guard.py tests/test_mlpipeline_guard.py
@@ -356,14 +356,14 @@ Claude-Session: https://claude.ai/code/session_01QY8G4RZ3xqbmgmbuHbeaoe"
 - Consumes: nothing from Task 1 (independent of the profile).
 - Produces: `fig(step: int, name: str, figure, explanation: str, state_dir="ml_pipeline") -> Path`; `eda_figures(df, *, target, time_col=None, state_dir="ml_pipeline") -> list[Path]`; `FIGURES_DIR = "figures"`; ledger lines `- Figure <file>: <explanation>` appended to `<state_dir>/PIPELINE.md`. File names `NN_<slug>.png`.
 
-- [ ] **Step 1: Dev env**
+- [x] **Step 1: Dev env**
 
 ```bash
 uv pip install --python .venv/bin/python matplotlib
 printf 'pandas\nnumpy\nmatplotlib\n' > tests/requirements-dev.txt
 ```
 
-- [ ] **Step 2: Write the failing tests** — append to `tests/test_mlpipeline_guard.py`:
+- [x] **Step 2: Write the failing tests** — append to `tests/test_mlpipeline_guard.py`:
 
 ```python
 class Figures(unittest.TestCase):
@@ -417,12 +417,12 @@ class Figures(unittest.TestCase):
             sys.modules.update(saved)
 ```
 
-- [ ] **Step 3: Run to verify they fail**
+- [x] **Step 3: Run to verify they fail**
 
 Run: `.venv/bin/python -m unittest tests.test_mlpipeline_guard.Figures 2>&1 | tail -3`
 Expected: `AttributeError: module 'mlpipeline_guard' has no attribute 'eda_figures'`.
 
-- [ ] **Step 4: Implement** — append to `lib/mlpipeline_guard.py`:
+- [x] **Step 4: Implement** — append to `lib/mlpipeline_guard.py`:
 
 ```python
 # ------------------------------------------------------------------ figures (steps 1-2 and any step)
@@ -544,12 +544,12 @@ def eda_figures(df: pd.DataFrame, *, target: str, time_col: str | None = None,
     return paths
 ```
 
-- [ ] **Step 5: Run to verify they pass**
+- [x] **Step 5: Run to verify they pass**
 
 Run: `.venv/bin/python -m unittest tests/test_mlpipeline_guard.py -v 2>&1 | tail -4`
 Expected: `OK`, 25 tests.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add lib/mlpipeline_guard.py tests/test_mlpipeline_guard.py tests/requirements-dev.txt
@@ -576,7 +576,7 @@ Claude-Session: https://claude.ai/code/session_01QY8G4RZ3xqbmgmbuHbeaoe"
 - Consumes: existing `GATE_LINE`, `APPROVED`, `NEGATED`, `_strings`, `find_pipeline`, `_emit`, `DOC_SUFFIXES`.
 - Produces: `approved_gates_in(text) -> list[str]`; `rationale_missing(text) -> list[str]`; `gate_problems(gate, state_dir: Path, ledger_text) -> list[str]`; `_state_dir_for(tool_input, cwd) -> Path`; constants `PROFILE_FILE`, `FIGURES_DIR`, `MIN_PNG_BYTES`, `GATE_REQUIREMENTS`, `GATE_RECORD_MSG`. Task 4 and Task 5 reuse `_state_dir_for`.
 
-- [ ] **Step 1: Extend the test helper and write the failing tests** — in `tests/test_guard_training.py` replace the `run` function with this version (adds `files`, a mapping of relative path → bytes or str, created under the temp project):
+- [x] **Step 1: Extend the test helper and write the failing tests** — in `tests/test_guard_training.py` replace the `run` function with this version (adds `files`, a mapping of relative path → bytes or str, created under the temp project):
 
 ```python
 def run(tool_input, pipeline_md=None, tool="Bash", env=None, cwd_sub="", files=None):
@@ -687,12 +687,12 @@ class GateRecording(unittest.TestCase):
         self.assertEqual(run(write_md(ledger + "- Gate D: approved 2026-09-19\n"), pipeline_md="", tool="Write", files=files)[0], "allow")
 ```
 
-- [ ] **Step 2: Run to verify they fail**
+- [x] **Step 2: Run to verify they fail**
 
 Run: `python3 -m unittest tests.test_guard_training.GateRecording 2>&1 | grep -E "^(Ran|OK|FAILED)"`
 Expected: `FAILED` — the deny cases currently return "allow" (`.md` files are skipped).
 
-- [ ] **Step 3: Implement** — in `hooks/guard_training.py` add after `TEST_MSG`:
+- [x] **Step 3: Implement** — in `hooks/guard_training.py` add after `TEST_MSG`:
 
 ```python
 # ------------------------------------------------------------------ gate recording
@@ -794,12 +794,12 @@ Then replace the body of `main()` between `payload = json.load(sys.stdin)` and `
 
 (The old lines that computed `target`, skipped docs, then computed `text` are replaced by this block; `found = analyse(text)` and everything after stay as they are.)
 
-- [ ] **Step 4: Run the whole hook suite**
+- [x] **Step 4: Run the whole hook suite**
 
 Run: `python3 -m unittest discover tests 2>&1 | grep -E "^(Ran|OK|FAILED)"`
 Expected: `OK`, 58 tests (49 + 9), 1 skipped.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add hooks/guard_training.py tests/test_guard_training.py
@@ -828,7 +828,7 @@ Claude-Session: https://claude.ai/code/session_01QY8G4RZ3xqbmgmbuHbeaoe"
 - Consumes: `_state_dir_for`, `PROFILE_FILE`, `NEGATED`, `TRAIN_API`, `COMMENT` from earlier tasks/this module.
 - Produces: `_load_profile(state_dir: Path) -> dict | None`; `overridden_flags(markdown) -> set[str]`; `red_flag(code, traits, overrides) -> str | None`; `RED_FLAGS`, `RED_FLAG_MSG`. Task 5 reuses `_load_profile`.
 
-- [ ] **Step 1: Write the failing tests** — append to `tests/test_guard_training.py`:
+- [x] **Step 1: Write the failing tests** — append to `tests/test_guard_training.py`:
 
 ```python
 def profile_with(**traits):
@@ -882,12 +882,12 @@ class RedFlags(unittest.TestCase):
         self.assertEqual(run({"command": "train_test_split(X, y)"}, GATE_A)[0], "allow")
 ```
 
-- [ ] **Step 2: Run to verify they fail**
+- [x] **Step 2: Run to verify they fail**
 
 Run: `python3 -m unittest tests.test_guard_training.RedFlags 2>&1 | grep -E "^(Ran|OK|FAILED)"`
 Expected: `FAILED` (deny cases return allow).
 
-- [ ] **Step 3: Implement** — add to `hooks/guard_training.py` after `_state_dir_for`:
+- [x] **Step 3: Implement** — add to `hooks/guard_training.py` after `_state_dir_for`:
 
 ```python
 # ------------------------------------------------------------------ red flags (need a profile)
@@ -957,12 +957,12 @@ Then in `main()`, insert between step 2 (the prose skip) and step 3 (the fast pa
                 return _emit(reason)
 ```
 
-- [ ] **Step 4: Run the whole hook suite**
+- [x] **Step 4: Run the whole hook suite**
 
 Run: `python3 -m unittest discover tests 2>&1 | grep -E "^(Ran|OK|FAILED)"`
 Expected: `OK`, 66 tests, 1 skipped.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add hooks/guard_training.py tests/test_guard_training.py
@@ -989,7 +989,7 @@ Claude-Session: https://claude.ai/code/session_01QY8G4RZ3xqbmgmbuHbeaoe"
 - Consumes: `_strings`, `_state_dir_for`, `_load_profile` from `hooks/guard_training.py`.
 - Produces: `trait_warnings(code, traits) -> list[str]`; `warnings(code, output, traits=None)` (extra optional parameter, existing behaviour unchanged).
 
-- [ ] **Step 1: Write the failing tests** — append to `tests/test_post_tool_warn.py`:
+- [x] **Step 1: Write the failing tests** — append to `tests/test_post_tool_warn.py`:
 
 ```python
 class TraitWarnings(unittest.TestCase):
@@ -1022,12 +1022,12 @@ class TraitWarnings(unittest.TestCase):
         self.assertIn("imbalanced", json.loads(out.getvalue())["hookSpecificOutput"]["additionalContext"])
 ```
 
-- [ ] **Step 2: Run to verify they fail**
+- [x] **Step 2: Run to verify they fail**
 
 Run: `python3 -m unittest tests.test_post_tool_warn.TraitWarnings 2>&1 | grep -E "^(Ran|OK|FAILED)"`
 Expected: `FAILED` with `AttributeError: ... has no attribute 'trait_warnings'`.
 
-- [ ] **Step 3: Implement** — in `hooks/post_tool_warn.py` change the import line to
+- [x] **Step 3: Implement** — in `hooks/post_tool_warn.py` change the import line to
 `from guard_training import _load_profile, _state_dir_for, _strings  # noqa: E402`, add after `DATEY`:
 
 ```python
@@ -1059,12 +1059,12 @@ change the signature of `warnings` to `def warnings(code: str, output: str, trai
         found = warnings(code, output, (profile or {}).get("traits"))
 ```
 
-- [ ] **Step 4: Run**
+- [x] **Step 4: Run**
 
 Run: `python3 -m unittest discover tests 2>&1 | grep -E "^(Ran|OK|FAILED)"`
 Expected: `OK`, 70 tests, 1 skipped.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add hooks/post_tool_warn.py tests/test_post_tool_warn.py
@@ -1092,7 +1092,7 @@ Claude-Session: https://claude.ai/code/session_01QY8G4RZ3xqbmgmbuHbeaoe"
 **Interfaces:**
 - Produces: the playbook path `skills/ml-pipeline/references/model-selection.md`; SessionStart context now names it.
 
-- [ ] **Step 1: Write the failing test** — in `tests/test_session_start.py`, add to `test_names_the_helpers_when_plugin_root_is_set`:
+- [x] **Step 1: Write the failing test** — in `tests/test_session_start.py`, add to `test_names_the_helpers_when_plugin_root_is_set`:
 
 ```python
         self.assertIn("/plug/skills/ml-pipeline/references/model-selection.md", context)
@@ -1100,7 +1100,7 @@ Claude-Session: https://claude.ai/code/session_01QY8G4RZ3xqbmgmbuHbeaoe"
 
 Run: `python3 -m unittest tests/test_session_start.py 2>&1 | grep -E "^(Ran|OK|FAILED)"` → `FAILED`.
 
-- [ ] **Step 2: Update `hooks/session_start.py`** — replace the `context = (...)` expression with:
+- [x] **Step 2: Update `hooks/session_start.py`** — replace the `context = (...)` expression with:
 
 ```python
     context = (
@@ -1115,7 +1115,7 @@ Run: `python3 -m unittest tests/test_session_start.py 2>&1 | grep -E "^(Ran|OK|F
 
 Run the test again → `OK`.
 
-- [ ] **Step 3: Write the playbook** — create `skills/ml-pipeline/references/model-selection.md`:
+- [x] **Step 3: Write the playbook** — create `skills/ml-pipeline/references/model-selection.md`:
 
 ```markdown
 # Model selection playbook
@@ -1198,7 +1198,7 @@ kernel SVM above 50,000 rows; one-hot on high-cardinality columns; `accuracy_sco
 imbalanced target.
 ```
 
-- [ ] **Step 4: Update `skills/ml-pipeline/SKILL.md`** — five anchored edits:
+- [x] **Step 4: Update `skills/ml-pipeline/SKILL.md`** — five anchored edits:
 
 (a) Replace steps 1 and 2 in "What each step must produce":
 
@@ -1257,7 +1257,7 @@ Model rationale:
   that was described but not drawn does not exist.
 ```
 
-- [ ] **Step 5: Update `README.md`** — in "## Enforced, not just instructed", after the first paragraph add:
+- [x] **Step 5: Update `README.md`** — in "## Enforced, not just instructed", after the first paragraph add:
 
 ```markdown
 It also refuses to let understanding be skipped. `guard.profile()` writes a data profile — column
@@ -1270,7 +1270,7 @@ data, a non-group split on grouped data, accuracy as the selection metric on an 
 and resampling before the split.
 ```
 
-- [ ] **Step 6: Update `install-other-tools.sh`** — after the `cp "$HERE"/lib/... ` line add:
+- [x] **Step 6: Update `install-other-tools.sh`** — after the `cp "$HERE"/lib/... ` line add:
 
 ```bash
   mkdir -p "$home_dir/skills/ml-pipeline/references"
@@ -1279,7 +1279,7 @@ and resampling before the split.
 
 Run: `bash -n install-other-tools.sh && ./install-other-tools.sh && ls ~/.codex/skills/ml-pipeline/references/` → `model-selection.md`.
 
-- [ ] **Step 7: Run all stdlib tests, then commit**
+- [x] **Step 7: Run all stdlib tests, then commit**
 
 Run: `python3 -m unittest discover tests 2>&1 | grep -E "^(Ran|OK|FAILED)"` → `OK`.
 
@@ -1307,7 +1307,7 @@ Claude-Session: https://claude.ai/code/session_01QY8G4RZ3xqbmgmbuHbeaoe"
 **Interfaces:**
 - Consumes: the plugin at the repo root; `lib/mlpipeline_guard.py` copied into the workspace by the scaffold.
 
-- [ ] **Step 1: Write the case files**
+- [x] **Step 1: Write the case files**
 
 `evals/understand-first/prompt.md`:
 
@@ -1392,12 +1392,12 @@ pattern: '- Figure 02_target_balance\.png:'
 
 `chmod +x evals/understand-first/fixture.sh`.
 
-- [ ] **Step 2: Run it**
+- [x] **Step 2: Run it**
 
 Run: `claude plugin eval . --case understand-first --runs 1 --ablation none --scaffold --allow-tools Bash Write --max-cost-usd 4 --no-publish --trust-plugin --json evals/results/understand-first-run1.json 2>&1 | tail -8`
 Expected: all seven graders PASS. If `profile-exists` / `figures-exist` fail, check the run's final message for "pip" or "No module named pandas": that is the sandbox blocking network, which the `needs-deps` tag documents; record the outcome in the commit message either way. If the agent trained (`no-training-*` fail), the skill text is what needs fixing — not the graders.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add evals/understand-first
@@ -1419,14 +1419,14 @@ Claude-Session: https://claude.ai/code/session_01QY8G4RZ3xqbmgmbuHbeaoe"
 **Files:**
 - Modify: `.claude-plugin/plugin.json`, `.codex-plugin/plugin.json`
 
-- [ ] **Step 1: Bump versions**
+- [x] **Step 1: Bump versions**
 
 ```bash
 sed -i '' 's/"version": "0.3.0"/"version": "0.4.0"/' .claude-plugin/plugin.json .codex-plugin/plugin.json
 grep -n '"version"' .claude-plugin/plugin.json .codex-plugin/plugin.json
 ```
 
-- [ ] **Step 2: Run every suite**
+- [x] **Step 2: Run every suite**
 
 ```bash
 python3 -m unittest discover tests 2>&1 | tail -3
@@ -1436,7 +1436,7 @@ claude plugin validate .
 
 Expected: `OK` twice (70 stdlib incl. 1 skipped; 25 guard), validate passes.
 
-- [ ] **Step 3: Commit, push, PR**
+- [x] **Step 3: Commit, push, PR**
 
 ```bash
 git add .claude-plugin/plugin.json .codex-plugin/plugin.json
