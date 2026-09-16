@@ -75,8 +75,9 @@ Writes `ml_pipeline/data_profile.json` and returns the same dict.
 ```
 
 **Column kind:** bool dtype → `bool`; datetime64 → `datetime`; numeric dtype → `numeric`, or `id`
-when `unique_frac > 0.95` and values are integer-like; object/string/category → `id` when
-`unique_frac > 0.95`, else `text` when median string length > 30, else `categorical`.
+when `unique_frac > 0.95` and values are integer-like; object/string/category → `text` when
+median string length > 30 (free text is almost always unique), else `id` when `unique_frac > 0.95`,
+else `categorical`.
 **Target task:** regression when the target is numeric with `n_unique > 20`; binary when
 `n_unique == 2`; multiclass otherwise. **Outliers:** 1.5×IQR rule. **High cardinality:** categorical
 with `n_levels > 50`. **Entity candidates:** columns whose name matches `(^|_)id$` (case-insensitive)

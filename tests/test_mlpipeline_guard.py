@@ -131,5 +131,96 @@ class FinalTest(unittest.TestCase):
         with self.assertRaises(guard.LeakageError):
             self._run(self.te)
 
+
+class Profile(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.state = Path(self.tmp.name) / "ml_pipeline"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _df(self, n=1000, seed=0):
+        rng = np.random.default_rng(seed)
+        y = rng.integers(0, 2, size=n)
+        return pd.DataFrame({
+            "age": rng.normal(50, 12, size=n),
+            "zip": rng.integers(90000, 90400, size=n).astype(str),          # 400 levels -> high cardinality
+            "flag": rng.integers(0, 2, size=n).astype(bool),
+            "notes": ["x" * 40 + str(i) for i in range(n)],                 # long strings -> text
+            "patient_id": np.arange(n),                                     # unique ints -> id
+            "admitted_at": pd.date_range("2024-01-01", periods=n, freq="h"),
+            "y": y,
+        })
+
+    def test_column_kinds(self):
+        p = guard.profile(self._df(), target="y", time_col="admitted_at", state_dir=self.state)
+        kinds = {c: p["columns"][c]["kind"] for c in p["columns"]}
+        self.assertEqual(kinds["age"], "numeric")
+        self.assertEqual(kinds["zip"], "categorical")
+        self.assertEqual(kinds["flag"], "bool")
+        self.assertEqual(kinds["notes"], "text")
+        self.assertEqual(kinds["patient_id"], "id")
+        self.assertEqual(kinds["admitted_at"], "datetime")
+
+    def test_shape_target_and_file(self):
+        p = guard.profile(self._df(), target="y", time_col="admitted_at", state_dir=self.state)
+        self.assertEqual(p["shape"]["n_rows"], 1000)
+        self.assertEqual(p["target"]["task"], "binary")
+        self.assertAlmostEqual(sum(p["target"]["class_balance"].values()), 1.0, places=3)
+        self.assertIn("zip", p["high_cardinality_categoricals"])
+        self.assertIn("patient_id", p["entity_candidates"])
+        self.assertEqual(json.loads((self.state / guard.PROFILE_FILE).read_text())["shape"]["n_rows"], 1000)
+
+    def test_missing_and_duplicates(self):
+        df = self._df(200)
+        df.loc[:19, "age"] = np.nan
+        df = pd.concat([df, df.iloc[:50]], ignore_index=True)
+        p = guard.profile(df, target="y", time_col="admitted_at", state_dir=self.state)
+        self.assertAlmostEqual(p["columns"]["age"]["missing_frac"], 40 / 250, places=3)  # 20 NaN + 20 in the duplicated rows
+        self.assertAlmostEqual(p["duplicates"]["exact_row_frac"], 50 / 250, places=3)
+
+    def test_regression_and_multiclass_targets(self):
+        df = self._df()
+        df["amount"] = np.random.default_rng(1).normal(size=len(df))
+        self.assertEqual(guard.profile(df, target="amount", time_col="admitted_at", state_dir=self.state)["target"]["task"], "regression")
+        df["cls"] = np.random.default_rng(2).integers(0, 4, size=len(df))
+        self.assertEqual(guard.profile(df, target="cls", time_col="admitted_at", state_dir=self.state)["target"]["task"], "multiclass")
+
+    def test_leakage_suspects(self):
+        df = self._df()
+        df["risk_final"] = df["y"] + np.random.default_rng(3).normal(0, 0.01, size=len(df))   # |corr| > 0.95
+        df["discharge_outcome"] = "a"                                                            # name rule
+        df["y_copy_cat"] = df["y"].astype(str)                                                   # purity rule
+        df["recorded_at"] = df["admitted_at"] + pd.Timedelta(days=3)                              # later than time_col
+        p = guard.profile(df, target="y", time_col="admitted_at", state_dir=self.state)
+        flagged = {s["column"] for s in p["leakage_suspects"]}
+        self.assertTrue({"risk_final", "discharge_outcome", "y_copy_cat", "recorded_at"} <= flagged, flagged)
+        self.assertNotIn("age", flagged)
+
+    def test_traits(self):
+        df = self._df()
+        df["y"] = (np.arange(len(df)) % 20 == 0).astype(int)   # 5% minority
+        p = guard.profile(df, target="y", time_col="admitted_at", state_dir=self.state)
+        t = p["traits"]
+        self.assertTrue(t["small_data"])
+        self.assertTrue(t["imbalanced"])
+        self.assertTrue(t["has_datetime"])
+        self.assertFalse(t["has_groups"])              # entity candidates never set has_groups
+        self.assertEqual(t["n_features"], 6)
+        p2 = guard.profile(df, target="y", time_col="admitted_at", group_col="patient_id", state_dir=self.state)
+        self.assertTrue(p2["traits"]["has_groups"])
+
+    def test_sampling_flag(self):
+        saved = guard.SAMPLE_ROWS
+        guard.SAMPLE_ROWS = 300
+        try:
+            p = guard.profile(self._df(1000), target="y", time_col="admitted_at", state_dir=self.state)
+        finally:
+            guard.SAMPLE_ROWS = saved
+        self.assertTrue(p["shape"]["sampled"])
+        self.assertEqual(p["shape"]["sample_rows"], 300)
+        self.assertEqual(p["shape"]["n_rows"], 1000)
+
 if __name__ == "__main__":
     unittest.main()
