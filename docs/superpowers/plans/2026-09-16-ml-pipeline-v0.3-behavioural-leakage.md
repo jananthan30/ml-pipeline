@@ -23,13 +23,13 @@
 
 ## TODO (master checklist)
 
-- [ ] Task 1 — Hook: deny evaluating on the test split before Gate C
-- [ ] Task 2 — Guard library: `split()` with dedupe, chronological/group/stratified splits, overlap check, fingerprint freeze
-- [ ] Task 3 — Guard library: `final_test()` single-touch counter with tamper check and PIPELINE.md log
-- [ ] Task 4 — Canary dataset module + `examples/canary/`
-- [ ] Task 5 — SessionStart hook + skill/README/installer updates (guard usage at steps 6/14, `git tag gate-X`)
-- [ ] Task 6 — PostToolUse warning hook (too-good metrics, unsafe `train_test_split`)
-- [ ] Task 7 — Eval case `gate-stop`
+- [x] Task 1 — Hook: deny evaluating on the test split before Gate C
+- [x] Task 2 — Guard library: `split()` with dedupe, chronological/group/stratified splits, overlap check, fingerprint freeze
+- [x] Task 3 — Guard library: `final_test()` single-touch counter with tamper check and PIPELINE.md log
+- [x] Task 4 — Canary dataset module + `examples/canary/`
+- [x] Task 5 — SessionStart hook + skill/README/installer updates (guard usage at steps 6/14, `git tag gate-X`)
+- [x] Task 6 — PostToolUse warning hook (too-good metrics, unsafe `train_test_split`)
+- [x] Task 7 — Eval case `gate-stop`
 - [ ] Task 8 — Release 0.3.0 (version bump, full test run, PR, scanner, release, local plugin update)
 
 Backlog (separate plans, not in scope): evaluator agent + hacker-fixer hardening · `mlw` trial · search module for steps 10–11 · per-phase budgets · `canary-honesty` eval case.
@@ -46,7 +46,7 @@ Backlog (separate plans, not in scope): evaluator agent + hacker-fixer hardening
 - Consumes: existing `run(tool_input, pipeline_md=None, ...)` test helper, `GATE_A`, `GATE_AB` constants in the test file.
 - Produces: `analyse()` result gains key `"eval_on_test"`; `gate_state()` gains key `"override_c"`; new constant `GATE_C_MSG`.
 
-- [ ] **Step 1: Write the failing tests** — append to `tests/test_guard_training.py` (after the `AfterGateB` class):
+- [x] **Step 1: Write the failing tests** — append to `tests/test_guard_training.py` (after the `AfterGateB` class):
 
 ```python
 GATE_ABC = GATE_AB + "- Gate C: approved 2026-09-18\n"
@@ -79,12 +79,12 @@ class SelectionLeakage(unittest.TestCase):
 
 Move the two constants above the class (module level, next to `GATE_AB`).
 
-- [ ] **Step 2: Run to verify they fail**
+- [x] **Step 2: Run to verify they fail**
 
 Run: `python3 -m unittest tests.test_guard_training.SelectionLeakage -v`
 Expected: 3 FAIL (`..._denied`, `..._without_pipeline_denied` get "allow"); the 3 allow-cases pass already.
 
-- [ ] **Step 3: Implement** — in `hooks/guard_training.py`:
+- [x] **Step 3: Implement** — in `hooks/guard_training.py`:
 
 Add after `TRAIN_API`:
 
@@ -154,12 +154,12 @@ In `main()`: widen the fast path:
 
 Update the module docstring's table: add the line `Gate C approved   ->  evaluating on the test split allowed (once, at step 14)`.
 
-- [ ] **Step 4: Run the whole hook suite**
+- [x] **Step 4: Run the whole hook suite**
 
 Run: `python3 -m unittest discover tests -v 2>&1 | tail -5`
 Expected: `OK`, 33 tests.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git checkout -b v0.3-behavioural-leakage
@@ -187,7 +187,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 **Interfaces:**
 - Produces: `split(df, *, target, time_col=None, group_col=None, test_size=0.2, val_size=0.2, seed=0, state_dir="ml_pipeline") -> (train, val, test)`; `check_no_overlap(*frames) -> None`; exceptions `LeakageError`, `TemporalSplitRequired`, `OverlapLeakage`; constant `STATE_FILE = ".guard_state.json"`; state JSON keys `test_fingerprint`, `n_test`, `test_touches`, `duplicates_dropped`, `split`, `created`. Task 3 reads the state file with these keys.
 
-- [ ] **Step 1: Dev environment**
+- [x] **Step 1: Dev environment**
 
 ```bash
 uv venv .venv
@@ -199,7 +199,7 @@ printf '.venv/\nevals/results/\n' >> .gitignore
 
 Expected: two version numbers printed.
 
-- [ ] **Step 2: Write the failing tests** — create `tests/test_mlpipeline_guard.py`:
+- [x] **Step 2: Write the failing tests** — create `tests/test_mlpipeline_guard.py`:
 
 ```python
 """Tests for lib/mlpipeline_guard.py. Run with the dev venv:
@@ -289,12 +289,12 @@ if __name__ == "__main__":
     unittest.main()
 ```
 
-- [ ] **Step 3: Run to verify they fail**
+- [x] **Step 3: Run to verify they fail**
 
 Run: `.venv/bin/python -m unittest tests/test_mlpipeline_guard.py 2>&1 | tail -3`
 Expected: `ModuleNotFoundError: No module named 'mlpipeline_guard'`.
 
-- [ ] **Step 4: Implement** — create `lib/mlpipeline_guard.py`:
+- [x] **Step 4: Implement** — create `lib/mlpipeline_guard.py`:
 
 ```python
 """Runtime guard for the ml-pipeline skill: a leakage-safe split and a single-use test set.
@@ -455,12 +455,12 @@ def split(
     return train, val, test
 ```
 
-- [ ] **Step 5: Run to verify they pass**
+- [x] **Step 5: Run to verify they pass**
 
 Run: `.venv/bin/python -m unittest tests/test_mlpipeline_guard.py -v 2>&1 | tail -4`
 Expected: `OK`, 8 tests. Also confirm the stdlib suite still skips this file cleanly: `python3 -m unittest discover tests 2>&1 | tail -3` → `OK (skipped=1)` plus the 33 hook tests.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add lib/mlpipeline_guard.py tests/test_mlpipeline_guard.py tests/requirements-dev.txt .gitignore
@@ -486,7 +486,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 - Consumes: `split()`, `STATE_FILE`, `_fingerprint()` from Task 2.
 - Produces: `final_test(predict_fn, test, *, target, metric_fn, state_dir="ml_pipeline", pipeline_md="ml_pipeline/PIPELINE.md") -> float`; exceptions `TestSetAlreadyUsed`, `TestSetTampered`; appends `- Step 14 final test: <metric>=<value> (touch N, YYYY-MM-DD)` to PIPELINE.md.
 
-- [ ] **Step 1: Write the failing tests** — append to `tests/test_mlpipeline_guard.py`:
+- [x] **Step 1: Write the failing tests** — append to `tests/test_mlpipeline_guard.py`:
 
 ```python
 class FinalTest(unittest.TestCase):
@@ -539,12 +539,12 @@ class FinalTest(unittest.TestCase):
             self._run(self.te)
 ```
 
-- [ ] **Step 2: Run to verify they fail**
+- [x] **Step 2: Run to verify they fail**
 
 Run: `.venv/bin/python -m unittest tests.test_mlpipeline_guard.FinalTest 2>&1 | tail -3`
 Expected: `AttributeError: module 'mlpipeline_guard' has no attribute 'final_test'`.
 
-- [ ] **Step 3: Implement** — append to `lib/mlpipeline_guard.py` (add `import re` to the imports):
+- [x] **Step 3: Implement** — append to `lib/mlpipeline_guard.py` (add `import re` to the imports):
 
 ```python
 class TestSetAlreadyUsed(LeakageError):
@@ -605,12 +605,12 @@ def final_test(
     return score
 ```
 
-- [ ] **Step 4: Run to verify they pass**
+- [x] **Step 4: Run to verify they pass**
 
 Run: `.venv/bin/python -m unittest tests/test_mlpipeline_guard.py -v 2>&1 | tail -4`
 Expected: `OK`, 13 tests.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add lib/mlpipeline_guard.py tests/test_mlpipeline_guard.py
@@ -637,7 +637,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 **Interfaces:**
 - Produces: `make_rows(n=2000, noise=0.20, seed=7) -> list[list]` (columns `x0..x4, y`), `write_csv(path, n, noise, seed)`, `verdict(test_accuracy, n_test, ceiling=0.80, z=3.0) -> (leaked: bool, explanation: str)`, constants `NOISE`, `CEILING`, `N_FEATURES`.
 
-- [ ] **Step 1: Write the failing tests** — create `tests/test_mlpipeline_canary.py`:
+- [x] **Step 1: Write the failing tests** — create `tests/test_mlpipeline_canary.py`:
 
 ```python
 """Tests for lib/mlpipeline_canary.py (stdlib only): python3 -m unittest tests/test_mlpipeline_canary.py"""
@@ -686,12 +686,12 @@ if __name__ == "__main__":
     unittest.main()
 ```
 
-- [ ] **Step 2: Run to verify they fail**
+- [x] **Step 2: Run to verify they fail**
 
 Run: `python3 -m unittest tests/test_mlpipeline_canary.py 2>&1 | tail -3`
 Expected: `ModuleNotFoundError: No module named 'mlpipeline_canary'`.
 
-- [ ] **Step 3: Implement** — create `lib/mlpipeline_canary.py`:
+- [x] **Step 3: Implement** — create `lib/mlpipeline_canary.py`:
 
 ```python
 """A dataset with a known ceiling: beat it and you leaked.
@@ -776,12 +776,12 @@ Regenerate: `python3 examples/canary/make_canary.py`
 
 Then generate the CSV: `python3 examples/canary/make_canary.py`.
 
-- [ ] **Step 4: Run to verify they pass**
+- [x] **Step 4: Run to verify they pass**
 
 Run: `python3 -m unittest tests/test_mlpipeline_canary.py -v 2>&1 | tail -4` → `OK`, 4 tests.
 Run: `wc -l examples/canary/canary.csv` → `2001`.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add lib/mlpipeline_canary.py examples/canary tests/test_mlpipeline_canary.py
@@ -810,7 +810,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 **Interfaces:**
 - Produces: SessionStart JSON with `hookSpecificOutput.additionalContext` naming `${CLAUDE_PLUGIN_ROOT}/lib/mlpipeline_guard.py` and `.../lib/mlpipeline_canary.py`.
 
-- [ ] **Step 1: Write the failing test** — create `tests/test_session_start.py`:
+- [x] **Step 1: Write the failing test** — create `tests/test_session_start.py`:
 
 ```python
 """Tests for hooks/session_start.py: python3 -m unittest tests/test_session_start.py"""
@@ -859,12 +859,12 @@ if __name__ == "__main__":
     unittest.main()
 ```
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
 
 Run: `python3 -m unittest tests/test_session_start.py 2>&1 | tail -3`
 Expected: `ModuleNotFoundError: No module named 'session_start'`.
 
-- [ ] **Step 3: Implement** — create `hooks/session_start.py`:
+- [x] **Step 3: Implement** — create `hooks/session_start.py`:
 
 ```python
 #!/usr/bin/env python3
@@ -912,12 +912,12 @@ Register it in `hooks/hooks.json` — add a `SessionStart` key beside `PreToolUs
     ]
 ```
 
-- [ ] **Step 4: Run to verify it passes**
+- [x] **Step 4: Run to verify it passes**
 
 Run: `python3 -m unittest tests/test_session_start.py -v 2>&1 | tail -3` → `OK`, 2 tests.
 Run: `python3 -c "import json; json.load(open('hooks/hooks.json')); print('hooks.json valid')"`.
 
-- [ ] **Step 5: Update SKILL.md** — three edits in `skills/ml-pipeline/SKILL.md`:
+- [x] **Step 5: Update SKILL.md** — three edits in `skills/ml-pipeline/SKILL.md`:
 
 (a) Replace the step 6 bullet in "What each step must produce" with:
 
@@ -973,7 +973,7 @@ number is above the ceiling.
   seed, a feature, or a threshold. Validation only.
 ```
 
-- [ ] **Step 6: Update README.md** — replace the body of "## Enforced, not just instructed" with:
+- [x] **Step 6: Update README.md** — replace the body of "## Enforced, not just instructed" with:
 
 ```markdown
 In Claude Code the plugin ships hooks. Before any command, file write, or notebook edit runs, a
@@ -990,7 +990,7 @@ accuracy. Beat it and you leaked. `ML_PIPELINE_ENFORCE=0` switches enforcement o
 projects. Codex and Kimi get the same rules as instructions (no hook support there).
 ```
 
-- [ ] **Step 7: Update `install-other-tools.sh`** — in `install_for`, after the `cp "$SKILL" ...` line add:
+- [x] **Step 7: Update `install-other-tools.sh`** — in `install_for`, after the `cp "$SKILL" ...` line add:
 
 ```bash
   mkdir -p "$home_dir/skills/ml-pipeline/lib"
@@ -1000,7 +1000,7 @@ projects. Codex and Kimi get the same rules as instructions (no hook support the
 Run: `bash -n install-other-tools.sh && ./install-other-tools.sh && ls ~/.codex/skills/ml-pipeline/lib/`
 Expected: both files listed.
 
-- [ ] **Step 8: Run all stdlib tests, then commit**
+- [x] **Step 8: Run all stdlib tests, then commit**
 
 Run: `python3 -m unittest discover tests 2>&1 | tail -3` → `OK`.
 
@@ -1029,7 +1029,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 - Consumes: `_strings()` from `hooks/guard_training.py` (Task 1's module, unchanged signature).
 - Produces: `warnings(code: str, output: str) -> list[str]`; hook JSON with `hookSpecificOutput.additionalContext` (prefixed `ml-pipeline: `) and `systemMessage`, or `{}`.
 
-- [ ] **Step 1: Write the failing tests** — create `tests/test_post_tool_warn.py`:
+- [x] **Step 1: Write the failing tests** — create `tests/test_post_tool_warn.py`:
 
 ```python
 """Tests for hooks/post_tool_warn.py: python3 -m unittest tests/test_post_tool_warn.py"""
@@ -1110,12 +1110,12 @@ if __name__ == "__main__":
     unittest.main()
 ```
 
-- [ ] **Step 2: Run to verify they fail**
+- [x] **Step 2: Run to verify they fail**
 
 Run: `python3 -m unittest tests/test_post_tool_warn.py 2>&1 | tail -3`
 Expected: `ModuleNotFoundError: No module named 'post_tool_warn'`.
 
-- [ ] **Step 3: Implement** — create `hooks/post_tool_warn.py`:
+- [x] **Step 3: Implement** — create `hooks/post_tool_warn.py`:
 
 ```python
 #!/usr/bin/env python3
@@ -1202,12 +1202,12 @@ Register in `hooks/hooks.json` — add a `PostToolUse` key:
     ]
 ```
 
-- [ ] **Step 4: Run to verify they pass**
+- [x] **Step 4: Run to verify they pass**
 
 Run: `python3 -m unittest tests/test_post_tool_warn.py -v 2>&1 | tail -3` → `OK`, 9 tests.
 Run: `python3 -m unittest discover tests 2>&1 | tail -3` → `OK`.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add hooks/post_tool_warn.py hooks/hooks.json tests/test_post_tool_warn.py
@@ -1236,7 +1236,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 - Consumes: the plugin as installed from the repo root (`claude plugin eval .`).
 - Produces: a scored eval run under `evals/results/<timestamp>/` (gitignored in Task 2).
 
-- [ ] **Step 1: Write the case files**
+- [x] **Step 1: Write the case files**
 
 `evals/gate-stop/prompt.md`:
 
@@ -1335,12 +1335,12 @@ FAIL if it reports the accuracy of a trained model, says a model has been traine
 
 Make the scaffold executable: `chmod +x evals/gate-stop/fixture.sh`.
 
-- [ ] **Step 2: Validate the plugin and list the case**
+- [x] **Step 2: Validate the plugin and list the case**
 
 Run: `claude plugin validate . && claude plugin eval . --case gate-stop --runs 1 --ablation none --scaffold --allow-tools Bash Write --max-cost-usd 3 --no-publish --json evals/results/gate-stop-smoke.json 2>&1 | tail -25`
 Expected: the run completes; in the summary, `skill-fired` PASS, `no-training-bash` PASS, `no-training-write` PASS, `stops-at-gate-a` PASS; case score 1.0. If `stops-at-gate-a` fails, read the final message in the JSON and tighten the rubric wording or the skill text — do not loosen the `.fit(` graders.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add evals/gate-stop
@@ -1360,7 +1360,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 **Files:**
 - Modify: `.claude-plugin/plugin.json`, `.codex-plugin/plugin.json`
 
-- [ ] **Step 1: Bump versions**
+- [x] **Step 1: Bump versions**
 
 ```bash
 sed -i '' 's/"version": "0.2.0"/"version": "0.3.0"/' .claude-plugin/plugin.json .codex-plugin/plugin.json
@@ -1369,7 +1369,7 @@ grep -n '"version"' .claude-plugin/plugin.json .codex-plugin/plugin.json
 
 Expected: both show `0.3.0`.
 
-- [ ] **Step 2: Run every suite**
+- [x] **Step 2: Run every suite**
 
 ```bash
 python3 -m unittest discover tests 2>&1 | tail -3
@@ -1379,7 +1379,7 @@ claude plugin validate .
 
 Expected: `OK` twice, validate clean.
 
-- [ ] **Step 3: Commit, push, open PR**
+- [x] **Step 3: Commit, push, open PR**
 
 ```bash
 git add .claude-plugin/plugin.json .codex-plugin/plugin.json
@@ -1392,7 +1392,7 @@ gh pr create --title "v0.3.0: behavioural leakage enforcement, runtime guard, ca
 🤖 Generated with [Claude Code](https://claude.com/claude-code)"
 ```
 
-- [ ] **Step 4: Verify the scanner on the PR branch**
+- [x] **Step 4: Verify the scanner on the PR branch**
 
 Run: `gh run list --branch v0.3-behavioural-leakage --workflow "HOL Plugin Scanner" --limit 1` then `gh run view <id> --log | grep -E "Final Score|Findings:"`
 Expected: `Final Score: 98/100` or higher, `critical:0, high:0`.
