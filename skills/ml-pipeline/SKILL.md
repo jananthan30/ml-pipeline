@@ -59,6 +59,17 @@ per finished step, and dated gate approvals. Update it after every step. On any 
 read it first and resume from the first unfinished step — never restart, never skip ahead
 of it.
 
+Record each gate approval on its own line in exactly this shape — the enforcement hook
+parses it:
+
+```
+- Gate A: approved 2026-09-16
+- Gate B: approved 2026-09-17
+- Override: Gate B - user approved skipping to training 2026-09-17 - reason: <why>
+```
+
+A line that says a gate is `todo`, `pending`, or `not yet approved` never counts as approval.
+
 ## Tools: marimo notebooks + matplotlib visuals
 
 - **The workbench is a marimo notebook**, not loose scripts. Keep notebooks in
@@ -118,6 +129,21 @@ of it.
 16. **Monitoring + retraining** — write down: what drift to watch (input and prediction
     distributions), what metric threshold triggers retraining, and how retraining reuses
     this same pipeline from step 1.
+
+## Enforcement in Claude Code (hook)
+
+Installed as a Claude Code plugin, `hooks/guard_training.py` runs before every Bash, Write,
+Edit, and notebook tool call, scans the code for fitting and training calls, and **denies**:
+
+- **model training** until PIPELINE.md has `Gate B: approved …` or an `Override: Gate B …`
+  line. With no `ml_pipeline/PIPELINE.md` at all, training is denied with a pointer to step 1.
+- **any fitting** — scalers, encoders, imputers included — until `Gate A: approved …`.
+- **fitting on the test split** (`X_test`, `df_test`, `test_*`) — always, at every gate.
+
+A denial is not an obstacle to route around: do the missing steps, get the user's explicit
+approval, record the gate line, and retry. The hook fails open on its own errors, and
+`ML_PIPELINE_ENFORCE=0` switches it off for projects that are not ML pipelines. Codex and Kimi
+have no hook support, so there the same rules apply as instructions only.
 
 ## Non-negotiables
 
