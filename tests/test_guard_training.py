@@ -262,6 +262,57 @@ class GateRecording(unittest.TestCase):
         self.assertEqual(run(write_md(ledger + "- Gate D: approved 2026-09-19\n"), pipeline_md="", tool="Write", files=files)[0], "allow")
 
 
+def profile_with(**traits):
+    base = {"n_rows": 1000, "n_features": 5, "task": "binary", "minority_frac": 0.4, "has_datetime": False,
+            "has_groups": False, "small_data": True, "imbalanced": False, "high_card_categoricals": []}
+    base.update(traits)
+    return {"ml_pipeline/data_profile.json": json.dumps({"traits": base})}
+
+
+class RedFlags(unittest.TestCase):
+    """Provably wrong model applications are denied; each has an override line."""
+
+    def test_neural_net_on_small_data(self):
+        decision, reason = run({"command": "clf = MLPClassifier()\nclf.fit(X_train, y_train)"}, GATE_AB, files=profile_with(small_data=True))
+        self.assertEqual(decision, "deny")
+        self.assertIn("red flag neural-net-small-data", reason)
+
+    def test_neural_net_without_training_call_is_fine(self):
+        self.assertEqual(run({"command": "from sklearn.neural_network import MLPClassifier"}, GATE_AB, files=profile_with())[0], "allow")
+
+    def test_random_split_on_temporal_data(self):
+        decision, reason = run({"command": "train_test_split(X, y, test_size=0.2)"}, GATE_A, files=profile_with(has_datetime=True))
+        self.assertEqual(decision, "deny")
+        self.assertIn("red flag random-split-temporal", reason)
+        self.assertEqual(run({"command": "TimeSeriesSplit(n_splits=5)"}, GATE_A, files=profile_with(has_datetime=True))[0], "allow")
+
+    def test_group_split(self):
+        decision, reason = run({"command": "KFold(n_splits=5)"}, GATE_A, files=profile_with(has_groups=True))
+        self.assertEqual(decision, "deny")
+        self.assertIn("red flag group-split", reason)
+        self.assertEqual(run({"command": "GroupKFold(n_splits=5)"}, GATE_A, files=profile_with(has_groups=True))[0], "allow")
+
+    def test_accuracy_selection_on_imbalanced(self):
+        decision, reason = run({"command": "GridSearchCV(clf, grid, scoring='accuracy')"}, GATE_AB, files=profile_with(imbalanced=True, minority_frac=0.05))
+        self.assertEqual(decision, "deny")
+        self.assertIn("red flag accuracy-imbalanced", reason)
+        self.assertEqual(run({"command": "GridSearchCV(clf, grid, scoring='average_precision')"}, GATE_AB, files=profile_with(imbalanced=True))[0], "allow")
+
+    def test_resample_before_split(self):
+        decision, reason = run({"command": "X_res, y_res = SMOTE().fit_resample(X, y)"}, GATE_AB, files=profile_with())
+        self.assertEqual(decision, "deny")
+        self.assertIn("red flag resample-before-split", reason)
+        self.assertEqual(run({"command": "SMOTE().fit_resample(X_train, y_train)"}, GATE_AB, files=profile_with())[0], "allow")
+
+    def test_override_lifts_one_flag(self):
+        md = GATE_A + "- Override: red flag random-split-temporal - user approved a random split 2026-09-16 - reason: signup date only\n"
+        self.assertEqual(run({"command": "train_test_split(X, y)"}, md, files=profile_with(has_datetime=True))[0], "allow")
+        self.assertEqual(run({"command": "KFold(5)"}, md, files=profile_with(has_datetime=True, has_groups=True))[0], "deny")
+
+    def test_no_profile_no_flags(self):
+        self.assertEqual(run({"command": "train_test_split(X, y)"}, GATE_A)[0], "allow")
+
+
 class PipelineDiscovery(unittest.TestCase):
     def test_found_from_a_subdirectory(self):
         self.assertEqual(run({"command": "clf.fit(X_train, y_train)"}, GATE_AB, cwd_sub="notebooks/sub")[0], "allow")

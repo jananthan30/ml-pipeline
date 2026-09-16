@@ -172,6 +172,59 @@ def _state_dir_for(tool_input: dict, cwd: str) -> Path:
     return found.parent if found else Path(cwd or ".").resolve() / "ml_pipeline"
 
 
+# ------------------------------------------------------------------ red flags (need a profile)
+RED_FLAGS = [
+    ("neural-net-small-data", lambda t: bool(t.get("small_data")),
+     re.compile(r"\b(?:MLPClassifier|MLPRegressor|Sequential|keras|torch\.nn|nn\.Module|tensorflow|tf\.keras)\b"),
+     "a neural net on {n_rows:,} rows overfits and hides it - start with a regularized linear model or gradient boosting"),
+    ("random-split-temporal", lambda t: bool(t.get("has_datetime")),
+     re.compile(r"\b(?:train_test_split|KFold|StratifiedKFold|ShuffleSplit|RepeatedKFold)\s*\("),
+     "the data has a datetime column, so a random split leaks the future into training - use guard.split(time_col=...) or TimeSeriesSplit"),
+    ("group-split", lambda t: bool(t.get("has_groups")),
+     re.compile(r"\b(?:train_test_split|KFold|StratifiedKFold|ShuffleSplit|RepeatedKFold|TimeSeriesSplit)\s*\("),
+     "rows share an entity, so any split that is not group-aware leaks - use guard.split(group_col=...) or GroupKFold"),
+    ("accuracy-imbalanced", lambda t: bool(t.get("imbalanced")),
+     re.compile(r"scoring\s*=\s*[\"']accuracy[\"']"),
+     "the minority class is {minority_pct} of rows, so accuracy rewards ignoring it - select on average_precision, f1, or balanced_accuracy"),
+]
+RESAMPLE = re.compile(r"fit_resample\s*\(([^)]*)\)")
+OVERRIDE_FLAG = re.compile(r"^.*\boverrid(?:e|den)\b.*\bred flag\s+([a-z-]+)\b.*$", re.I | re.M)
+RED_FLAG_MSG = "ml-pipeline: red flag {0}: {1}. Override with '- Override: red flag {0} - ...' in ml_pipeline/PIPELINE.md."
+
+
+def _load_profile(state_dir: Path) -> dict | None:
+    path = state_dir / PROFILE_FILE
+    if not path.is_file():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except ValueError:
+        return None
+
+
+def overridden_flags(markdown: str) -> set[str]:
+    return {m.group(1).lower() for m in OVERRIDE_FLAG.finditer(markdown) if not NEGATED.search(m.group(0))}
+
+
+def red_flag(code: str, traits: dict, overrides: set[str]) -> str | None:
+    """The first red flag the code trips given the profile's traits, or None."""
+    values = {"n_rows": int(traits.get("n_rows") or 0),
+              "minority_pct": f"{float(traits.get('minority_frac') or 0):.1%}"}
+    trains = ".fit" in code or bool(TRAIN_API.search(code))
+    for name, applies, pattern, why in RED_FLAGS:
+        if name in overrides or not applies(traits) or not pattern.search(code):
+            continue
+        if name == "neural-net-small-data" and not trains:
+            continue
+        return RED_FLAG_MSG.format(name, why.format(**values))
+    if "resample-before-split" not in overrides:
+        for match in RESAMPLE.finditer(code):
+            if "train" not in match.group(1).lower():
+                return RED_FLAG_MSG.format("resample-before-split",
+                                           f"resampling must fit on the training split only ({match.group(0)[:60]}) - split first, then fit_resample(X_train, y_train)")
+    return None
+
+
 def _strings(obj, out: list[str] | None = None) -> list[str]:
     """Every string value in a tool_input tree, minus keys that describe rather than contain code."""
     out = [] if out is None else out
@@ -324,6 +377,15 @@ def main() -> int:
         target = str(tool_input.get("file_path") or tool_input.get("notebook_path") or "")
         if target and Path(target).suffix.lower() in DOC_SUFFIXES:
             return _emit(None)
+        # 2b. Red flags: wrong applications the data profile can prove.
+        state_dir = _state_dir_for(tool_input, cwd)
+        profile = _load_profile(state_dir)
+        if profile is not None:
+            pipeline_md = state_dir / "PIPELINE.md"
+            markdown = pipeline_md.read_text(encoding="utf-8", errors="replace") if pipeline_md.is_file() else ""
+            reason = red_flag(COMMENT.sub("", text), profile.get("traits") or {}, overridden_flags(markdown))
+            if reason:
+                return _emit(reason)
         # 3. Fast path: nothing to look at.
         if ".fit" not in text and not TRAIN_API.search(text) and not EVAL_CALL.search(text):
             return _emit(None)
