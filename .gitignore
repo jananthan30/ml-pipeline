@@ -1,3 +1,5 @@
 ml_pipeline/
 __pycache__/
 .DS_Store
+.venv/
+evals/results/
