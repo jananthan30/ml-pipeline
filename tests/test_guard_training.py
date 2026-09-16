@@ -33,14 +33,20 @@ def _stdin(text: str):
         sys.stdin = old
 
 
-def run(tool_input, pipeline_md=None, tool="Bash", env=None, cwd_sub=""):
+def run(tool_input, pipeline_md=None, tool="Bash", env=None, cwd_sub="", files=None):
     """Run the hook against a temp project. Returns (decision, reason)."""
     with tempfile.TemporaryDirectory() as tmp:
         if pipeline_md is not None:
-            (Path(tmp) / "ml_pipeline").mkdir()
+            (Path(tmp) / "ml_pipeline").mkdir(exist_ok=True)
             (Path(tmp) / "ml_pipeline" / "PIPELINE.md").write_text(pipeline_md)
+        for rel, data in (files or {}).items():
+            path = Path(tmp) / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data if isinstance(data, bytes) else data.encode())
         cwd = Path(tmp) / cwd_sub
         cwd.mkdir(parents=True, exist_ok=True)
+        if "file_path" in tool_input and str(tool_input["file_path"]).startswith("./"):
+            tool_input = {**tool_input, "file_path": str(Path(tmp) / tool_input["file_path"][2:])}
         payload = json.dumps({"tool_name": tool, "tool_input": tool_input, "cwd": str(cwd)})
         saved = dict(os.environ)
         os.environ.pop("ML_PIPELINE_ENFORCE", None)
@@ -180,6 +186,80 @@ class SelectionLeakage(unittest.TestCase):
 
     def test_transforming_test_is_preprocessing_not_evaluation(self):
         self.assertEqual(run({"command": "X_test_s = scaler.transform(X_test)"}, GATE_A)[0], "allow")
+
+
+PNG = b"\x89PNG\r\n\x1a\n" + b"\0" * 2000          # > 1,024 bytes, fine for the hook's size check
+TINY = b"\x89PNG\r\n\x1a\n" + b"\0" * 50
+LEDGER_A = ("- Figure 01_missingness.png: none missing.\n"
+            "- Figure 02_target_balance.png: 51% vs 49%.\n"
+            "- Figure 02_distributions.png: two skewed.\n")
+ARTIFACTS_A = {"ml_pipeline/data_profile.json": "{}", "ml_pipeline/figures/01_missingness.png": PNG,
+               "ml_pipeline/figures/02_target_balance.png": PNG, "ml_pipeline/figures/02_distributions.png": PNG}
+RATIONALE = ("Model rationale:\n- traits: binary, 1,000 rows (small)\n- baseline: dummy + logistic\n"
+             "- candidates: boosting\n- ruled out: neural nets (small data)\n- metric: PR-AUC\n")
+
+
+def write_md(content):
+    return {"file_path": "./ml_pipeline/PIPELINE.md", "content": content}
+
+
+class GateRecording(unittest.TestCase):
+    """A gate line is denied until that gate's artifacts exist on disk."""
+
+    def test_gate_a_denied_without_anything(self):
+        decision, reason = run(write_md("- Gate A: approved 2026-09-16\n"), pipeline_md="", tool="Write")
+        self.assertEqual(decision, "deny")
+        self.assertIn("data_profile.json missing", reason)
+        self.assertIn("figures/01_*.png 0 found (need 1)", reason)
+
+    def test_gate_a_allowed_when_complete(self):
+        decision, _ = run(write_md(LEDGER_A + "- Gate A: approved 2026-09-16\n"), pipeline_md="", tool="Write", files=ARTIFACTS_A)
+        self.assertEqual(decision, "allow")
+
+    def test_png_without_ledger_line_denied(self):
+        files = {**ARTIFACTS_A, "ml_pipeline/figures/02_extra.png": PNG}
+        decision, reason = run(write_md(LEDGER_A + "- Gate A: approved 2026-09-16\n"), pipeline_md="", tool="Write", files=files)
+        self.assertEqual(decision, "deny")
+        self.assertIn("02_extra.png has no '- Figure 02_extra.png:' line", reason)
+
+    def test_tiny_png_denied(self):
+        files = {**ARTIFACTS_A, "ml_pipeline/figures/01_missingness.png": TINY}
+        decision, reason = run(write_md(LEDGER_A + "- Gate A: approved 2026-09-16\n"), pipeline_md="", tool="Write", files=files)
+        self.assertEqual(decision, "deny")
+        self.assertIn("(empty?)", reason)
+
+    def test_ledger_in_existing_file_counts(self):
+        decision, _ = run(write_md("- Gate A: approved 2026-09-16\n"), pipeline_md=LEDGER_A, tool="Write", files=ARTIFACTS_A)
+        self.assertEqual(decision, "allow")
+
+    def test_bash_append_is_checked_too(self):
+        cmd = {"command": "echo '- Gate A: approved 2026-09-16' >> ml_pipeline/PIPELINE.md"}
+        self.assertEqual(run(cmd, pipeline_md="")[0], "deny")
+
+    def test_negated_line_is_not_a_recording(self):
+        self.assertEqual(run(write_md("- Gate A: not yet approved\n"), pipeline_md="", tool="Write")[0], "allow")
+
+    def test_gate_b_needs_rationale_and_figure(self):
+        files = {**ARTIFACTS_A, "ml_pipeline/figures/04_cleaning.png": PNG}
+        ledger = LEDGER_A + "- Figure 04_cleaning.png: 312 rows dropped.\n"
+        decision, reason = run(write_md(ledger + "- Gate B: approved 2026-09-17\n"), pipeline_md="", tool="Write", files=files)
+        self.assertEqual(decision, "deny")
+        self.assertIn("Model rationale block missing lines: traits, baseline, candidates, ruled out, metric", reason)
+        partial = "Model rationale:\n- traits: x\n- baseline: y\n"
+        decision, reason = run(write_md(ledger + partial + "- Gate B: approved 2026-09-17\n"), pipeline_md="", tool="Write", files=files)
+        self.assertIn("missing lines: candidates, ruled out, metric", reason)
+        decision, _ = run(write_md(ledger + RATIONALE + "- Gate B: approved 2026-09-17\n"), pipeline_md="", tool="Write", files=files)
+        self.assertEqual(decision, "allow")
+
+    def test_gate_c_and_d(self):
+        files = {**ARTIFACTS_A, "ml_pipeline/figures/12_roc.png": PNG, "ml_pipeline/figures/13_errors.png": PNG}
+        ledger = LEDGER_A + "- Figure 12_roc.png: AUC 0.8.\n- Figure 13_errors.png: worst slice.\n"
+        self.assertEqual(run(write_md(ledger + "- Gate C: approved 2026-09-18\n"), pipeline_md="", tool="Write", files=files)[0], "allow")
+        decision, reason = run(write_md(ledger + "- Gate D: approved 2026-09-19\n"), pipeline_md="", tool="Write", files=files)
+        self.assertEqual(decision, "deny")
+        self.assertIn("no '- Step 14 final test:' line", reason)
+        ledger += "- Step 14 final test: acc=0.79 (touch 1, 2026-09-19)\n"
+        self.assertEqual(run(write_md(ledger + "- Gate D: approved 2026-09-19\n"), pipeline_md="", tool="Write", files=files)[0], "allow")
 
 
 class PipelineDiscovery(unittest.TestCase):

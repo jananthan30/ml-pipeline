@@ -99,6 +99,78 @@ TEST_MSG = (
     "step 14, and is never fit on. Fit on the training split only."
 )
 
+# ------------------------------------------------------------------ gate recording
+PROFILE_FILE = "data_profile.json"
+FIGURES_DIR = "figures"
+MIN_PNG_BYTES = 1024
+GATE_REQUIREMENTS = {
+    "A": {"profile": True, "figures": {"01": 1, "02": 2}},
+    "B": {"figures": {"04": 1}, "rationale": True},
+    "C": {"figures": {"12": 1}},
+    "D": {"figures": {"13": 1}, "final_test_line": True},
+}
+RATIONALE_HEAD = re.compile(r"^\s*Model rationale:\s*$", re.I | re.M)
+RATIONALE_BULLETS = ("traits", "baseline", "candidates", "ruled out", "metric")
+LEDGER = re.compile(r"^\s*-\s*Figure\s+(\S+\.png):\s*\S", re.I | re.M)
+FINAL_TEST_LINE = re.compile(r"^\s*-\s*Step 14 final test:", re.I | re.M)
+GATE_RECORD_MSG = "ml-pipeline: Gate {0} can't be recorded: {1}."
+
+
+def approved_gates_in(text: str) -> list[str]:
+    """Gate letters that ``text`` records as approved (non-negated lines only)."""
+    gates = []
+    for match in GATE_LINE.finditer(text):
+        line = match.group(0)
+        if APPROVED.search(line) and not NEGATED.search(line):
+            gates.append(match.group(1).upper())
+    return gates
+
+
+def rationale_missing(text: str) -> list[str]:
+    """Bullets absent from the Model rationale block; all five when the block itself is absent."""
+    head = RATIONALE_HEAD.search(text)
+    if not head:
+        return list(RATIONALE_BULLETS)
+    window = "\n".join(text[head.end():].splitlines()[:12])
+    return [b for b in RATIONALE_BULLETS if not re.search(r"^\s*-\s*" + re.escape(b) + r"\s*:", window, re.I | re.M)]
+
+
+def gate_problems(gate: str, state_dir: Path, ledger_text: str) -> list[str]:
+    """Everything still missing before ``gate`` may be recorded, in the words the agent will read."""
+    required = GATE_REQUIREMENTS.get(gate, {})
+    problems: list[str] = []
+    if required.get("profile") and not (state_dir / PROFILE_FILE).is_file():
+        problems.append(f"{PROFILE_FILE} missing")
+    figures_dir = state_dir / FIGURES_DIR
+    figures = sorted(figures_dir.glob("*.png")) if figures_dir.is_dir() else []
+    for prefix, need in required.get("figures", {}).items():
+        have = [p for p in figures if p.name.startswith(prefix + "_")]
+        if len(have) < need:
+            problems.append(f"{FIGURES_DIR}/{prefix}_*.png {len(have)} found (need {need})")
+    ledgered = {m.group(1) for m in LEDGER.finditer(ledger_text)}
+    for png in figures:
+        size = png.stat().st_size
+        if size < MIN_PNG_BYTES:
+            problems.append(f"{FIGURES_DIR}/{png.name} is {size} bytes (empty?)")
+        if png.name not in ledgered:
+            problems.append(f"{png.name} has no '- Figure {png.name}:' line")
+    if required.get("rationale"):
+        missing = rationale_missing(ledger_text)
+        if missing:
+            problems.append("Model rationale block missing lines: " + ", ".join(missing))
+    if required.get("final_test_line") and not FINAL_TEST_LINE.search(ledger_text):
+        problems.append("no '- Step 14 final test:' line")
+    return problems
+
+
+def _state_dir_for(tool_input: dict, cwd: str) -> Path:
+    """The ml_pipeline/ directory this call concerns: next to the edited PIPELINE.md, else found from cwd."""
+    target = str(tool_input.get("file_path") or "")
+    if target.endswith("PIPELINE.md"):
+        return Path(target).resolve().parent
+    found = find_pipeline(cwd)
+    return found.parent if found else Path(cwd or ".").resolve() / "ml_pipeline"
+
 
 def _strings(obj, out: list[str] | None = None) -> list[str]:
     """Every string value in a tool_input tree, minus keys that describe rather than contain code."""
@@ -238,16 +310,27 @@ def main() -> int:
             return _emit(None)
         payload = json.load(sys.stdin)
         tool_input = payload.get("tool_input") or {}
+        cwd = payload.get("cwd") or os.getcwd()
+        text = "\n".join(_strings(tool_input))
+        # 1. Recording a gate: that gate's artifacts must already exist.
+        for gate in approved_gates_in(text):
+            state_dir = _state_dir_for(tool_input, cwd)
+            pipeline_md = state_dir / "PIPELINE.md"
+            existing = pipeline_md.read_text(encoding="utf-8", errors="replace") if pipeline_md.is_file() else ""
+            problems = gate_problems(gate, state_dir, existing + "\n" + text)
+            if problems:
+                return _emit(GATE_RECORD_MSG.format(gate, "; ".join(problems)))
+        # 2. Prose files are not code.
         target = str(tool_input.get("file_path") or tool_input.get("notebook_path") or "")
         if target and Path(target).suffix.lower() in DOC_SUFFIXES:
-            return _emit(None)  # prose about .fit() is not a fit
-        text = "\n".join(_strings(tool_input))
+            return _emit(None)
+        # 3. Fast path: nothing to look at.
         if ".fit" not in text and not TRAIN_API.search(text) and not EVAL_CALL.search(text):
-            return _emit(None)  # fast path: nothing to look at
+            return _emit(None)
         found = analyse(text)
         if not any(found.values()):
             return _emit(None)
-        pipeline = find_pipeline(payload.get("cwd") or os.getcwd())
+        pipeline = find_pipeline(cwd)
         gates = gate_state(pipeline.read_text(encoding="utf-8", errors="replace")) if pipeline else None
         return _emit(decide(found, gates))
     except Exception as exc:  # fail open: never lock the user out because of us
