@@ -20,6 +20,8 @@ import guard_training as hook  # noqa: E402
 GATE_A = "# Pipeline\n- Gate A: approved 2026-09-16\n"
 GATE_AB = GATE_A + "- Gate B: approved 2026-09-17\n"
 OVERRIDE = GATE_A + "- Override: Gate B - user approved skipping to training 2026-09-17 - reason: deadline\n"
+GATE_ABC = GATE_AB + "- Gate C: approved 2026-09-18\n"
+OVERRIDE_C = GATE_AB + "- Override: Gate C - user approved evaluating on the test set 2026-09-18 - reason: demo\n"
 
 
 @contextlib.contextmanager
@@ -154,6 +156,30 @@ class AfterGateB(unittest.TestCase):
     def test_train_test_split_itself_is_fine(self):
         cmd = "X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2)\nclf.fit(X_train, y_train)"
         self.assertEqual(run({"command": cmd}, GATE_AB)[0], "allow")
+
+
+class SelectionLeakage(unittest.TestCase):
+    """Evaluating on the test split before Gate C is selection leakage — the kind that matters most."""
+
+    def test_metric_on_test_before_gate_c_denied(self):
+        decision, reason = run({"command": "print(accuracy_score(y_test, clf.predict(X_test)))"}, GATE_AB)
+        self.assertEqual(decision, "deny")
+        self.assertIn("Gate C", reason)
+
+    def test_score_on_test_without_pipeline_denied(self):
+        self.assertEqual(run({"command": "clf.score(X_test, y_test)"})[0], "deny")
+
+    def test_metric_on_test_after_gate_c_allowed(self):
+        self.assertEqual(run({"command": "accuracy_score(y_test, clf.predict(X_test))"}, GATE_ABC)[0], "allow")
+
+    def test_override_c_allows(self):
+        self.assertEqual(run({"command": "clf.score(X_test, y_test)"}, OVERRIDE_C)[0], "allow")
+
+    def test_validation_evaluation_is_fine(self):
+        self.assertEqual(run({"command": "roc_auc_score(y_val, clf.predict_proba(X_val)[:, 1])"}, GATE_AB)[0], "allow")
+
+    def test_transforming_test_is_preprocessing_not_evaluation(self):
+        self.assertEqual(run({"command": "X_test_s = scaler.transform(X_test)"}, GATE_A)[0], "allow")
 
 
 class PipelineDiscovery(unittest.TestCase):
