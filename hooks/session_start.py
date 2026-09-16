@@ -18,7 +18,7 @@ def main() -> int:
     lib = os.path.join(root, "lib")
     context = (
         "ml-pipeline runtime helpers: guard library at "
-        f"{os.path.join(lib, 'mlpipeline_guard.py')} - copy it to ml_pipeline/guard.py at step 6 and use "
+        f"{os.path.join(lib, 'mlpipeline_guard.py')} - copy it to ml_pipeline/guard.py at step 6, not before, and use "
         "guard.split() / guard.final_test(); canary dataset generator at "
         f"{os.path.join(lib, 'mlpipeline_canary.py')} (honest accuracy ceiling 0.80; above it means leakage)."
     )
