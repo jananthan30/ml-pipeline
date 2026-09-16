@@ -4,7 +4,8 @@
 
 Coding agents love to call `.fit()` five minutes into an ML task — before looking at the
 data, before there's a test set, before anyone agreed on what is being predicted. This
-plugin forces a strict, data-first 16-step pipeline with explicit user-permission gates:
+plugin forces a strict, data-first 16-step pipeline with explicit user-permission gates —
+and, in Claude Code, a hook that makes skipping them impossible:
 
 ![The ml-pipeline flow: 16 steps across 4 phases — Understand, Prepare, Model, Prove & Ship — each ending in a permission gate](assets/pipeline.svg)
 
@@ -47,6 +48,16 @@ enforcement section to each tool's global `AGENTS.md`.
   figures saved to `ml_pipeline/figures/`, each explained in 1–2 plain sentences.
 - **Resumable** — `ml_pipeline/PIPELINE.md` tracks every step and approval, so a new
   session continues where the last one stopped.
+
+## Enforced, not just instructed
+
+In Claude Code the plugin ships a `PreToolUse` hook. Before any command, file write, or
+notebook edit runs, it scans the code for training calls and **denies** them unless
+`ml_pipeline/PIPELINE.md` records the gate that unlocks them: nothing is fit before Gate A,
+no model is trained before Gate B, and the test split is never fit on. A denied call tells
+the agent exactly which steps are missing — so "just train it" fails closed until you have
+approved the gate. `ML_PIPELINE_ENFORCE=0` switches it off for non-ML projects. Codex and
+Kimi get the same rules as instructions (no hook support there).
 
 ## License
 

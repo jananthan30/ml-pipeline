@@ -1,0 +1,17 @@
+{
+  "description": "ml-pipeline enforcement: deny model training until ml_pipeline/PIPELINE.md records the approved gate",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Write|Edit|MultiEdit|NotebookEdit|mcp__.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/guard_training.py\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
