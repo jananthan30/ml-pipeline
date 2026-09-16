@@ -30,7 +30,7 @@
 - [x] Task 5 — SessionStart hook + skill/README/installer updates (guard usage at steps 6/14, `git tag gate-X`)
 - [x] Task 6 — PostToolUse warning hook (too-good metrics, unsafe `train_test_split`)
 - [x] Task 7 — Eval case `gate-stop`
-- [ ] Task 8 — Release 0.3.0 (version bump, full test run, PR, scanner, release, local plugin update)
+- [x] Task 8 — Release 0.3.0 (version bump, full test run, PR, scanner, release, local plugin update)
 
 Backlog (separate plans, not in scope): evaluator agent + hacker-fixer hardening · `mlw` trial · search module for steps 10–11 · per-phase budgets · `canary-honesty` eval case.
 
@@ -1397,7 +1397,7 @@ gh pr create --title "v0.3.0: behavioural leakage enforcement, runtime guard, ca
 Run: `gh run list --branch v0.3-behavioural-leakage --workflow "HOL Plugin Scanner" --limit 1` then `gh run view <id> --log | grep -E "Final Score|Findings:"`
 Expected: `Final Score: 98/100` or higher, `critical:0, high:0`.
 
-- [ ] **Step 5: After the user merges — release and update the local plugin**
+- [x] **Step 5: After the user merges — release and update the local plugin**
 
 ```bash
 git checkout main && git pull
