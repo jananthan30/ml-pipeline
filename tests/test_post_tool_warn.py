@@ -72,5 +72,34 @@ class MainRoundTrip(unittest.TestCase):
         self.assertIn("hook error", json.loads(out.getvalue())["systemMessage"])
 
 
+
+class TraitWarnings(unittest.TestCase):
+    def test_slow_models_on_large_n(self):
+        out = hook.trait_warnings("KNeighborsClassifier().fit(X_train, y_train)", {"n_rows": 120000})
+        self.assertTrue(any("scales badly" in w for w in out))
+        self.assertEqual(hook.trait_warnings("KNeighborsClassifier()", {"n_rows": 1000}), [])
+
+    def test_one_hot_on_high_cardinality(self):
+        out = hook.trait_warnings("pd.get_dummies(df)", {"high_card_categoricals": ["zip"]})
+        self.assertTrue(any("zip" in w for w in out))
+
+    def test_accuracy_reported_on_imbalanced(self):
+        out = hook.trait_warnings("print(accuracy_score(y_val, pred))", {"imbalanced": True})
+        self.assertTrue(any("imbalanced" in w for w in out))
+        self.assertEqual(hook.trait_warnings("print(accuracy_score(y_val, pred))", {"imbalanced": False}), [])
+
+    def test_main_reads_profile_from_cwd(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "ml_pipeline").mkdir()
+            (Path(tmp) / "ml_pipeline" / "data_profile.json").write_text(json.dumps({"traits": {"imbalanced": True}}))
+            payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": "accuracy_score(y_val, p)"},
+                                  "tool_response": "0.93", "cwd": tmp})
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out), _stdin(payload):
+                hook.main()
+        self.assertIn("imbalanced", json.loads(out.getvalue())["hookSpecificOutput"]["additionalContext"])
+
 if __name__ == "__main__":
     unittest.main()
