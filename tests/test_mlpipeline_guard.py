@@ -222,5 +222,56 @@ class Profile(unittest.TestCase):
         self.assertEqual(p["shape"]["sample_rows"], 300)
         self.assertEqual(p["shape"]["n_rows"], 1000)
 
+
+class Figures(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.state = Path(self.tmp.name) / "ml_pipeline"
+        self.md = self.state / "PIPELINE.md"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_eda_figures_writes_required_set_with_ledger(self):
+        paths = guard.eda_figures(frame(dates=True), target="y", time_col="date", state_dir=self.state)
+        names = sorted(p.name for p in paths)
+        self.assertEqual(names, ["01_missingness.png", "02_correlations.png", "02_distributions.png",
+                                 "02_target_balance.png", "02_temporal_coverage.png"])
+        for p in paths:
+            self.assertGreater(p.stat().st_size, 1024, p.name)
+            self.assertIn(f"- Figure {p.name}: ", self.md.read_text())
+
+    def test_no_temporal_figure_without_dates(self):
+        names = {p.name for p in guard.eda_figures(frame(), target="y", state_dir=self.state)}
+        self.assertNotIn("02_temporal_coverage.png", names)
+
+    def test_fig_saves_and_ledgers(self):
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        f, ax = plt.subplots()
+        ax.plot([0, 1], [0, 1])
+        path = guard.fig(12, "ROC curve", f, "AUC 0.81 on validation, baseline 0.50.", state_dir=self.state)
+        self.assertEqual(path.name, "12_roc_curve.png")
+        self.assertGreater(path.stat().st_size, 1024)
+        self.assertIn("- Figure 12_roc_curve.png: AUC 0.81", self.md.read_text())
+
+    def test_fig_requires_explanation(self):
+        import matplotlib.pyplot as plt
+        with self.assertRaises(ValueError):
+            guard.fig(4, "x", plt.figure(), "   ", state_dir=self.state)
+
+    def test_missing_matplotlib_is_a_clear_error(self):
+        import sys
+        saved = {k: sys.modules.pop(k) for k in list(sys.modules) if k == "matplotlib" or k.startswith("matplotlib.")}
+        sys.modules["matplotlib"] = None  # makes `import matplotlib` raise ImportError
+        try:
+            with self.assertRaises(RuntimeError) as ctx:
+                guard.eda_figures(frame(), target="y", state_dir=self.state)
+            self.assertIn("pip install matplotlib", str(ctx.exception))
+        finally:
+            del sys.modules["matplotlib"]
+            sys.modules.update(saved)
+
 if __name__ == "__main__":
     unittest.main()

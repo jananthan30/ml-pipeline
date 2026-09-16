@@ -391,3 +391,122 @@ def profile(
     state_dir.mkdir(parents=True, exist_ok=True)
     (state_dir / PROFILE_FILE).write_text(json.dumps(result, indent=2, default=str))
     return result
+
+
+# ------------------------------------------------------------------ figures (steps 1-2 and any step)
+FIGURES_DIR = "figures"
+
+
+def _plt():
+    try:
+        import matplotlib
+    except ImportError as exc:
+        raise RuntimeError("matplotlib is required for figures: pip install matplotlib") from exc
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    return plt
+
+
+def _ledger(pipeline_md: Path, filename: str, explanation: str) -> None:
+    line = f"- Figure {filename}: {explanation.strip()}\n"
+    pipeline_md.parent.mkdir(parents=True, exist_ok=True)
+    existing = pipeline_md.read_text().rstrip("\n") + "\n" if pipeline_md.is_file() else ""
+    if line not in existing:
+        pipeline_md.write_text(existing + line)
+
+
+def fig(step: int, name: str, figure, explanation: str, state_dir: str | Path = "ml_pipeline") -> Path:
+    """Save a matplotlib figure as ml_pipeline/figures/NN_<slug>.png and record its explanation."""
+    if not explanation or not explanation.strip():
+        raise ValueError("every figure needs an explanation: what it shows and why it matters")
+    plt = _plt()
+    figure = getattr(figure, "figure", figure)  # accept an Axes too
+    state_dir = Path(state_dir)
+    out_dir = state_dir / FIGURES_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
+    slug = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+    path = out_dir / f"{int(step):02d}_{slug}.png"
+    figure.savefig(path, dpi=120, bbox_inches="tight")
+    plt.close(figure)
+    _ledger(state_dir / "PIPELINE.md", path.name, explanation)
+    return path
+
+
+def eda_figures(df: pd.DataFrame, *, target: str, time_col: str | None = None,
+                state_dir: str | Path = "ml_pipeline") -> list[Path]:
+    """The required step 1-2 figures, each with an explanation computed from the data."""
+    plt = _plt()
+    paths: list[Path] = []
+    n = len(df)
+
+    missing = df.isna().mean().sort_values(ascending=False)
+    f, ax = plt.subplots(figsize=(8, max(3, 0.25 * len(missing))))
+    ax.barh(missing.index.astype(str)[::-1], missing.to_numpy()[::-1])
+    ax.set_xlabel("missing fraction")
+    ax.set_title("Missing values per column")
+    n_missing = int((missing > 0).sum())
+    paths.append(fig(1, "missingness", f,
+                     f"{n_missing} of {len(missing)} columns have missing values; worst is {missing.index[0]} "
+                     f"at {missing.iloc[0]:.1%}." if n_missing else "No column has missing values.", state_dir))
+
+    y = df[target]
+    f, ax = plt.subplots(figsize=(6, 4))
+    if pd.api.types.is_numeric_dtype(y) and not pd.api.types.is_bool_dtype(y) and y.nunique() > 20:
+        ax.hist(y.dropna(), bins=30)
+        ax.set_title(f"Target {target} distribution")
+        explanation = (f"{target} ranges {y.min():.3g} to {y.max():.3g} with median {y.median():.3g}; "
+                       "a mean-predictor baseline is the number to beat.")
+    else:
+        balance = y.astype(str).value_counts(normalize=True)
+        ax.bar(balance.index, balance.to_numpy())
+        ax.set_title(f"Target {target} balance")
+        explanation = (f"{target}={balance.index[0]} is {balance.iloc[0]:.1%} of {n:,} rows, so a majority-class "
+                       f"dummy scores {balance.iloc[0]:.1%}; the minority share is {balance.min():.1%}.")
+    paths.append(fig(2, "target_balance", f, explanation, state_dir))
+
+    numeric = df.select_dtypes("number").drop(columns=[target], errors="ignore").iloc[:, :12]
+    if numeric.shape[1]:
+        cols = numeric.shape[1]
+        rows = int(np.ceil(cols / 4))
+        f, axes = plt.subplots(rows, 4, figsize=(12, 2.6 * rows))
+        axes = np.atleast_1d(axes).ravel()
+        for ax, col in zip(axes, numeric.columns):
+            ax.hist(numeric[col].dropna(), bins=30)
+            ax.set_title(str(col), fontsize=9)
+        for ax in axes[cols:]:
+            ax.axis("off")
+        skewed = [str(c) for c in numeric.columns if abs(float(numeric[c].skew())) > 1]
+        paths.append(fig(2, "distributions", f,
+                         f"Histograms of {cols} numeric features; {len(skewed)} are strongly skewed "
+                         f"({', '.join(skewed[:5]) or 'none'}), which matters for scaling and outliers.", state_dir))
+
+    with_target = df.select_dtypes("number").iloc[:, :30]
+    if target in df.columns and target not in with_target.columns:
+        with_target = with_target.assign(**{target: pd.factorize(df[target])[0]})
+    if with_target.shape[1] >= 2:
+        corr = with_target.corr()
+        f, ax = plt.subplots(figsize=(7, 6))
+        image = ax.imshow(corr.to_numpy(), vmin=-1, vmax=1, cmap="coolwarm")
+        ax.set_xticks(range(len(corr)))
+        ax.set_xticklabels([str(c) for c in corr.columns], rotation=90, fontsize=7)
+        ax.set_yticks(range(len(corr)))
+        ax.set_yticklabels([str(c) for c in corr.columns], fontsize=7)
+        f.colorbar(image)
+        ax.set_title("Correlations")
+        ranked = corr[target].drop(target).abs().sort_values(ascending=False) if target in corr.columns else pd.Series(dtype=float)
+        explanation = (f"Strongest correlation with {target}: {ranked.index[0]} ({ranked.iloc[0]:.2f}); anything "
+                       "above 0.95 is a leakage suspect." if len(ranked) else "Correlations between numeric features.")
+        paths.append(fig(2, "correlations", f, explanation, state_dir))
+
+    datetime_cols = [c for c in df.columns if pd.api.types.is_datetime64_any_dtype(df[c])]
+    tcol = time_col or (datetime_cols[0] if datetime_cols else None)
+    if tcol is not None:
+        counts = df[tcol].dt.to_period("M").value_counts().sort_index()
+        f, ax = plt.subplots(figsize=(9, 3.5))
+        ax.plot([str(p) for p in counts.index], counts.to_numpy())
+        ax.tick_params(axis="x", rotation=90, labelsize=7)
+        ax.set_title(f"Rows per month over {tcol}")
+        paths.append(fig(2, "temporal_coverage", f,
+                         f"{tcol} spans {str(df[tcol].min())[:10]} to {str(df[tcol].max())[:10]} over {len(counts)} months; "
+                         "a chronological split must hold out the latest period.", state_dir))
+    return paths
