@@ -30,7 +30,7 @@
 - [x] Task 5 — PostToolUse: trait-aware warnings
 - [x] Task 6 — Playbook + skill / README / SessionStart / installer
 - [x] Task 7 — Eval case `understand-first`
-- [ ] Task 8 — Release 0.4.0
+- [x] Task 8 — Release 0.4.0
 
 ---
 
@@ -1455,7 +1455,7 @@ gh pr create --title "v0.4.0: understand first - data profile, figures every tim
 Run: `gh run list --branch v0.4-understand-first --workflow "HOL Plugin Scanner" --limit 1`, then `gh run view <id> --log | grep -E "Final Score|Findings:"`.
 Expected: `Final Score: 98/100` or higher, `critical:0, high:0`.
 
-- [ ] **Step 5: After the user's merge decision — release and update the local plugin**
+- [x] **Step 5: After the user's merge decision — release and update the local plugin**
 
 ```bash
 git checkout main && git pull
