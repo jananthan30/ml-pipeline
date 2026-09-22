@@ -14,9 +14,11 @@ sanctioned way to touch that test set, and it works once.
 """
 from __future__ import annotations
 
+import csv
 import hashlib
 import json
 import re
+import warnings
 from datetime import date
 from pathlib import Path
 
@@ -715,3 +717,138 @@ def eda_figures(df: pd.DataFrame, *, target: str, time_col: str | None = None,
                          f"{tcol} spans {str(df[tcol].min())[:10]} to {str(df[tcol].max())[:10]} over {len(counts)} months; "
                          "a chronological split must hold out the latest period.", state_dir))
     return paths
+
+
+# ------------------------------------------------------------------ records (steps 1-8)
+DICTIONARY_FILE = "data_dictionary.csv"
+DICTIONARY_HEADER = ["column", "kind", "dtype", "observed", "meaning", "unit", "allowed", "source",
+                     "available_at_prediction", "role", "figure_note"]
+MISSINGNESS_FILE = "missingness.csv"
+MISSINGNESS_HEADER = ["column", "n_missing", "pct_missing", "mechanism", "evidence", "decision", "reason"]
+PLAN_FILE = "categorical_plan.csv"
+PLAN_HEADER = ["column", "n_levels", "rare_levels", "high_cardinality", "encoding", "reason"]
+
+
+def _load_profile(state_dir) -> dict:
+    path = Path(state_dir) / PROFILE_FILE
+    if not path.is_file():
+        raise LeakageError("run guard.profile() first")
+    prof = json.loads(path.read_text())
+    if prof.get("schema_version") != "2":
+        raise LeakageError("data_profile.json is from an older guard: re-run guard.profile()")
+    return prof
+
+
+def _merge_csv(path: Path, header: list[str], rows: list[dict], *, key: str, computed: list[str]) -> list[str]:
+    """Write ``rows``, keeping the agent's words for rows that still exist; return the keys dropped.
+
+    Computed fields always come from ``rows``; word fields keep a non-empty earlier value, else take the
+    default in ``rows``. Reads ``utf-8-sig`` so files saved by Excel or Numbers still merge.
+    """
+    old: dict[str, dict] = {}
+    if path.is_file():
+        with path.open(newline="", encoding="utf-8-sig") as handle:
+            old = {r.get(key) or "": r for r in csv.DictReader(handle)}
+    merged = [{h: (row.get(h, "") if h in computed else (old.get(row[key], {}).get(h) or row.get(h, "")))
+               for h in header} for row in rows]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=header, lineterminator="\n")
+        writer.writeheader()
+        writer.writerows(merged)
+    current = {row[key] for row in rows}
+    return sorted(k for k in old if k and k not in current)
+
+
+def _warn_removed(removed: list[str], path: Path) -> None:
+    if removed:
+        warnings.warn(f"{path.name}: removed rows for columns no longer in the frame: {', '.join(removed)}",
+                      UserWarning, stacklevel=3)
+
+
+def _observed(info: dict) -> str:
+    kind = info["kind"]
+    if not info.get("non_null"):
+        return "all missing"
+    if kind == "numeric":
+        return f"{info['min']}..{info['max']}, median {info['median']}"
+    if kind in ("categorical", "bool"):
+        shown = list(info["top"])[:5]
+        return f"{info['n_levels']} levels: {', '.join(shown)}{'…' if info['n_levels'] > len(shown) else ''}"
+    if kind == "datetime":
+        return f"{info['start']}..{info['end']}"
+    if kind == "text":
+        return f"length {info['length_min']}..{info['length_max']}"
+    return f"{info['n_unique']} unique"
+
+
+def data_dictionary(df: pd.DataFrame, *, state_dir: str | Path = "ml_pipeline") -> Path:
+    """Step 1: one row per column; the guard fills kind, dtype, and observed values, the agent the words."""
+    target = _load_profile(state_dir)["target"]["name"]
+    rows = []
+    for col in df.columns:
+        info = _column_stats(df[col], _column_kind(df[col]))
+        rows.append({"column": str(col), "kind": info["kind"], "dtype": info["dtype"], "observed": _observed(info),
+                     "role": "target" if str(col) == str(target) else ""})
+    path = Path(state_dir) / DICTIONARY_FILE
+    _warn_removed(_merge_csv(path, DICTIONARY_HEADER, rows, key="column",
+                             computed=["column", "kind", "dtype", "observed"]), path)
+    return path
+
+
+def missingness(df: pd.DataFrame, *, state_dir: str | Path = "ml_pipeline") -> Path:
+    """Step 1: one row per column with gaps (counts computed) and a figure of which go missing together."""
+    counts = df.isna().sum()
+    gappy = [c for c in df.columns if counts[c] > 0]
+    rows = [{"column": str(c), "n_missing": str(int(counts[c])), "pct_missing": f"{100 * counts[c] / len(df):.2f}"}
+            for c in gappy]
+    path = Path(state_dir) / MISSINGNESS_FILE
+    _warn_removed(_merge_csv(path, MISSINGNESS_HEADER, rows, key="column",
+                             computed=["column", "n_missing", "pct_missing"]), path)
+    if not gappy:
+        return path
+    plt = _plt()
+    indicators = df[gappy].isna()
+    if len(gappy) >= 2:
+        corr = indicators.astype(float).corr()
+        size = 0.5 * len(gappy)
+        f, ax = plt.subplots(figsize=(max(5, size + 3), max(4, size + 2)))
+        image = ax.imshow(corr.to_numpy(), vmin=-1, vmax=1, cmap="coolwarm")
+        ax.set_xticks(range(len(gappy)))
+        ax.set_xticklabels([str(c) for c in gappy], rotation=90, fontsize=7)
+        ax.set_yticks(range(len(gappy)))
+        ax.set_yticklabels([str(c) for c in gappy], fontsize=7)
+        f.colorbar(image)
+        ax.set_title("Which columns go missing together")
+        a, b, share = max(((a, b, float((indicators[a] & indicators[b]).sum() / indicators[a].sum()))
+                           for a in gappy for b in gappy if a != b), key=lambda t: t[2])
+        explanation = (f"{len(gappy)} columns have gaps; {b} is also missing in {share:.0%} of {a}'s "
+                       f"{int(indicators[a].sum()):,} gap rows.")
+    else:
+        col = gappy[0]
+        f, ax = plt.subplots(figsize=(6, 3))
+        ax.bar([str(col)], [int(counts[col])])
+        ax.set_ylabel("missing rows")
+        ax.set_title("Missing values")
+        explanation = (f"Only {col} has gaps: {int(counts[col]):,} of {len(df):,} rows "
+                       f"({counts[col] / len(df):.1%}); every other column is complete.")
+    fig(1, "missing_pattern", f, explanation, state_dir)
+    return path
+
+
+def categorical_plan(df: pd.DataFrame, *, state_dir: str | Path = "ml_pipeline") -> Path:
+    """Step 7: one row per categorical or bool column (levels computed); the agent picks the encoding."""
+    target = str(_load_profile(state_dir)["target"]["name"])
+    rows = []
+    for col in df.columns:
+        if str(col) == target or _column_kind(df[col]) not in ("categorical", "bool"):
+            continue
+        values = df[col].dropna().astype(str)
+        counts = values.value_counts()
+        rows.append({"column": str(col), "n_levels": str(len(counts)),
+                     "rare_levels": str(int((counts / max(len(values), 1) < RARE_LEVEL_FRAC).sum())),
+                     "high_cardinality": "yes" if len(counts) > HIGH_CARD_LEVELS else "no"})
+    path = Path(state_dir) / PLAN_FILE
+    _warn_removed(_merge_csv(path, PLAN_HEADER, rows, key="column",
+                             computed=["column", "n_levels", "rare_levels", "high_cardinality"]), path)
+    return path

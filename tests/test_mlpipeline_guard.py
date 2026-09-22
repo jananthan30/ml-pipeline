@@ -3,6 +3,7 @@
 """
 from __future__ import annotations
 
+import csv
 import hashlib
 import json
 import re
@@ -25,6 +26,22 @@ def frame(n=1000, seed=0, dates=False):
     df = pd.DataFrame({"a": rng.normal(size=n), "b": rng.integers(0, 5, size=n), "y": rng.integers(0, 2, size=n)})
     if dates:
         df["date"] = pd.date_range("2024-01-01", periods=n, freq="h")
+    return df
+
+
+def messy(n=600, seed=0):
+    rng = np.random.default_rng(seed)
+    df = pd.DataFrame({
+        "age": rng.normal(50, 12, n).round(1),
+        "income": rng.lognormal(10, 1, n).round(0),
+        "zip": rng.integers(0, 120, n).astype(str),          # ~119 levels -> high cardinality
+        "plan": rng.choice(["basic", "plus", "pro"], n).astype(object),
+        "smoker": rng.integers(0, 2, n).astype(bool),
+        "patient_id": np.arange(n),
+        "y": rng.integers(0, 2, n),
+    })
+    df.loc[rng.choice(n, 40, replace=False), "income"] = np.nan
+    df.loc[rng.choice(n, 25, replace=False), "plan"] = np.nan
     return df
 
 
@@ -458,6 +475,86 @@ class Figures(unittest.TestCase):
         finally:
             del sys.modules["matplotlib"]
             sys.modules.update(saved)
+
+
+class Records(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.state = Path(self.tmp.name) / "ml_pipeline"
+        self.df = messy()
+        guard.profile(self.df, target="y", state_dir=self.state)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def rows(self, name, state=None):
+        with ((state or self.state) / name).open(newline="", encoding="utf-8") as handle:
+            return list(csv.DictReader(handle))
+
+    def write_rows(self, name, rows, excel=False):
+        with (self.state / name).open("w", newline="", encoding="utf-8-sig" if excel else "utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(rows[0]), lineterminator="\r\n" if excel else "\n")
+            writer.writeheader()
+            writer.writerows(rows)
+
+    def test_dictionary_skeleton(self):
+        guard.data_dictionary(self.df, state_dir=self.state)
+        rows = self.rows(guard.DICTIONARY_FILE)
+        self.assertEqual([r["column"] for r in rows], list(self.df.columns))
+        by = {r["column"]: r for r in rows}
+        self.assertEqual(by["y"]["role"], "target")
+        self.assertEqual(by["zip"]["kind"], "categorical")
+        self.assertIn("median", by["age"]["observed"])
+        self.assertEqual({by["age"][f] for f in ("meaning", "unit", "role", "figure_note")}, {""})
+
+    def test_dictionary_keeps_words_and_survives_excel(self):
+        guard.data_dictionary(self.df, state_dir=self.state)
+        rows = self.rows(guard.DICTIONARY_FILE)
+        rows[0]["meaning"] = "age at admission"
+        self.write_rows(guard.DICTIONARY_FILE, rows, excel=True)
+        guard.data_dictionary(self.df, state_dir=self.state)
+        self.assertEqual(self.rows(guard.DICTIONARY_FILE)[0]["meaning"], "age at admission")
+
+    def test_dictionary_drops_stale_rows_with_a_warning(self):
+        guard.data_dictionary(self.df, state_dir=self.state)
+        with self.assertWarns(UserWarning) as ctx:
+            guard.data_dictionary(self.df.drop(columns=["plan"]), state_dir=self.state)
+        self.assertIn("plan", str(ctx.warning))
+        self.assertNotIn("plan", [r["column"] for r in self.rows(guard.DICTIONARY_FILE)])
+
+    def test_dictionary_needs_a_profile(self):
+        (self.state / guard.PROFILE_FILE).unlink()
+        with self.assertRaises(guard.LeakageError):
+            guard.data_dictionary(self.df, state_dir=self.state)
+
+    def test_awkward_column_names_round_trip(self):
+        df = pd.DataFrame({0: [1.5, 2.5, 3.5, 4.5], 'weight, "kg"': [60.0, 70.0, 80.0, 90.0], "y": [0, 1, 0, 1]})
+        guard.profile(df, target="y", state_dir=self.state)
+        guard.data_dictionary(df, state_dir=self.state)
+        self.assertEqual([r["column"] for r in self.rows(guard.DICTIONARY_FILE)], ["0", 'weight, "kg"', "y"])
+
+    def test_missingness_rows_counts_and_pattern(self):
+        guard.missingness(self.df, state_dir=self.state)
+        rows = {r["column"]: r for r in self.rows(guard.MISSINGNESS_FILE)}
+        self.assertEqual(set(rows), {"income", "plan"})
+        self.assertEqual((rows["income"]["n_missing"], rows["income"]["pct_missing"]), ("40", "6.67"))
+        self.assertGreater((self.state / "figures" / "01_missing_pattern.png").stat().st_size, 1024)
+        self.assertIn("- Figure 01_missing_pattern.png: 2 columns have gaps", (self.state / "PIPELINE.md").read_text())
+
+    def test_missingness_single_column_and_no_gaps(self):
+        guard.missingness(self.df.drop(columns=["plan"]), state_dir=self.state)
+        self.assertIn("Only income has gaps", (self.state / "PIPELINE.md").read_text())
+        clean = Path(self.tmp.name) / "clean"
+        guard.missingness(self.df.dropna(), state_dir=clean)
+        self.assertEqual(self.rows(guard.MISSINGNESS_FILE, state=clean), [])
+        self.assertFalse((clean / "figures" / "01_missing_pattern.png").exists())
+
+    def test_categorical_plan_rows(self):
+        guard.categorical_plan(self.df, state_dir=self.state)
+        rows = {r["column"]: r for r in self.rows(guard.PLAN_FILE)}
+        self.assertEqual(set(rows), {"zip", "plan", "smoker"})
+        self.assertEqual((rows["zip"]["high_cardinality"], rows["plan"]["n_levels"], rows["smoker"]["high_cardinality"]),
+                         ("yes", "3", "no"))
 
 if __name__ == "__main__":
     unittest.main()
