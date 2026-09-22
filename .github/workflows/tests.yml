@@ -22,7 +22,7 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - name: Hook, canary, and session tests
-        run: python -m unittest tests/test_guard_training.py tests/test_post_tool_warn.py tests/test_session_start.py tests/test_mlpipeline_canary.py
+        run: python -m unittest tests/test_guard_training.py tests/test_post_tool_warn.py tests/test_session_start.py tests/test_mlpipeline_canary.py tests/test_gate_records.py
       - name: Hook audit probe (must report 0 wrong)
         run: python tests/probe_hook_audit.py | tee probe.txt && grep -q "^0 of " probe.txt
 
@@ -37,4 +37,4 @@ jobs:
       - name: Install test dependencies
         run: python -m pip install -r tests/requirements-dev.txt
       - name: Guard library tests
-        run: python -m unittest tests/test_mlpipeline_guard.py
+        run: python -m unittest tests/test_mlpipeline_guard.py tests/test_v05_end_to_end.py

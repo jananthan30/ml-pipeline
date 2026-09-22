@@ -19,7 +19,9 @@ def main() -> int:
     context = (
         "ml-pipeline runtime helpers: guard library at "
         f"{os.path.join(lib, 'mlpipeline_guard.py')} - copy it to ml_pipeline/guard.py at step 1 (profile) and use "
-        "guard.profile() / guard.eda_figures() / guard.fig() / guard.split() / guard.final_test(); model-selection "
+        "guard.load() / guard.profile() / guard.data_dictionary() / guard.missingness() / guard.label_audit() / "
+        "guard.eda_figures() / guard.variable_figures() / guard.fig() / guard.split() / guard.train_associations() / "
+        "guard.fit() / guard.importance() / guard.final_test(); model-selection "
         f"playbook at {os.path.join(root, 'skills', 'ml-pipeline', 'references', 'model-selection.md')} (read at step 3 "
         f"and before Gate B); canary dataset generator at {os.path.join(lib, 'mlpipeline_canary.py')} "
         "(honest accuracy ceiling 0.80; above it means leakage)."

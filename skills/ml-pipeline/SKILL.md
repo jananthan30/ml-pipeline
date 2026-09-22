@@ -115,19 +115,27 @@ Model rationale:
 
 ## What each step must produce
 
-1. **Data inspection** — copy the plugin's guard library to `ml_pipeline/guard.py` (its path is given at
-   session start; in Codex/Kimi it is `skills/ml-pipeline/lib/mlpipeline_guard.py` next to this file),
-   load the raw data read-only, and run `guard.profile(df, target=..., time_col=..., group_col=...)`.
-   Read `ml_pipeline/data_profile.json` before anything else: its `leakage_suspects` and `traits`
-   decide the split, the metric, and the model family. Report rows × columns, column kinds, missing
-   values, duplicates, and every leakage suspect. For images or text, build a manifest table first
-   (path, label, size or length) and profile that. No modification yet.
+1. **Data inspection** — copy the plugin's guard library to `ml_pipeline/guard.py` with `cp` (its path is
+   given at session start; in Codex/Kimi it is `skills/ml-pipeline/lib/mlpipeline_guard.py` next to this
+   file). Load every raw file whole with `df = guard.load(path)` — never `nrows`, `usecols`, or a sample —
+   which records the file's hash and row count; register a frame joined from several files with
+   `guard.derive(df, name, parents=[...], how=...)`. Run `guard.profile(df, target=..., time_col=...,
+   group_col=...)` on the whole frame and read `ml_pipeline/data_profile.json` before anything else:
+   `source.full_data` must be true, and its `leakage_suspects` and `traits` decide the split, the metric,
+   and the model family. Create the per-column records: `guard.data_dictionary(df)`,
+   `guard.missingness(df)`, `guard.label_audit(df, target=...)`. For images or text, build a manifest table
+   first (path, label, size or length) and profile that. No modification yet.
 2. **EDA** — `guard.eda_figures(df, target=..., time_col=...)` writes the required figures
-   (`01_missingness`, `02_target_balance`, `02_distributions`, `02_correlations`, `02_temporal_coverage`
-   when a date column exists) with explanations computed from the data; add any others with
-   `guard.fig(step, name, figure, explanation)`. If matplotlib is missing, install it — text
-   descriptions are not figures and the gate will not accept them. Output: the figures, your
-   interpretation of each, and a short list of hypotheses and problems spotted.
+   (`01_missingness`, `02_target_balance`, `02_distributions`, `02_correlations` between features only,
+   `02_temporal_coverage` when a date column exists) and `guard.variable_figures(df, target=...)` draws every
+   column on grouped pages. Then fill every word field: in `data_dictionary.csv` the meaning, unit, allowed
+   values, source, available-at-prediction (yes/no), role (feature/target/id/leak/drop), and a `figure_note`
+   for every column; in `missingness.csv` the likely cause and evidence; every section of `label_audit.md`,
+   naming each leakage suspect kept as a feature. A note is at least 40 characters and cites a real statistic
+   of its column from the profile ("median 54, 2% missing"); no two columns share a note. Add other figures
+   with `guard.fig(step, name, figure, explanation)`; every explanation has a number. If matplotlib is
+   missing, install it — text descriptions are not figures. The Gate A report shows the row chain (file rows
+   → profiled rows), the dictionary, the missingness table, and the label audit.
 3. **Define the prediction problem** — write a short contract: target (exact definition,
    units), prediction unit and population, prediction time/horizon, information actually
    available at prediction time, objective, evaluation metric, constraints. **The user must
@@ -135,8 +143,10 @@ Model rationale:
    `references/model-selection.md` with the profile's traits when choosing the metric and the
    candidate model families.
 4. **Data cleaning** — missing values, duplicates, invalid/impossible values, inconsistent
-   categories, unit/format issues. Report before/after counts for every rule. Document every
-   rule in PIPELINE.md. Prefer preserving data over deleting. Never use information from the
+   categories, unit/format issues. Apply every rule as
+   `cleaned = guard.log_cleaning(rule, before, after, reason=...)`, which records before/after counts in
+   `cleaning_log.csv`; if nothing needs cleaning, record `- Cleaning: none needed - reason: <why>`. Fill
+   `decision` and `reason` for every row of `missingness.csv`. Prefer preserving data over deleting. Never use information from the
    future or from the test rows to decide a cleaning rule.
 5. **Data engineering** — joins/integration, aggregation, time alignment to an index date,
    business rules, one-row-per-prediction-unit feature table, data-quality checks
@@ -148,20 +158,27 @@ Model rationale:
    It drops exact duplicates, refuses a random split when a datetime column exists, keeps groups
    together, checks that no row lands in two splits, and freezes a fingerprint of the test set.
    The test set is touched exactly once, at step 14, through `guard.final_test()`.
-7. **Feature engineering** — design features on the training set's statistics only, then
-   apply the same transformations to validation/test.
+7. **Feature engineering** — run `guard.categorical_plan(df)` and fill an encoding and a reason for every
+   categorical feature. Run `guard.train_associations(train, target=...)` on the training split only for the
+   correlation matrix and each feature's strength with the target — never on the full frame. Design features
+   on the training set's statistics only, then apply the same transformations to validation/test.
 8. **Preprocessing** — scalers, encoders, imputers fit on train only, wrapped in a pipeline
    object so train and inference can never diverge.
 9. **Baseline first** — a dummy predictor (majority class / mean) AND one simple model
    (logistic/linear regression or small tree). Record their metrics. Every later model is
-   judged against this line; a complex model that can't beat it gets reported as such.
+   judged against this line; a complex model that can't beat it gets reported as such. Train through
+   `guard.fit(model, X_train, y_train)` (custom loops: `guard.record_training(train_data, name=...)`) so each
+   run's row count is recorded; Gate C needs one run on the whole training split, and a pilot on a slice
+   needs the user's `- Override: pilot - ...` first.
 10. **Model training** — train candidate models on train, compare on validation. Log every
     run's config and score.
 11. **Hyperparameter tuning** — on validation/cross-validation only. The test set is never
     part of tuning.
 12. **Model evaluation** — the contract's metric plus supporting views: confusion matrix and
     ROC/PR curves for classification, residual plots for regression, always compared to the
-    baseline. Figures required.
+    baseline. Figures required. Run `guard.importance(model.predict, val, target=..., metric_fn=...)` for
+    permutation importance on the validation split, and save one attribution figure (SHAP, partial
+    dependence, or coefficients) with `guard.fig(12, 'attribution_<name>', ...)`.
 13. **Error analysis** — worst predictions, performance by slice/subgroup, calibration,
     where the model fails and a hypothesis for why.
 14. **Final test** — `score = guard.final_test(model.predict, test, target=..., metric_fn=...)`.
@@ -192,12 +209,23 @@ file, module, or notebook a command runs (`python train.py`, `python -m pkg`, `u
 - **evaluating on the test split** — `.predict/.score` or a metric function whose arguments name
   `X_test`, `df_test`, `test_*` — until `- Gate C: approved …` (or `- Override: Gate C - …`).
 - **changing the enforcement setting** — only the user switches enforcement off.
-- **recording a gate before its artifacts exist** — `Gate A` needs `data_profile.json`, one `01_*.png`
-  and two `02_*.png`; `Gate B` needs a `04_*.png` and the `Model rationale:` block; `Gate C` a
-  `12_*.png`; `Gate D` a `13_*.png` and the `Step 14 final test:` line. Every PNG must be larger than
-  1 KB and have its `- Figure <file>:` line. The denial lists exactly what is missing.
+- **recording a gate before its records are complete** — the denial lists exactly what is missing:
+  - `Gate A`: `source.json` and a full-data profile (or `- Override: partial data - ...`); the schema-2
+    profile; `data_dictionary.csv` with every column and every word field; every column on a
+    `02_variables_pNN.png` page; `missingness.csv` with a cause for every column with gaps; a complete
+    `label_audit.md`; one `01_*.png` and two `02_*.png`.
+  - `Gate B`: a cleaning log (or `- Cleaning: none needed - reason: ...`); a decision for every column with
+    gaps; `categorical_plan.csv` for every categorical feature; `associations.json` from the training split
+    with its two `07_*_train.png` figures; a `04_*.png`; the `Model rationale:` block.
+  - `Gate C`: a full-data training run in `training_runs.jsonl`; `importance.json` from the validation
+    split; `12_permutation_importance.png` and one `12_attribution_*.png`.
+  - `Gate D`: a `13_*.png` and the `Step 14 final test:` line.
+  - Every PNG is larger than 1 KB and has a `- Figure <file>: <explanation>` line of at least 40
+    characters with a number.
+- **training on a slice** after Gate B — `X_train[:5000]`, `.sample(...)`, `.head(...)` in the fit call, or
+  `nrows=` — unless the current run has `- Override: pilot - <size> - user approved YYYY-MM-DD - reason: ...`.
 - **red flags the profile can prove** — `neural-net-small-data`, `random-split-temporal`,
-  `group-split`, `accuracy-imbalanced`, `resample-before-split` (see `references/model-selection.md`).
+  `group-split`, `accuracy-imbalanced`, `resample-before-split`, `target-stats-outside-train` (see `references/model-selection.md`).
   Override one only after the user agreed: `- Override: red flag <name> - user approved <what> YYYY-MM-DD - reason: <why>`.
 
 A PostToolUse hook also warns (never blocks) when a result looks too good to be honest
