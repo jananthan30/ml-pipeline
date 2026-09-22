@@ -330,7 +330,7 @@ IMBALANCE_MINORITY = 0.10
 HIGH_CARD_LEVELS = 50
 LEAK_CORR = 0.95
 LEAK_PURITY = 0.98
-SAMPLE_ROWS = 200_000
+RARE_LEVEL_FRAC = 0.01
 _ID_NAME = re.compile(r"(^|_)id$", re.I)
 _LEAK_NAME = re.compile(r"(outcome|result|after|label|target|final|actual)|_y$", re.I)
 
@@ -371,27 +371,43 @@ def _column_kind(series: pd.Series) -> str:
     return "categorical"
 
 
-def _column_stats(full: pd.Series, sample: pd.Series, kind: str) -> dict:
-    n = len(full)
-    n_unique = int(full.nunique(dropna=True))
-    info = {"kind": kind, "missing_frac": round(float(full.isna().mean()), 4),
-            "n_unique": n_unique, "unique_frac": round(n_unique / n, 4) if n else 0.0}
-    values = sample.dropna()
+def _column_stats(series: pd.Series, kind: str) -> dict:
+    """The describe + info equivalent for one column, on every row."""
+    n = len(series)
+    missing = int(series.isna().sum())
+    n_unique = int(series.nunique(dropna=True))
+    info = {"kind": kind, "dtype": str(series.dtype), "non_null": int(n - missing), "missing": missing,
+            "missing_frac": round(missing / n, 4) if n else 0.0,
+            "n_unique": n_unique, "unique_frac": round(n_unique / n, 4) if n else 0.0,
+            "memory_bytes": int(series.memory_usage(deep=True, index=False))}
+    values = series.dropna()
     if not len(values):
         return info
     if kind == "numeric":
-        q1, q3 = values.quantile(0.25), values.quantile(0.75)
-        iqr = q3 - q1
-        outliers = ((values < q1 - 1.5 * iqr) | (values > q3 + 1.5 * iqr)).mean() if iqr > 0 else 0.0
-        info.update(min=_num(values.min()), median=_num(values.median()), max=_num(values.max()),
-                    skew=_num(values.skew()) if len(values) > 2 else 0.0, outlier_frac=round(float(outliers), 4))
+        v = values.astype(float)
+        q = v.quantile([0.01, 0.05, 0.25, 0.5, 0.75, 0.95, 0.99])
+        iqr = q[0.75] - q[0.25]
+        outliers = int(((v < q[0.25] - 1.5 * iqr) | (v > q[0.75] + 1.5 * iqr)).sum()) if iqr > 0 else 0
+        info.update(mean=_num(v.mean()), std=_num(v.std()), min=_num(v.min()), p01=_num(q[0.01]),
+                    p05=_num(q[0.05]), p25=_num(q[0.25]), median=_num(q[0.5]), p75=_num(q[0.75]),
+                    p95=_num(q[0.95]), p99=_num(q[0.99]), max=_num(v.max()),
+                    skew=_num(v.skew()) if len(v) > 2 else 0.0, kurtosis=_num(v.kurt()) if len(v) > 3 else 0.0,
+                    zeros=int((v == 0).sum()), negatives=int((v < 0).sum()),
+                    outliers=outliers, outlier_frac=round(outliers / len(v), 4))
     elif kind in ("categorical", "bool"):
-        top = values.astype(str).value_counts(normalize=True).head(5)
-        info.update(n_levels=int(values.nunique()), top={k: round(float(v), 4) for k, v in top.items()})
+        counts = values.astype(str).value_counts()
+        top = counts.head(10)
+        info.update(n_levels=int(len(counts)),
+                    top={k: round(float(c) / len(values), 4) for k, c in top.items()},
+                    top_counts={k: int(c) for k, c in top.items()},
+                    rare_levels=int((counts / len(values) < RARE_LEVEL_FRAC).sum()))
     elif kind == "datetime":
-        info.update(start=str(values.min())[:10], end=str(values.max())[:10])
+        start, end = values.min(), values.max()
+        info.update(start=str(start)[:10], end=str(end)[:10], span_days=int((end - start).days))
     elif kind == "text":
-        info.update(median_length=int(values.astype(str).str.len().median()))
+        lengths = values.astype(str).str.len()
+        info.update(length_min=int(lengths.min()), length_median=int(lengths.median()),
+                    length_max=int(lengths.max()), median_length=int(lengths.median()))
     return info
 
 
@@ -399,11 +415,33 @@ def _target_info(y: pd.Series) -> dict:
     values = y.dropna()
     n_unique = int(values.nunique())
     if pd.api.types.is_numeric_dtype(values) and not pd.api.types.is_bool_dtype(values) and n_unique > 20:
-        return {"name": y.name, "task": "regression", "n_classes": None, "class_balance": None, "minority_frac": None}
-    balance = values.astype(str).value_counts(normalize=True)
-    return {"name": y.name, "task": "binary" if n_unique == 2 else "multiclass", "n_classes": n_unique,
+        v = values.astype(float)
+        return {"name": str(y.name), "task": "regression", "n_classes": None, "class_balance": None,
+                "minority_frac": None, "class_counts": None,
+                "mean": _num(v.mean()), "std": _num(v.std()), "min": _num(v.min()), "max": _num(v.max())}
+    counts = values.astype(str).value_counts()
+    balance = counts / counts.sum()
+    return {"name": str(y.name), "task": "binary" if n_unique == 2 else "multiclass", "n_classes": n_unique,
             "class_balance": {k: round(float(v), 4) for k, v in balance.items()},
-            "minority_frac": round(float(balance.min()), 4)}
+            "minority_frac": round(float(balance.min()), 4),
+            "class_counts": {k: int(c) for k, c in counts.items()}}
+
+
+def _source_match(df: pd.DataFrame, source: str | None, state_dir: Path) -> dict:
+    """Whether ``df`` is a whole loaded source: same row count and the same column set."""
+    sources = _sources(state_dir)["sources"]
+    columns = {str(c) for c in df.columns}
+    for name in ([source] if source is not None else list(sources)):
+        entry = sources.get(name)
+        if entry and entry["n_rows"] == len(df) and set(entry["columns"]) == columns:
+            return {"name": name, "n_rows": int(len(df)), "full_data": True}
+    if not sources:
+        reason = "no source loaded with guard.load(); the profile cannot be tied to a full data file"
+    elif source is not None and source not in sources:
+        reason = f"source {source!r} is not in source.json"
+    else:
+        reason = f"{len(df):,} rows x {len(columns)} columns matches no loaded source (a sample or a slice?)"
+    return {"name": source, "n_rows": int(len(df)), "full_data": False, "reason": reason}
 
 
 def _leakage_suspects(df: pd.DataFrame, target: str, time_col, kinds: dict, task: str) -> list[dict]:
@@ -451,30 +489,30 @@ def profile(
     target: str,
     time_col: str | None = None,
     group_col: str | None = None,
+    source: str | None = None,
     state_dir: str | Path = "ml_pipeline",
 ) -> dict:
     """Step 1: describe the data and write ml_pipeline/data_profile.json.
 
     Everything later in the pipeline — figures, the model playbook, the hook's red flags — reads
-    this file instead of re-deriving facts from the data.
+    this file instead of re-deriving facts from the data. Every statistic uses every row, and
+    ``source`` records whether the frame is a whole loaded source (``guard.load`` / ``guard.derive``).
     """
     if target not in df.columns:
         raise KeyError(f"target column {target!r} not in frame")
     n = len(df)
-    sampled = n > SAMPLE_ROWS
-    sample = df.sample(SAMPLE_ROWS, random_state=0) if sampled else df
     kinds = {col: _column_kind(df[col]) for col in df.columns}
     target_info = _target_info(df[target])
-    columns = {str(col): _column_stats(df[col], sample[col], kinds[col]) for col in df.columns}
+    columns = {str(col): _column_stats(df[col], kinds[col]) for col in df.columns}
     high_card = [str(c) for c, k in kinds.items() if k == "categorical" and columns[str(c)].get("n_levels", 0) > HIGH_CARD_LEVELS]
     datetime_cols = [str(c) for c, k in kinds.items() if k == "datetime"]
     minority = target_info["minority_frac"]
     result = {
-        "schema_version": "1",
+        "schema_version": "2",
         "created": date.today().isoformat(),
         "shape": {"n_rows": int(n), "n_cols": int(df.shape[1]),
-                  "memory_mb": round(float(df.memory_usage(deep=True).sum()) / 1e6, 2),
-                  "sampled": bool(sampled), "sample_rows": SAMPLE_ROWS if sampled else None},
+                  "memory_mb": round(float(df.memory_usage(deep=True).sum()) / 1e6, 2)},
+        "source": _source_match(df, source, Path(state_dir)),
         "target": target_info,
         "columns": columns,
         "duplicates": {"exact_row_frac": round(float(df.duplicated().mean()), 4) if n else 0.0},
@@ -484,7 +522,7 @@ def profile(
         "time_col": time_col,
         "group_col": group_col,
         "entity_candidates": [str(c) for c in _entity_candidates(df, kinds)],
-        "leakage_suspects": _leakage_suspects(sample, target, time_col, kinds, target_info["task"]),
+        "leakage_suspects": _leakage_suspects(df, target, time_col, kinds, target_info["task"]),
         "traits": {
             "n_rows": int(n), "n_features": int(df.shape[1] - 1), "task": target_info["task"],
             "minority_frac": minority,

@@ -308,16 +308,75 @@ class Profile(unittest.TestCase):
         p2 = guard.profile(df, target="y", time_col="admitted_at", group_col="patient_id", state_dir=self.state)
         self.assertTrue(p2["traits"]["has_groups"])
 
-    def test_sampling_flag(self):
-        saved = guard.SAMPLE_ROWS
-        guard.SAMPLE_ROWS = 300
-        try:
-            p = guard.profile(self._df(1000), target="y", time_col="admitted_at", state_dir=self.state)
-        finally:
-            guard.SAMPLE_ROWS = saved
-        self.assertTrue(p["shape"]["sampled"])
-        self.assertEqual(p["shape"]["sample_rows"], 300)
-        self.assertEqual(p["shape"]["n_rows"], 1000)
+    def test_every_row_counts(self):
+        n = 250_000
+        df = pd.DataFrame({"c": np.zeros(n), "y": np.arange(n) % 2})
+        df.loc[n - 10:, "c"] = 5.0
+        p = guard.profile(df, target="y", state_dir=self.state)
+        self.assertEqual(p["schema_version"], "2")
+        self.assertEqual(p["columns"]["c"]["zeros"], n - 10)
+        self.assertNotIn("sampled", p["shape"])
+        self.assertFalse(hasattr(guard, "SAMPLE_ROWS"))
+
+    def test_kind_specific_statistics(self):
+        df = self._df()
+        c = guard.profile(df, target="y", time_col="admitted_at", state_dir=self.state)["columns"]
+        common = {"kind", "dtype", "non_null", "missing", "missing_frac", "n_unique", "unique_frac", "memory_bytes"}
+        levels = {"n_levels", "top", "top_counts", "rare_levels"}
+        expected = {
+            "age": {"mean", "std", "min", "p01", "p05", "p25", "median", "p75", "p95", "p99", "max", "skew",
+                    "kurtosis", "zeros", "negatives", "outliers", "outlier_frac"},
+            "zip": levels, "flag": levels, "admitted_at": {"start", "end", "span_days"},
+            "notes": {"length_min", "length_median", "length_max"}, "patient_id": set(),
+        }
+        for col, keys in expected.items():
+            with self.subTest(col=col):
+                self.assertLessEqual(common | keys, set(c[col]))
+        self.assertEqual(c["zip"]["n_levels"], df["zip"].nunique())
+        self.assertEqual(sum(c["flag"]["top_counts"].values()), 1000)
+        self.assertEqual(c["admitted_at"]["span_days"], 41)
+
+    def test_all_missing_column(self):
+        df = self._df()
+        df["empty"] = np.nan
+        info = guard.profile(df, target="y", time_col="admitted_at", state_dir=self.state)["columns"]["empty"]
+        self.assertEqual((info["missing"], info["non_null"]), (1000, 0))
+        self.assertNotIn("mean", info)
+
+    def test_target_counts_and_regression_stats(self):
+        df = self._df()
+        p = guard.profile(df, target="y", time_col="admitted_at", state_dir=self.state)
+        self.assertEqual(p["target"]["class_counts"], {str(k): int(v) for k, v in df["y"].value_counts().items()})
+        df["amount"] = np.random.default_rng(1).normal(size=len(df))
+        t = guard.profile(df, target="amount", time_col="admitted_at", state_dir=self.state)["target"]
+        self.assertIsNone(t["class_counts"])
+        self.assertAlmostEqual(t["mean"], round(float(df["amount"].mean()), 4))
+
+    def _loaded(self, n=300):
+        csv_path = Path(self.tmp.name) / "raw.csv"
+        frame(n).to_csv(csv_path, index=False)
+        return csv_path, guard.load(csv_path, state_dir=self.state)
+
+    def test_full_data_when_the_frame_is_a_loaded_source(self):
+        csv_path, df = self._loaded()
+        self.assertEqual(guard.profile(df, target="y", state_dir=self.state)["source"],
+                         {"name": str(csv_path), "n_rows": 300, "full_data": True})
+
+    def test_a_sample_is_not_full_data(self):
+        _, df = self._loaded()
+        src = guard.profile(df.sample(frac=0.5, random_state=0), target="y", state_dir=self.state)["source"]
+        self.assertFalse(src["full_data"])
+        self.assertIn("matches no loaded source", src["reason"])
+
+    def test_no_source_loaded(self):
+        src = guard.profile(frame(), target="y", state_dir=self.state)["source"]
+        self.assertFalse(src["full_data"])
+        self.assertIn("guard.load()", src["reason"])
+
+    def test_named_source_must_exist(self):
+        self._loaded()
+        src = guard.profile(frame(), target="y", source="nope.csv", state_dir=self.state)["source"]
+        self.assertIn("not in source.json", src["reason"])
 
 
 class Figures(unittest.TestCase):
