@@ -80,6 +80,16 @@ class Split(unittest.TestCase):
         with self.assertRaises(ValueError):
             guard.split(frame(), target="y", test_size=0.6, val_size=0.5, state_dir=self.state)
 
+    def test_state_records_train_and_validation(self):
+        tr, va, te = guard.split(frame(), target="y", state_dir=self.state)
+        state = json.loads((self.state / guard.STATE_FILE).read_text())
+        self.assertEqual((state["n_train"], state["n_val"]), (len(tr), len(va)))
+        self.assertEqual((len(state["train_fingerprint"]), len(state["val_fingerprint"])), (64, 64))
+
+    def test_resplitting_before_any_test_touch_is_fine(self):
+        guard.split(frame(), target="y", state_dir=self.state)
+        guard.split(frame(), target="y", state_dir=self.state)
+
 
 
 class FinalTest(unittest.TestCase):
@@ -129,6 +139,31 @@ class FinalTest(unittest.TestCase):
     def test_no_split_state_raises(self):
         (self.state / guard.STATE_FILE).unlink()
         with self.assertRaises(guard.LeakageError):
+            self._run(self.te)
+
+    def test_resplit_after_final_test_raises(self):
+        self._run(self.te)
+        with self.assertRaises(guard.TestSetAlreadyUsed):
+            guard.split(frame(), target="y", state_dir=self.state)
+
+    def test_resplit_allowed_with_final_test_override(self):
+        self._run(self.te)
+        self.md.write_text(self.md.read_text() +
+                           "- Override: final test - user approved a new test strategy 2026-09-24 - reason: new data\n")
+        guard.split(frame(), target="y", state_dir=self.state)
+        self.assertEqual(json.loads((self.state / guard.STATE_FILE).read_text())["test_touches"], 0)
+
+    def test_override_must_be_the_strict_line(self):
+        self._run(self.te)
+        self.md.write_text(self.md.read_text() + "### Override requested by the agent for the final test\n")
+        with self.assertRaises(guard.TestSetAlreadyUsed):
+            self._run(self.te)
+
+    def test_override_from_an_older_run_does_not_count(self):
+        self._run(self.te)
+        self.md.write_text(self.md.read_text() +
+                           "- Override: final test - user approved 2026-09-18 - reason: x\n## Run: retrain (2026-09-24)\n")
+        with self.assertRaises(guard.TestSetAlreadyUsed):
             self._run(self.te)
 
 

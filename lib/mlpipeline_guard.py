@@ -39,6 +39,42 @@ class OverlapLeakage(LeakageError):
     """Identical rows appear in more than one split."""
 
 
+class TestSetAlreadyUsed(LeakageError):
+    """final_test() was called more than once without a recorded override."""
+
+
+class TestSetTampered(LeakageError):
+    """The frame handed to final_test() is not the one frozen at split time."""
+
+
+_RUN_HEAD = re.compile(r"^[ \t]*##[ \t]+Run[ \t]*:", re.I | re.M)
+
+
+def _current_run(markdown: str) -> str:
+    """The newest run: from the last ``## Run:`` heading on, or the whole ledger (the hook's rule)."""
+    heads = list(_RUN_HEAD.finditer(markdown))
+    return markdown[heads[-1].start():] if heads else markdown
+
+
+def _override_allows(pipeline_md: Path, what: str) -> bool:
+    """True when the current run has the strict line ``- Override: <what> - ...``."""
+    if not pipeline_md.is_file():
+        return False
+    line = re.compile(r"^[ \t]*-[ \t]*Override[ \t]*:[ \t]*" + re.escape(what) + r"[ \t]*-", re.I | re.M)
+    return bool(line.search(_current_run(pipeline_md.read_text())))
+
+
+def _split_state(state_dir) -> dict:
+    """The frozen split's state; raises when there is none or it predates train/validation sizes."""
+    path = Path(state_dir) / STATE_FILE
+    if not path.is_file():
+        raise LeakageError("no split state: call guard.split() at step 6 first")
+    state = json.loads(path.read_text())
+    if "n_train" not in state:
+        raise LeakageError("split state is from an older guard: re-run guard.split()")
+    return state
+
+
 def _row_hashes(df: pd.DataFrame) -> np.ndarray:
     return pd.util.hash_pandas_object(df, index=False).to_numpy()
 
@@ -112,8 +148,13 @@ def split(
     val_size: float = 0.2,
     seed: int = 0,
     state_dir: str | Path = "ml_pipeline",
+    pipeline_md: str | Path | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Split into (train, val, test) the way the pipeline's step 6 requires, and freeze the test set."""
+    """Split into (train, val, test) the way the pipeline's step 6 requires, and freeze the test set.
+
+    Refuses to re-split once the frozen test set has been evaluated (that would reset the single
+    use), unless the current run records ``- Override: final test - ...``.
+    """
     if not (0 < test_size < 1 and 0 <= val_size < 1 and test_size + val_size < 1):
         raise ValueError("test_size and val_size must be in (0, 1) and sum to less than 1")
     if target not in df.columns:
@@ -122,6 +163,14 @@ def split(
         raise TemporalSplitRequired(
             f"datetime column(s) {dt_cols} present: pass time_col=... so the split is chronological"
         )
+    state_dir = Path(state_dir)
+    ledger = Path(pipeline_md) if pipeline_md is not None else state_dir / "PIPELINE.md"
+    previous = state_dir / STATE_FILE
+    if (previous.is_file() and json.loads(previous.read_text()).get("test_touches", 0) >= 1
+            and not _override_allows(ledger, "final test")):
+        raise TestSetAlreadyUsed(
+            "the frozen test set was already evaluated; re-splitting would reset that. Agree a new test "
+            "strategy with the user and record `- Override: final test - ...` in PIPELINE.md first")
 
     before = len(df)
     df = df.drop_duplicates().reset_index(drop=True)
@@ -144,7 +193,6 @@ def split(
     train, val, test = (df.iloc[np.sort(idx)].reset_index(drop=True) for idx in parts)
     check_no_overlap(train, val, test)
 
-    state_dir = Path(state_dir)
     state_dir.mkdir(parents=True, exist_ok=True)
     (state_dir / STATE_FILE).write_text(json.dumps({
         "test_fingerprint": _fingerprint(test),
@@ -153,26 +201,12 @@ def split(
         "duplicates_dropped": int(dropped),
         "split": kind,
         "created": date.today().isoformat(),
+        "n_train": int(len(train)),
+        "n_val": int(len(val)),
+        "train_fingerprint": _fingerprint(train),
+        "val_fingerprint": _fingerprint(val),
     }, indent=2))
     return train, val, test
-
-
-class TestSetAlreadyUsed(LeakageError):
-    """final_test() was called more than once without a recorded override."""
-
-
-class TestSetTampered(LeakageError):
-    """The frame handed to final_test() is not the one frozen at split time."""
-
-
-_NEGATED = re.compile(r"\b(?:not|pending|awaiting|todo)\b", re.I)
-
-
-def _override_allows(pipeline_md: Path, what: str) -> bool:
-    if not pipeline_md.is_file():
-        return False
-    line = re.compile(r"^.*\boverrid(?:e|den)\b.*\b" + re.escape(what) + r"\b.*$", re.I | re.M)
-    return any(not _NEGATED.search(m.group(0)) for m in line.finditer(pipeline_md.read_text()))
 
 
 def final_test(
