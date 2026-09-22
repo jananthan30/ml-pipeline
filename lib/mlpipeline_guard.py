@@ -249,6 +249,80 @@ def final_test(
     return score
 
 
+# ------------------------------------------------------------------ sources (step 1)
+SOURCE_FILE = "source.json"
+_READERS = {
+    ".csv": ("read_csv", {}), ".txt": ("read_csv", {}), ".tsv": ("read_csv", {"sep": "\t"}),
+    ".parquet": ("read_parquet", {}), ".pq": ("read_parquet", {}),
+    ".xlsx": ("read_excel", {}), ".xls": ("read_excel", {}),
+    ".json": ("read_json", {}), ".jsonl": ("read_json", {"lines": True}), ".ndjson": ("read_json", {"lines": True}),
+    ".feather": ("read_feather", {}),
+}
+_PARTIAL_KWARGS = ("nrows", "skiprows", "skipfooter", "chunksize", "iterator", "usecols")
+
+
+class PartialData(LeakageError):
+    """A load or profile that does not cover the full data."""
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _sources(state_dir: Path) -> dict:
+    path = Path(state_dir) / SOURCE_FILE
+    return json.loads(path.read_text()) if path.is_file() else {"schema_version": "1", "sources": {}}
+
+
+def _record_source(state_dir: Path, name: str, entry: dict) -> None:
+    data = _sources(state_dir)
+    data["sources"][name] = entry
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / SOURCE_FILE).write_text(json.dumps(data, indent=2))
+
+
+def load(path, *, state_dir: str | Path = "ml_pipeline", **read_kwargs) -> pd.DataFrame:
+    """Step 1: read a whole data file and record its hash, rows, and columns in source.json."""
+    partial = sorted(key for key in read_kwargs if key in _PARTIAL_KWARGS)
+    if partial:
+        raise PartialData(f"{', '.join(partial)} would load part of the data: load the whole file, then give "
+                          "unwanted columns role 'drop' in the data dictionary")
+    path = Path(path)
+    suffix = path.suffix.lower()
+    if suffix not in _READERS:
+        raise ValueError(f"unsupported file type {suffix!r}; supported: {', '.join(sorted(_READERS))}")
+    reader, defaults = _READERS[suffix]
+    df = getattr(pd, reader)(path, **{**defaults, **read_kwargs})
+    _record_source(Path(state_dir), str(path), {
+        "kind": "file", "sha256": _sha256(path), "bytes": path.stat().st_size,
+        "n_rows": int(len(df)), "n_cols": int(df.shape[1]), "columns": [str(c) for c in df.columns],
+        "loaded": date.today().isoformat()})
+    return df
+
+
+def derive(df: pd.DataFrame, name: str, *, parents, how: str, state_dir: str | Path = "ml_pipeline") -> pd.DataFrame:
+    """Step 5: register a frame built from loaded sources (a join or an aggregation) as a source."""
+    state_dir = Path(state_dir)
+    parents = list(parents)
+    if not parents:
+        raise ValueError("a derived frame needs at least one parent source")
+    known = _sources(state_dir)["sources"]
+    unknown = [p for p in parents if p not in known]
+    if unknown:
+        raise KeyError(f"parents not loaded with guard.load() or guard.derive(): {unknown}")
+    if not str(how).strip():
+        raise ValueError("describe how the frame was derived")
+    _record_source(state_dir, str(name), {
+        "kind": "derived", "parents": parents, "how": str(how).strip(),
+        "n_rows": int(len(df)), "n_cols": int(df.shape[1]), "columns": [str(c) for c in df.columns],
+        "loaded": date.today().isoformat()})
+    return df
+
+
 # ------------------------------------------------------------------ profile (step 1)
 PROFILE_FILE = "data_profile.json"
 SMALL_DATA_ROWS = 5000

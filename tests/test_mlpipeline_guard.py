@@ -3,6 +3,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 import tempfile
@@ -165,6 +166,67 @@ class FinalTest(unittest.TestCase):
                            "- Override: final test - user approved 2026-09-18 - reason: x\n## Run: retrain (2026-09-24)\n")
         with self.assertRaises(guard.TestSetAlreadyUsed):
             self._run(self.te)
+
+
+class Sources(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.state = self.root / "ml_pipeline"
+        self.csv = self.root / "raw.csv"
+        frame(50).to_csv(self.csv, index=False)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def sources(self):
+        return json.loads((self.state / guard.SOURCE_FILE).read_text())["sources"]
+
+    def test_load_records_hash_rows_and_columns(self):
+        df = guard.load(self.csv, state_dir=self.state)
+        entry = self.sources()[str(self.csv)]
+        self.assertEqual(len(df), 50)
+        self.assertEqual(entry["sha256"], hashlib.sha256(self.csv.read_bytes()).hexdigest())
+        self.assertEqual((entry["kind"], entry["n_rows"], entry["n_cols"]), ("file", 50, 3))
+        self.assertEqual(entry["columns"], ["a", "b", "y"])
+
+    def test_partial_loads_are_refused(self):
+        for kwargs in ({"nrows": 10}, {"skiprows": 5}, {"skipfooter": 1}, {"chunksize": 10},
+                       {"iterator": True}, {"usecols": ["a"]}):
+            with self.subTest(kwargs=kwargs), self.assertRaises(guard.PartialData):
+                guard.load(self.csv, state_dir=self.state, **kwargs)
+        self.assertFalse((self.state / guard.SOURCE_FILE).exists())
+
+    def test_other_read_options_pass_through(self):
+        self.assertEqual(str(guard.load(self.csv, state_dir=self.state, dtype={"b": "float64"})["b"].dtype), "float64")
+
+    def test_tab_separated(self):
+        tsv = self.root / "raw.tsv"
+        frame(20).to_csv(tsv, sep="\t", index=False)
+        self.assertEqual(list(guard.load(tsv, state_dir=self.state).columns), ["a", "b", "y"])
+
+    def test_unsupported_suffix(self):
+        odd = self.root / "raw.dat"
+        odd.write_text("a\n1\n")
+        with self.assertRaises(ValueError):
+            guard.load(odd, state_dir=self.state)
+
+    def test_derive_records_the_chain(self):
+        df = guard.load(self.csv, state_dir=self.state)
+        guard.derive(df.assign(c=1), "raw_plus_c", parents=[str(self.csv)], how="added a constant column c",
+                     state_dir=self.state)
+        entry = self.sources()["raw_plus_c"]
+        self.assertEqual((entry["kind"], entry["parents"], entry["n_rows"], entry["n_cols"]),
+                         ("derived", [str(self.csv)], 50, 4))
+
+    def test_derive_needs_known_parents_and_a_reason(self):
+        df = guard.load(self.csv, state_dir=self.state)
+        with self.assertRaises(KeyError):
+            guard.derive(df, "x", parents=["never_loaded.csv"], how="join", state_dir=self.state)
+        with self.assertRaises(ValueError):
+            guard.derive(df, "x", parents=[str(self.csv)], how="  ", state_dir=self.state)
+        with self.assertRaises(ValueError):
+            guard.derive(df, "x", parents=[], how="join", state_dir=self.state)
 
 
 class Profile(unittest.TestCase):
