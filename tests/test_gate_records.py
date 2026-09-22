@@ -1,6 +1,8 @@
 """Tests for hooks/gate_records.py (stdlib): python3 -m unittest tests/test_gate_records.py"""
 from __future__ import annotations
 
+import csv
+import io
 import json
 import sys
 import tempfile
@@ -121,6 +123,24 @@ class GateA(unittest.TestCase):
     def test_excel_saved_dictionary_passes(self):
         excel = "﻿" + fx.dictionary_csv(fx.dictionary_rows()).replace("\n", "\r\n")
         self.assertEqual(problems("A", with_(fx.DICTIONARY, excel)), [])
+
+    def test_legacy_excel_encoding_and_semicolons_are_read(self):
+        rows = fx.dictionary_rows()
+        rows[0]["unit"] = "°C"
+        out = io.StringIO()
+        writer = csv.DictWriter(out, fieldnames=fx.DICTIONARY_HEADER, delimiter=";", lineterminator="\r\n")
+        writer.writeheader()
+        writer.writerows(rows)
+        self.assertEqual(problems("A", with_(fx.DICTIONARY, out.getvalue().encode("cp1252"))), [])
+        self.assertEqual(problems("A", with_(fx.DICTIONARY, fx.dictionary_csv(rows).encode("cp1252"))), [])
+        rows[0]["meaning"] = ""
+        self.assertIn("blank fields: age (meaning)",
+                      joined("A", with_(fx.DICTIONARY, fx.dictionary_csv(rows).encode("cp1252"))))
+
+    def test_non_numeric_counts_are_reported_not_crashed(self):
+        rows = fx.missingness_rows()
+        rows[0]["n_missing"] = "inf"
+        self.assertIn("counts differ from the profile for age", joined("A", with_(fx.MISSINGNESS, fx.missingness_csv(rows))))
 
     def test_long_lists_are_capped(self):
         p = fx.profile()

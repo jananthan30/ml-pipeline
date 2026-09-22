@@ -6,6 +6,7 @@ ml_pipeline/ and returns problems in the words the agent will read. Stdlib only.
 from __future__ import annotations
 
 import csv
+import io
 import json
 import re
 from pathlib import Path
@@ -105,16 +106,25 @@ def _listing(names) -> str:
     return shown + (f" and {len(names) - LIST_CAP} more" if len(names) > LIST_CAP else "")
 
 
+def _read_text(path: Path) -> str:
+    """A record's text: UTF-8 (with or without a byte-order mark), else Excel's legacy cp1252."""
+    raw = path.read_bytes()
+    try:
+        return raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return raw.decode("cp1252", errors="replace")
+
+
 def _json(path: Path):
     try:
-        return json.loads(path.read_text(encoding="utf-8-sig"))
+        return json.loads(_read_text(path))
     except (OSError, ValueError):
         return None
 
 
 def _jsonl(path: Path) -> list[dict]:
     try:
-        lines = path.read_text(encoding="utf-8-sig").splitlines()
+        lines = _read_text(path).splitlines()
     except OSError:
         return []
     out = []
@@ -128,12 +138,20 @@ def _jsonl(path: Path) -> list[dict]:
     return out
 
 
-def _csv_rows(path: Path) -> list[dict] | None:
-    """Rows of a CSV record with stripped values; None when the file is absent. Excel's BOM and CRLF are fine."""
+def _csv_rows(path: Path, key: str = "column") -> list[dict] | None:
+    """Rows of a CSV record with stripped values; None when the file is absent.
+
+    Files saved by Excel or Numbers parse too: a byte-order mark, CRLF, cp1252, or a ``;`` or tab
+    delimiter (the delimiter is the one whose header has ``key``).
+    """
     if not path.is_file():
         return None
-    with path.open(newline="", encoding="utf-8-sig") as handle:
-        return [{k: (v or "").strip() for k, v in row.items() if k is not None} for row in csv.DictReader(handle)]
+    text = _read_text(path)
+    for delimiter in (",", ";", "\t"):
+        reader = csv.DictReader(io.StringIO(text, newline=""), delimiter=delimiter)
+        if reader.fieldnames and key in [f.strip() for f in reader.fieldnames]:
+            return [{(k or "").strip(): (v or "").strip() for k, v in row.items() if k is not None} for row in reader]
+    return []
 
 
 def _valid_combo(value: str, allowed) -> bool:
@@ -144,7 +162,7 @@ def _valid_combo(value: str, allowed) -> bool:
 def _int(value) -> int | None:
     try:
         return int(float(str(value).replace(",", "")))
-    except ValueError:
+    except (ValueError, OverflowError):
         return None
 
 
@@ -315,7 +333,7 @@ def _label_audit_problems(state_dir: Path, profile: dict, dictionary: list[dict]
     path = state_dir / LABEL_AUDIT_FILE
     if not path.is_file():
         return ["label_audit.md missing: run guard.label_audit(df, target=...) and write every section"]
-    text = path.read_text(encoding="utf-8-sig", errors="replace")
+    text = _read_text(path)
     problems = []
     start, end = text.find(COMPUTED_START), text.find(COMPUTED_END)
     if start == -1 or end == -1:
@@ -395,7 +413,7 @@ def _plan_problems(state_dir: Path, profile: dict) -> list[str]:
 def gate_b_problems(state_dir: Path, run_text: str) -> list[str]:
     """Everything Phase 2 still lacks."""
     problems = []
-    cleaning = _csv_rows(state_dir / CLEANING_FILE) or []
+    cleaning = _csv_rows(state_dir / CLEANING_FILE, key="rule") or []
     if not CLEANING_NONE.search(run_text) and not any(r.get("rule") and r.get("reason") for r in cleaning):
         problems.append("no cleaning recorded: log each rule with guard.log_cleaning(...), or record "
                         "'- Cleaning: none needed - reason: ...'")

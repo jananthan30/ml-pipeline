@@ -147,13 +147,15 @@ GATE_B_MSG = (
     "ml-pipeline: model training is locked until Gate B ({0!r}). Finish steps 4-8 (cleaning, "
     "engineering, split, features, preprocessing), get the user's explicit approval, and record "
     "`- Gate B: approved YYYY-MM-DD` in ml_pipeline/PIPELINE.md. If the user explicitly chose to skip "
-    "ahead, record `- Override: Gate B - user approved training YYYY-MM-DD - reason: ...` instead."
+    "ahead, `- Override: Gate B - user approved training YYYY-MM-DD - reason: ...` records that choice, but "
+    "an override needs the same records as an approval."
 )
 GATE_C_MSG = (
     "ml-pipeline: evaluating on the test split is locked until Gate C ({0!r}). The test set is touched "
     "exactly once, at step 14, after the user approves Gate C - tune and select on validation only. "
     "Record `- Gate C: approved YYYY-MM-DD` in ml_pipeline/PIPELINE.md first, or, if the user explicitly "
-    "chose otherwise, `- Override: Gate C - user approved evaluating on the test set YYYY-MM-DD - reason: ...`."
+    "chose otherwise, `- Override: Gate C - user approved evaluating on the test set YYYY-MM-DD - reason: ...`; "
+    "an override needs the same records as an approval."
 )
 TEST_MSG = (
     "ml-pipeline: this fits on the test split ({0!r}). The test set is touched exactly once, at "
@@ -187,11 +189,65 @@ RATIONALE_BULLETS = ("traits", "baseline", "candidates", "ruled out", "metric")
 LEDGER = re.compile(r"^\s*-\s*Figure\s+(\S+\.png):[ \t]*(\S[^\n]*)$", re.I | re.M)
 FINAL_TEST_LINE = re.compile(r"^\s*-\s*Step 14 final test:", re.I | re.M)
 GATE_RECORD_MSG = "ml-pipeline: Gate {0} can't be recorded: {1}."
+GATE_CHECK_FAILED_MSG = ("ml-pipeline: could not check the Gate {0} records ({1}); fix the file it names, re-run the "
+                         "guard helper that writes it, and retry.")
 
 
 def approved_gates_in(text: str) -> list[str]:
     """Gate letters that ``text`` records: a strict approval or override line for that gate."""
-    return [(m.group(1) or m.group(2)).upper() for m in RECORDING.finditer(text)]
+    return [gate for gate, _ in _recording_lines(text)]
+
+
+def _recording_lines(text: str) -> list[tuple[str, str]]:
+    """(gate letter, whole stripped line) for each gate recording in ``text``."""
+    out = []
+    for m in RECORDING.finditer(text):
+        start = text.rfind("\n", 0, m.start()) + 1
+        end = text.find("\n", m.end())
+        out.append(((m.group(1) or m.group(2)).upper(), text[start: end if end != -1 else len(text)].strip()))
+    return out
+
+
+def _old_strings(obj) -> list[str]:
+    """Every ``old_string`` in an Edit or MultiEdit tool input."""
+    if isinstance(obj, dict):
+        return ([v for k, v in obj.items() if k == "old_string" and isinstance(v, str)]
+                + [s for v in obj.values() if isinstance(v, (dict, list)) for s in _old_strings(v)])
+    if isinstance(obj, list):
+        return [s for v in obj for s in _old_strings(v)]
+    return []
+
+
+def _new_gates(tool_input: dict, text: str, existing: str) -> list[str]:
+    """Gates this call adds: recording lines that occur more often in the new text than in what it replaces.
+
+    What it replaces is the edited ``old_string`` for Edit / MultiEdit and the existing ledger otherwise, so
+    rewriting the whole ledger, or anchoring an edit on an existing gate line, does not re-check that gate.
+    """
+    olds = _old_strings(tool_input)
+    before = [line for _, line in _recording_lines("\n".join(olds) if olds else existing)]
+    after = _recording_lines(text)
+    lines = [line for _, line in after]
+    gates: list[str] = []
+    for gate, line in after:
+        if lines.count(line) > before.count(line) and gate not in gates:
+            gates.append(gate)
+    return gates
+
+
+def _recording_problem(tool_input: dict, text: str, cwd: str) -> str | None:
+    """Why this ledger write may not record its new gates, or None."""
+    state_dir = _state_dir_for(tool_input, cwd)
+    pipeline_md = state_dir / "PIPELINE.md"
+    existing = pipeline_md.read_text(encoding="utf-8", errors="replace") if pipeline_md.is_file() else ""
+    for gate in _new_gates(tool_input, text, existing):
+        try:
+            problems = gate_problems(gate, state_dir, existing + "\n" + text)
+        except Exception as exc:  # a gate is never recorded unchecked; only this ledger write is denied
+            return GATE_CHECK_FAILED_MSG.format(gate, exc)
+        if problems:
+            return GATE_RECORD_MSG.format(gate, "; ".join(problems))
+    return None
 
 
 def rationale_missing(text: str) -> list[str]:
@@ -421,17 +477,17 @@ def executed_code(command: str, cwd: str) -> str:
     chunks: list[str] = []
     for segment in SHELL_SEPARATOR.split(command):
         try:
-            tokens = shlex.split(segment)
-        except ValueError:
-            tokens = segment.split()
-        if tokens[:1] == ["cd"] and len(tokens) > 1:
-            base = base / Path(tokens[1]).expanduser()
-            continue
-        for kind, name in _exec_targets(tokens):
             try:
-                chunks.append(_read_script(kind, name, base))
-            except OSError:  # one unreadable file must not fail the whole hook open
+                tokens = shlex.split(segment)
+            except ValueError:
+                tokens = segment.split()
+            if tokens[:1] == ["cd"] and len(tokens) > 1:
+                base = base / Path(tokens[1]).expanduser()
                 continue
+            for kind, name in _exec_targets(tokens):
+                chunks.append(_read_script(kind, name, base))
+        except Exception:  # an unreadable path must never fail the whole hook open
+            continue
     return "\n".join(chunk for chunk in chunks if chunk)
 
 
@@ -592,15 +648,11 @@ def main() -> int:
         # 1. Only the user switches enforcement off or points it at another ledger.
         if suffix not in PROSE_SUFFIXES and SELF_DISABLE.search(text):
             return _emit(SELF_DISABLE_MSG)
-        # 2. Recording a gate in the ledger: that gate's artifacts must already exist.
+        # 2. Recording a gate in the ledger: that gate's records must already be complete.
         if _writes_ledger(tool_input):
-            for gate in approved_gates_in(text):
-                state_dir = _state_dir_for(tool_input, cwd)
-                pipeline_md = state_dir / "PIPELINE.md"
-                existing = pipeline_md.read_text(encoding="utf-8", errors="replace") if pipeline_md.is_file() else ""
-                problems = gate_problems(gate, state_dir, existing + "\n" + text)
-                if problems:
-                    return _emit(GATE_RECORD_MSG.format(gate, "; ".join(problems)))
+            reason = _recording_problem(tool_input, text, cwd)
+            if reason:
+                return _emit(reason)
         # 3. Prose and other languages are not Python.
         if suffix in PROSE_SUFFIXES or suffix in OTHER_LANGUAGE_SUFFIXES:
             return _emit(None)

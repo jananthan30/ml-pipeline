@@ -207,6 +207,31 @@ def write_md(content):
     return {"file_path": "./ml_pipeline/PIPELINE.md", "content": content}
 
 
+class HookRobustness(unittest.TestCase):
+    """Input the hook cannot read never switches enforcement off (review finding 1)."""
+
+    def test_unresolvable_home_directory_is_not_an_off_switch(self):
+        for cmd in ('cd ~nosuchuser_zz 2>/dev/null; python -c "model.fit(X_test, y_test)"',
+                    'python ~nosuchuser_zz/x.py; python -c "model.fit(X_test, y_test)"'):
+            with self.subTest(cmd=cmd):
+                decision, reason = run({"command": cmd}, GATE_AB)
+                self.assertEqual(decision, "deny")
+                self.assertIn("fits on the test split", reason)
+
+    def test_records_that_crash_the_check_fail_closed(self):
+        p = fx.profile()
+        p["columns"]["age"] = "not a mapping"
+        files = {**fx.records("A"), fx.PROFILE: json.dumps(p)}
+        decision, reason = run(write_md(fx.ledger("A") + "- Gate A: approved 2026-09-23\n"), pipeline_md="",
+                               tool="Write", files=files)
+        self.assertEqual(decision, "deny")
+        self.assertIn("could not check the Gate A records", reason)
+
+    def test_gate_messages_say_overrides_need_the_records(self):
+        self.assertIn("an override needs the same records", run(TRAIN_CMD, GATE_A)[1])
+        self.assertIn("an override needs the same records", run(TEST_EVAL, GATE_AB)[1])
+
+
 class GateRecording(unittest.TestCase):
     """A gate line is denied until that gate's records exist and explain every column."""
 
@@ -253,6 +278,20 @@ class GateRecording(unittest.TestCase):
         decision, _ = run(write_md("- Gate A: approved 2026-09-23\n"), pipeline_md=fx.ledger("A"), tool="Write",
                           files=fx.records("A"))
         self.assertEqual(decision, "allow")
+
+    def test_recorded_gates_are_not_rechecked(self):
+        rows = fx.dictionary_rows()
+        rows[1]["figure_note"] = "plan: fine"                    # Gate A's records have gone stale since
+        files = {**fx.records("B"), fx.DICTIONARY: fx.dictionary_csv(rows)}
+        existing = fx.ledger("B") + "- Gate A: approved 2026-09-23\n"
+        edit = {"file_path": "./ml_pipeline/PIPELINE.md", "old_string": "- Gate A: approved 2026-09-23\n",
+                "new_string": "- Gate A: approved 2026-09-23\n- Gate B: approved 2026-09-24\n"}
+        self.assertEqual(run(edit, pipeline_md=existing, tool="Edit", files=files), ("allow", ""))
+        whole = {"file_path": "./ml_pipeline/PIPELINE.md", "content": existing + "- Gate B: approved 2026-09-24\n"}
+        self.assertEqual(run(whole, pipeline_md=existing, tool="Write", files=files), ("allow", ""))
+        new_run = {"file_path": "./ml_pipeline/PIPELINE.md",
+                   "content": existing + "## Run: again (2026-09-25)\n- Gate A: approved 2026-09-25\n"}
+        self.assertEqual(run(new_run, pipeline_md=existing, tool="Write", files=files)[0], "deny")
 
     def test_bash_append_is_checked_too(self):
         cmd = {"command": "echo '- Gate A: approved 2026-09-16' >> ml_pipeline/PIPELINE.md"}
