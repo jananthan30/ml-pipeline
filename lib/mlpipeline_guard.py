@@ -719,6 +719,71 @@ def eda_figures(df: pd.DataFrame, *, target: str, time_col: str | None = None,
     return paths
 
 
+PAGE_COLUMNS = 12
+PAGES_FILE = "pages.json"
+
+
+def _draw_variable(ax, series: pd.Series, kind: str) -> None:
+    values = series.dropna()
+    if not len(values):
+        ax.text(0.5, 0.5, "all missing", ha="center", va="center")
+        ax.set_axis_off()
+    elif kind == "numeric":
+        ax.hist(values.astype(float), bins=30)
+        ax.axvline(float(values.median()), color="black", linestyle="--", linewidth=1)
+    elif kind in ("categorical", "bool"):
+        counts = values.astype(str).value_counts().head(10)
+        ax.barh(counts.index[::-1], counts.to_numpy()[::-1])
+        ax.tick_params(axis="y", labelsize=7)
+    elif kind == "datetime":
+        counts = values.dt.to_period("M").value_counts().sort_index()
+        ax.plot([str(p) for p in counts.index], counts.to_numpy())
+        ax.tick_params(axis="x", rotation=90, labelsize=6)
+    elif kind == "text":
+        ax.hist(values.astype(str).str.len(), bins=30)
+        ax.set_xlabel("length", fontsize=7)
+    else:
+        ax.text(0.5, 0.5, f"{values.nunique():,} unique ids", ha="center", va="center")
+        ax.set_axis_off()
+
+
+def variable_figures(df: pd.DataFrame, *, target: str, per_page: int = PAGE_COLUMNS,
+                     state_dir: str | Path = "ml_pipeline") -> list[Path]:
+    """Step 2: every column's distribution on grouped pages, plus figures/pages.json (page -> columns)."""
+    plt = _plt()
+    columns = list(df.columns)
+    pages = [columns[i:i + per_page] for i in range(0, len(columns), per_page)]
+    mapping: dict[str, list[str]] = {}
+    paths: list[Path] = []
+    for number, cols in enumerate(pages, start=1):
+        rows = int(np.ceil(len(cols) / 4))
+        f, axes = plt.subplots(rows, 4, figsize=(14, 3 * rows))
+        axes = np.atleast_1d(axes).ravel()
+        gappy, skewed = [], []
+        for ax, col in zip(axes, cols):
+            series = df[col]
+            kind = _column_kind(series)
+            _draw_variable(ax, series, kind)
+            ax.set_title(f"{col} ({'target' if str(col) == str(target) else kind})", fontsize=9)
+            if series.isna().any():
+                gappy.append(str(col))
+            if kind == "numeric" and series.dropna().size > 2 and abs(float(series.skew())) > 1:
+                skewed.append(str(col))
+        for ax in axes[len(cols):]:
+            ax.axis("off")
+        detail = f" ({', '.join(skewed[:5])})" if skewed else ""
+        explanation = (f"Page {number} of {len(pages)}: {len(cols)} columns ({cols[0]} to {cols[-1]}); "
+                       f"{len(gappy)} have missing values, {len(skewed)} are strongly skewed{detail}. "
+                       "Per-column notes are in data_dictionary.csv.")
+        path = fig(2, f"variables_p{number:02d}", f, explanation, state_dir)
+        mapping[path.name] = [str(c) for c in cols]
+        paths.append(path)
+    out = Path(state_dir) / FIGURES_DIR / PAGES_FILE
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(mapping, indent=2))
+    return paths
+
+
 # ------------------------------------------------------------------ records (steps 1-8)
 DICTIONARY_FILE = "data_dictionary.csv"
 DICTIONARY_HEADER = ["column", "kind", "dtype", "observed", "meaning", "unit", "allowed", "source",
@@ -851,4 +916,60 @@ def categorical_plan(df: pd.DataFrame, *, state_dir: str | Path = "ml_pipeline")
     path = Path(state_dir) / PLAN_FILE
     _warn_removed(_merge_csv(path, PLAN_HEADER, rows, key="column",
                              computed=["column", "n_levels", "rare_levels", "high_cardinality"]), path)
+    return path
+
+
+LABEL_AUDIT_FILE = "label_audit.md"
+_COMPUTED_START = "<!-- computed by guard.label_audit - do not edit -->"
+_COMPUTED_END = "<!-- end computed -->"
+LABEL_SECTIONS = {
+    "Definition": "the exact rule that produces the label, with units and time window",
+    "Source": "who or what produced the label, and how",
+    "When labeled": "when the label becomes known, relative to the prediction time",
+    "Leakage check": "which columns could encode the label; every leakage suspect kept as a feature is named here",
+    "Noise and consistency": "how reliable the label is; what the conflicting-label count above means",
+}
+
+
+def _label_conflicts(df: pd.DataFrame, target: str) -> tuple[int, int]:
+    """(rows, groups) of rows identical in every non-target, non-id column but with different labels."""
+    features = [c for c in df.columns if c != target and _column_kind(df[c]) != "id"]
+    if not features:
+        return 0, 0
+    keys = pd.Series(pd.util.hash_pandas_object(df[features], index=False).to_numpy(), index=df.index)
+    per_key = df[target].groupby(keys).nunique(dropna=True)
+    conflicted = per_key[per_key > 1].index
+    return int(keys.isin(conflicted).sum()), int(len(conflicted))
+
+
+def _label_block(df: pd.DataFrame, target: str) -> str:
+    info = _target_info(df[target])
+    lines = [_COMPUTED_START, f"- rows: {len(df):,}", f"- missing labels: {int(df[target].isna().sum()):,}"]
+    if info["task"] == "regression":
+        lines.append(f"- target: min {info['min']}, max {info['max']}, mean {info['mean']}, std {info['std']}")
+    else:
+        total = sum(info["class_counts"].values())
+        lines.append("- classes: " + "; ".join(f"{k} = {c:,} ({c / total:.1%})" for k, c in info["class_counts"].items()))
+    rows, groups = _label_conflicts(df, target)
+    lines += [f"- identical feature rows with different labels: {rows:,} rows in {groups:,} groups", _COMPUTED_END]
+    return "\n".join(lines)
+
+
+def label_audit(df: pd.DataFrame, *, target: str, state_dir: str | Path = "ml_pipeline") -> Path:
+    """Step 1: the label's computed facts plus five sections the agent writes; later calls refresh the facts only."""
+    path = Path(state_dir) / LABEL_AUDIT_FILE
+    block = _label_block(df, target)
+    if path.is_file():
+        text = path.read_text()
+        start, end = text.find(_COMPUTED_START), text.find(_COMPUTED_END)
+        if start != -1 and end != -1:
+            text = text[:start] + block + text[end + len(_COMPUTED_END):]
+        else:
+            head, _, rest = text.partition("\n")
+            text = f"{head}\n\n{block}\n{rest}"
+    else:
+        sections = "\n\n".join(f"## {name}\n<!-- {hint} -->" for name, hint in LABEL_SECTIONS.items())
+        text = f"# Label audit: {target}\n\n{block}\n\n{sections}\n"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
     return path

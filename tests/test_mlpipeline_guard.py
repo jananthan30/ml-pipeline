@@ -556,5 +556,63 @@ class Records(unittest.TestCase):
         self.assertEqual((rows["zip"]["high_cardinality"], rows["plan"]["n_levels"], rows["smoker"]["high_cardinality"]),
                          ("yes", "3", "no"))
 
+
+class VariablePagesAndLabels(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.state = Path(self.tmp.name) / "ml_pipeline"
+        self.df = messy()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def pages(self):
+        return json.loads((self.state / "figures" / guard.PAGES_FILE).read_text())
+
+    def test_pages_cover_every_column(self):
+        paths = guard.variable_figures(self.df, target="y", per_page=3, state_dir=self.state)
+        self.assertEqual([p.name for p in paths], ["02_variables_p01.png", "02_variables_p02.png", "02_variables_p03.png"])
+        self.assertEqual(sorted(c for cols in self.pages().values() for c in cols), sorted(self.df.columns))
+        ledger = dict(re.findall(r"^- Figure (\S+): (.*)$", (self.state / "PIPELINE.md").read_text(), re.M))
+        for p in paths:
+            self.assertGreater(p.stat().st_size, 1024)
+            self.assertIsNone(guard.note_problem(ledger[p.name]))
+
+    def test_wide_frame_pages(self):
+        wide = pd.DataFrame(np.random.default_rng(0).normal(size=(50, 30)), columns=[f"f{i}" for i in range(30)])
+        wide["y"] = np.arange(50) % 2
+        self.assertEqual(len(guard.variable_figures(wide, target="y", state_dir=self.state)), 3)  # 31 columns / 12
+
+    def test_all_missing_column_gets_a_panel(self):
+        guard.variable_figures(self.df.assign(empty=np.nan), target="y", state_dir=self.state)
+        self.assertIn("empty", [c for cols in self.pages().values() for c in cols])
+
+    def test_label_audit_template_and_counts(self):
+        flipped = self.df.iloc[:5].assign(y=1 - self.df["y"].iloc[:5])
+        df = pd.concat([self.df, flipped], ignore_index=True)
+        guard.label_audit(df, target="y", state_dir=self.state)
+        text = (self.state / guard.LABEL_AUDIT_FILE).read_text()
+        counts = df["y"].value_counts()
+        self.assertIn(f"0 = {counts[0]:,} (", text)
+        self.assertIn(f"1 = {counts[1]:,} (", text)
+        self.assertIn("- identical feature rows with different labels: 10 rows in 5 groups", text)
+        for section in guard.LABEL_SECTIONS:
+            self.assertIn(f"## {section}\n", text)
+
+    def test_label_audit_refresh_keeps_the_writing(self):
+        guard.label_audit(self.df, target="y", state_dir=self.state)
+        path = self.state / guard.LABEL_AUDIT_FILE
+        path.write_text(path.read_text().replace("## Source\n", "## Source\nClaims data from the hospital billing team.\n"))
+        guard.label_audit(self.df.iloc[:300], target="y", state_dir=self.state)
+        text = path.read_text()
+        self.assertIn("Claims data from the hospital billing team.", text)
+        self.assertIn("- rows: 300", text)
+        self.assertEqual(text.count(guard._COMPUTED_START), 1)
+
+    def test_label_audit_regression_line(self):
+        guard.label_audit(self.df.assign(y=np.random.default_rng(3).normal(size=len(self.df))), target="y",
+                          state_dir=self.state)
+        self.assertIn("- target: min ", (self.state / guard.LABEL_AUDIT_FILE).read_text())
+
 if __name__ == "__main__":
     unittest.main()
