@@ -359,3 +359,74 @@ def gate_a_problems(state_dir: Path, run_text: str) -> list[str]:
             + _dictionary_problems(dictionary, profile) + _pages_problems(state_dir, columns)
             + _missingness_problems(state_dir, columns, stage="A")
             + _label_audit_problems(state_dir, profile, dictionary))
+
+
+# ------------------------------------------------------------------ Gates B and C
+def _split_record_problems(state_dir: Path, filename: str, split: str, key: str, how: str) -> list[str]:
+    record = _json(state_dir / filename)
+    if not isinstance(record, dict):
+        return [f"{filename} missing: run {how}"]
+    state = _json(state_dir / STATE_FILE) or {}
+    on = record.get("computed_on") or {}
+    if on.get("split") != split or key not in state or on.get("n_rows") != state.get(key):
+        return [f"{filename} was not computed on the {split} split ({on.get('n_rows')} rows, the {split} split has "
+                f"{state.get(key)}): run {how}"]
+    return []
+
+
+def _plan_problems(state_dir: Path, profile: dict) -> list[str]:
+    roles = {r.get("column"): r.get("role", "").lower() for r in _csv_rows(state_dir / DICTIONARY_FILE) or []}
+    target = str((profile.get("target") or {}).get("name"))
+    needed = [c for c, info in (profile.get("columns") or {}).items()
+              if info.get("kind") in ("categorical", "bool") and c != target and roles.get(c) == "feature"]
+    if not needed:
+        return []
+    rows = _csv_rows(state_dir / PLAN_FILE)
+    if rows is None:
+        return ["categorical_plan.csv missing: run guard.categorical_plan(df)"]
+    by_name = {r.get("column"): r for r in rows}
+    unplanned = [c for c in needed if c not in by_name or not by_name[c].get("reason")
+                 or not _valid_combo(by_name[c].get("encoding", ""), ENCODINGS)]
+    if unplanned:
+        return [f"categorical_plan.csv needs an encoding ({', '.join(ENCODINGS)}) and a reason for {_listing(unplanned)}"]
+    return []
+
+
+def gate_b_problems(state_dir: Path, run_text: str) -> list[str]:
+    """Everything Phase 2 still lacks."""
+    problems = []
+    cleaning = _csv_rows(state_dir / CLEANING_FILE) or []
+    if not CLEANING_NONE.search(run_text) and not any(r.get("rule") and r.get("reason") for r in cleaning):
+        problems.append("no cleaning recorded: log each rule with guard.log_cleaning(...), or record "
+                        "'- Cleaning: none needed - reason: ...'")
+    profile = _v2_profile(state_dir)
+    if profile is None:
+        problems.append("data_profile.json (schema 2) missing: run guard.profile() at step 1")
+    else:
+        problems += _missingness_problems(state_dir, profile.get("columns") or {}, stage="B")
+        problems += _plan_problems(state_dir, profile)
+    problems += _split_record_problems(state_dir, ASSOCIATIONS_FILE, "train", "n_train",
+                                       "guard.train_associations(train, target=...)")
+    for name in ("07_correlations_train.png", "07_feature_target_train.png"):
+        if not (state_dir / "figures" / name).is_file():
+            problems.append(f"figures/{name} missing: run guard.train_associations(train, target=...)")
+    return problems
+
+
+def gate_c_problems(state_dir: Path, run_text: str) -> list[str]:
+    """Everything Phase 3 still lacks."""
+    problems = []
+    state = _json(state_dir / STATE_FILE) or {}
+    runs = _jsonl(state_dir / TRAINING_FILE)
+    if not any(r.get("full") is True and "n_train" in state and r.get("n_rows") == state["n_train"] for r in runs):
+        problems.append("no full-data training run on record: train on the whole training split with guard.fit(...) "
+                        "or record it with guard.record_training(...)")
+    problems += _split_record_problems(state_dir, IMPORTANCE_FILE, "validation", "n_val",
+                                       "guard.importance(model.predict, val, target=..., metric_fn=...)")
+    figures = state_dir / "figures"
+    if not (figures / "12_permutation_importance.png").is_file():
+        problems.append("figures/12_permutation_importance.png missing: run guard.importance(...)")
+    if not list(figures.glob("12_attribution_*.png")):
+        problems.append("no figures/12_attribution_*.png: draw one attribution figure (SHAP, partial dependence, or "
+                        "coefficients) and save it with guard.fig(12, 'attribution_<name>', ...)")
+    return problems

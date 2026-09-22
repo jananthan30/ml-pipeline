@@ -195,5 +195,64 @@ class GateA(unittest.TestCase):
         self.assertEqual(problems("A", files), [])
 
 
+class GateB(unittest.TestCase):
+    def test_complete_records_pass(self):
+        self.assertEqual(problems("B", fx.records("B")), [])
+
+    def test_cleaning(self):
+        files = with_(fx.CLEANING, None, "B")
+        self.assertIn("no cleaning recorded", joined("B", files))
+        self.assertEqual(problems("B", files, "- Cleaning: none needed - reason: validated upstream by the registry\n"), [])
+
+    def test_missingness_decisions(self):
+        rows = fx.missingness_rows()
+        rows[0]["decision"] = "guess"
+        self.assertIn("needs a decision", joined("B", with_(fx.MISSINGNESS, fx.missingness_csv(rows), "B")))
+        rows[0]["decision"] = "impute-median+indicator"
+        self.assertEqual(problems("B", with_(fx.MISSINGNESS, fx.missingness_csv(rows), "B")), [])
+
+    def test_categorical_plan(self):
+        self.assertIn("categorical_plan.csv missing", joined("B", with_(fx.PLAN, None, "B")))
+        rows = fx.plan_rows()
+        rows[0]["encoding"] = ""
+        self.assertIn("needs an encoding", joined("B", with_(fx.PLAN, fx.plan_csv(rows), "B")))
+
+    def test_plan_ignores_non_features(self):
+        rows = fx.dictionary_rows()
+        rows[1]["role"] = "drop"
+        files = with_(fx.PLAN, None, "B")
+        files[fx.DICTIONARY] = fx.dictionary_csv(rows)
+        self.assertEqual(problems("B", files), [])
+
+    def test_associations_on_the_training_split(self):
+        self.assertIn("associations.json missing", joined("B", with_(fx.ASSOCIATIONS, None, "B")))
+        a = fx.associations()
+        a["computed_on"]["n_rows"] = 200
+        self.assertIn("was not computed on the train split (200 rows, the train split has 120)",
+                      joined("B", with_(fx.ASSOCIATIONS, json.dumps(a), "B")))
+        self.assertIn("figures/07_feature_target_train.png missing",
+                      joined("B", with_(fx.FIG("07_feature_target_train.png"), None, "B")))
+
+
+class GateC(unittest.TestCase):
+    def test_complete_records_pass(self):
+        self.assertEqual(problems("C", fx.records("C")), [])
+
+    def test_full_training_run(self):
+        self.assertIn("no full-data training run", joined("C", with_(fx.TRAINING, None, "C")))
+        pilot = json.dumps({"model": "pilot", "n_rows": 50, "n_train": 120, "full": False, "date": "2026-09-24"}) + "\n"
+        self.assertIn("no full-data training run", joined("C", with_(fx.TRAINING, pilot, "C")))
+
+    def test_importance_on_validation(self):
+        imp = fx.importance()
+        imp["computed_on"]["split"] = "train"
+        self.assertIn("importance.json was not computed on the validation split",
+                      joined("C", with_(fx.IMPORTANCE, json.dumps(imp), "C")))
+
+    def test_attribution_figure(self):
+        self.assertIn("no figures/12_attribution_*.png",
+                      joined("C", with_(fx.FIG("12_attribution_coefficients.png"), None, "C")))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -31,6 +31,9 @@ import shlex
 import sys
 from pathlib import Path
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import gate_records  # noqa: E402
+
 PIPELINE_REL = Path("ml_pipeline") / "PIPELINE.md"
 SEARCH_UP = 4  # look in cwd and this many parent directories
 PROSE_SUFFIXES = {".md", ".markdown", ".rst"}
@@ -166,7 +169,7 @@ GATE_REQUIREMENTS = {
 }
 RATIONALE_HEAD = re.compile(r"^\s*Model rationale:\s*$", re.I | re.M)
 RATIONALE_BULLETS = ("traits", "baseline", "candidates", "ruled out", "metric")
-LEDGER = re.compile(r"^\s*-\s*Figure\s+(\S+\.png):\s*\S", re.I | re.M)
+LEDGER = re.compile(r"^\s*-\s*Figure\s+(\S+\.png):[ \t]*(\S[^\n]*)$", re.I | re.M)
 FINAL_TEST_LINE = re.compile(r"^\s*-\s*Step 14 final test:", re.I | re.M)
 GATE_RECORD_MSG = "ml-pipeline: Gate {0} can't be recorded: {1}."
 
@@ -197,19 +200,26 @@ def gate_problems(gate: str, state_dir: Path, ledger_text: str) -> list[str]:
         have = [p for p in figures if p.name.startswith(prefix + "_")]
         if len(have) < need:
             problems.append(f"{FIGURES_DIR}/{prefix}_*.png {len(have)} found (need {need})")
-    ledgered = {m.group(1) for m in LEDGER.finditer(ledger_text)}
+    explained = {m.group(1): m.group(2) for m in LEDGER.finditer(ledger_text)}
     for png in figures:
         size = png.stat().st_size
         if size < MIN_PNG_BYTES:
             problems.append(f"{FIGURES_DIR}/{png.name} is {size} bytes (empty?)")
-        if png.name not in ledgered:
+        if png.name not in explained:
             problems.append(f"{png.name} has no '- Figure {png.name}:' line")
+        else:
+            why = gate_records.note_problem(explained[png.name])
+            if why:
+                problems.append(f"{png.name}: explanation {why}")
     if required.get("rationale"):
         missing = rationale_missing(ledger_text)
         if missing:
             problems.append("Model rationale block missing lines: " + ", ".join(missing))
     if required.get("final_test_line") and not FINAL_TEST_LINE.search(ledger_text):
         problems.append("no '- Step 14 final test:' line")
+    checks = {"A": gate_records.gate_a_problems, "B": gate_records.gate_b_problems, "C": gate_records.gate_c_problems}
+    if gate in checks:
+        problems += checks[gate](state_dir, current_run(ledger_text))
     return problems
 
 

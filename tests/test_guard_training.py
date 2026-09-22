@@ -17,6 +17,8 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "hooks"))
 import guard_training as hook  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import v05_fixtures as fx  # noqa: E402
 
 GATE_A = "# Pipeline\n- Gate A: approved 2026-09-16\n"
 GATE_AB = GATE_A + "- Gate B: approved 2026-09-17\n"
@@ -198,15 +200,7 @@ class SelectionLeakage(unittest.TestCase):
         self.assertEqual(run({"command": "X_test_s = scaler.transform(X_test)"}, GATE_A)[0], "allow")
 
 
-PNG = b"\x89PNG\r\n\x1a\n" + b"\0" * 2000          # > 1,024 bytes, fine for the hook's size check
 TINY = b"\x89PNG\r\n\x1a\n" + b"\0" * 50
-LEDGER_A = ("- Figure 01_missingness.png: none missing.\n"
-            "- Figure 02_target_balance.png: 51% vs 49%.\n"
-            "- Figure 02_distributions.png: two skewed.\n")
-ARTIFACTS_A = {"ml_pipeline/data_profile.json": "{}", "ml_pipeline/figures/01_missingness.png": PNG,
-               "ml_pipeline/figures/02_target_balance.png": PNG, "ml_pipeline/figures/02_distributions.png": PNG}
-RATIONALE = ("Model rationale:\n- traits: binary, 1,000 rows (small)\n- baseline: dummy + logistic\n"
-             "- candidates: boosting\n- ruled out: neural nets (small data)\n- metric: PR-AUC\n")
 
 
 def write_md(content):
@@ -214,7 +208,12 @@ def write_md(content):
 
 
 class GateRecording(unittest.TestCase):
-    """A gate line is denied until that gate's artifacts exist on disk."""
+    """A gate line is denied until that gate's records exist and explain every column."""
+
+    def record(self, gate, files, ledger=None, existing=""):
+        text = (fx.ledger(gate if gate in "ABC" else "C") if ledger is None else ledger)
+        return run(write_md(text + f"- Gate {gate}: approved 2026-09-23\n"), pipeline_md=existing, tool="Write",
+                   files=files)
 
     def test_gate_a_denied_without_anything(self):
         decision, reason = run(write_md("- Gate A: approved 2026-09-16\n"), pipeline_md="", tool="Write")
@@ -223,23 +222,36 @@ class GateRecording(unittest.TestCase):
         self.assertIn("figures/01_*.png 0 found (need 1)", reason)
 
     def test_gate_a_allowed_when_complete(self):
-        decision, _ = run(write_md(LEDGER_A + "- Gate A: approved 2026-09-16\n"), pipeline_md="", tool="Write", files=ARTIFACTS_A)
-        self.assertEqual(decision, "allow")
+        self.assertEqual(self.record("A", fx.records("A")), ("allow", ""))
+
+    def test_missing_records_named_in_the_denial(self):
+        files = fx.records("A")
+        del files[fx.DICTIONARY]
+        decision, reason = self.record("A", files)
+        self.assertEqual(decision, "deny")
+        self.assertIn("data_dictionary.csv missing", reason)
 
     def test_png_without_ledger_line_denied(self):
-        files = {**ARTIFACTS_A, "ml_pipeline/figures/02_extra.png": PNG}
-        decision, reason = run(write_md(LEDGER_A + "- Gate A: approved 2026-09-16\n"), pipeline_md="", tool="Write", files=files)
+        decision, reason = self.record("A", {**fx.records("A"), fx.FIG("02_extra.png"): fx.PNG})
         self.assertEqual(decision, "deny")
         self.assertIn("02_extra.png has no '- Figure 02_extra.png:' line", reason)
 
     def test_tiny_png_denied(self):
-        files = {**ARTIFACTS_A, "ml_pipeline/figures/01_missingness.png": TINY}
-        decision, reason = run(write_md(LEDGER_A + "- Gate A: approved 2026-09-16\n"), pipeline_md="", tool="Write", files=files)
+        decision, reason = self.record("A", {**fx.records("A"), fx.FIG("01_missingness.png"): TINY})
         self.assertEqual(decision, "deny")
         self.assertIn("(empty?)", reason)
 
+    def test_vague_figure_explanation_denied(self):
+        ledger = fx.ledger("A").replace(
+            "y=0 is 70.0% of 200 rows, so a majority-class dummy scores 70.0%.",
+            "shows the class balance of the target variable nicely")
+        decision, reason = self.record("A", fx.records("A"), ledger=ledger)
+        self.assertEqual(decision, "deny")
+        self.assertIn("02_target_balance.png: explanation contains no number", reason)
+
     def test_ledger_in_existing_file_counts(self):
-        decision, _ = run(write_md("- Gate A: approved 2026-09-16\n"), pipeline_md=LEDGER_A, tool="Write", files=ARTIFACTS_A)
+        decision, _ = run(write_md("- Gate A: approved 2026-09-23\n"), pipeline_md=fx.ledger("A"), tool="Write",
+                          files=fx.records("A"))
         self.assertEqual(decision, "allow")
 
     def test_bash_append_is_checked_too(self):
@@ -249,27 +261,25 @@ class GateRecording(unittest.TestCase):
     def test_negated_line_is_not_a_recording(self):
         self.assertEqual(run(write_md("- Gate A: not yet approved\n"), pipeline_md="", tool="Write")[0], "allow")
 
-    def test_gate_b_needs_rationale_and_figure(self):
-        files = {**ARTIFACTS_A, "ml_pipeline/figures/04_cleaning.png": PNG}
-        ledger = LEDGER_A + "- Figure 04_cleaning.png: 312 rows dropped.\n"
-        decision, reason = run(write_md(ledger + "- Gate B: approved 2026-09-17\n"), pipeline_md="", tool="Write", files=files)
+    def test_gate_b_needs_rationale_and_records(self):
+        decision, reason = self.record("B", fx.records("B"), ledger=fx.ledger("B").replace(fx.RATIONALE, ""))
         self.assertEqual(decision, "deny")
         self.assertIn("Model rationale block missing lines: traits, baseline, candidates, ruled out, metric", reason)
-        partial = "Model rationale:\n- traits: x\n- baseline: y\n"
-        decision, reason = run(write_md(ledger + partial + "- Gate B: approved 2026-09-17\n"), pipeline_md="", tool="Write", files=files)
-        self.assertIn("missing lines: candidates, ruled out, metric", reason)
-        decision, _ = run(write_md(ledger + RATIONALE + "- Gate B: approved 2026-09-17\n"), pipeline_md="", tool="Write", files=files)
-        self.assertEqual(decision, "allow")
+        files = fx.records("B")
+        del files[fx.ASSOCIATIONS]
+        decision, reason = self.record("B", files)
+        self.assertIn("associations.json missing", reason)
+        self.assertEqual(self.record("B", fx.records("B")), ("allow", ""))
 
     def test_gate_c_and_d(self):
-        files = {**ARTIFACTS_A, "ml_pipeline/figures/12_roc.png": PNG, "ml_pipeline/figures/13_errors.png": PNG}
-        ledger = LEDGER_A + "- Figure 12_roc.png: AUC 0.8.\n- Figure 13_errors.png: worst slice.\n"
-        self.assertEqual(run(write_md(ledger + "- Gate C: approved 2026-09-18\n"), pipeline_md="", tool="Write", files=files)[0], "allow")
-        decision, reason = run(write_md(ledger + "- Gate D: approved 2026-09-19\n"), pipeline_md="", tool="Write", files=files)
+        self.assertEqual(self.record("C", fx.records("C")), ("allow", ""))
+        files = {**fx.records("C"), fx.FIG("13_errors.png"): fx.PNG}
+        ledger = fx.ledger("C") + "- Figure 13_errors.png: the worst slice is plan=pro with 12 of 40 validation rows wrong.\n"
+        decision, reason = self.record("D", files, ledger=ledger)
         self.assertEqual(decision, "deny")
         self.assertIn("no '- Step 14 final test:' line", reason)
-        ledger += "- Step 14 final test: acc=0.79 (touch 1, 2026-09-19)\n"
-        self.assertEqual(run(write_md(ledger + "- Gate D: approved 2026-09-19\n"), pipeline_md="", tool="Write", files=files)[0], "allow")
+        ledger += "- Step 14 final test: accuracy=0.7900 (touch 1, 2026-09-25)\n"
+        self.assertEqual(self.record("D", files, ledger=ledger)[0], "allow")
 
 
 def profile_with(**traits):
