@@ -69,7 +69,9 @@ All records live in `ml_pipeline/` next to `PIPELINE.md`:
 
 Every guard helper that writes a file the agent also edits **merges**: it refreshes computed
 fields, keeps the agent's words for rows that still exist, adds rows for new columns with blank
-word fields, and removes rows for columns no longer in the frame (returning their names).
+word fields, and removes rows for columns no longer in the frame, warning with their names
+(`UserWarning`). CSVs are read as `utf-8-sig`, so a file saved from Excel or Numbers (byte-order
+mark, CRLF line endings) still parses; they are written as plain UTF-8.
 
 ## 1. Full-data proof and the pilot rule
 
@@ -328,9 +330,10 @@ Evaluated like the other red flags (only when a profile exists; lifted by
 `- Override: red flag target-stats-outside-train - ...` in the current run). Fires when a call to
 `mutual_info_classif`, `mutual_info_regression`, `f_classif`, `f_regression`, `chi2`, or
 `r_regression` has arguments that do not contain `train`, or when a `.fit(` / `.fit_transform(`
-whose receiver or preceding 200 characters name `SelectKBest`, `SelectPercentile`,
-`GenericUnivariateSelect`, `SelectFpr`, `SelectFdr`, or `SelectFwe` has arguments that do not
-contain `train`. Message: `target-based feature selection must use the training split only (…) -
+on a selector has arguments that do not contain `train`. A selector is `SelectKBest`,
+`SelectPercentile`, `GenericUnivariateSelect`, `SelectFpr`, `SelectFdr`, or `SelectFwe`, called
+directly (`SelectKBest(k=5).fit(...)`) or through a name assigned from one of those constructors in
+the same code (`sel = SelectKBest(k=5)` ... `sel.fit(...)`). Message: `target-based feature selection must use the training split only (…) -
 select features inside the training data or a CV fold`.
 
 ## 4. Phase 3 records (Gate C) and the real-explanation rule
@@ -390,7 +393,7 @@ each problem names at most `LIST_CAP` = 10 columns followed by `and N more`.
 
 | Gate | v0.4 (kept) | v0.5 adds |
 |---|---|---|
-| A | profile; ≥ 1 `01_*.png`; ≥ 2 `02_*.png` | `source.json` present and `source.full_data` true, or `- Override: partial data - …` in the current run; profile schema 2 with every kind-specific key for every column; dictionary: column set equals the profile's (missing, extra, duplicate named), no blank word field, valid `available_at_prediction` and `role`, exactly one `target` row naming the profile target, no `feature` with `available_at_prediction = no`, every figure note passes §4.3; every profile column on some page in `pages.json` and every listed page on disk; missingness: every gappy column listed once with `n_missing` equal to the profile's, valid `mechanism`, non-empty `evidence`, `01_missing_pattern.png` when any column has gaps; label audit: file present, computed block present with class counts equal to the profile's `class_counts` (or the regression line), each of the five sections has ≥ 40 characters outside HTML comments, and the Leakage check section contains the name (case-insensitive) of every leakage suspect whose role is `feature` or `id` |
+| A | profile; ≥ 1 `01_*.png`; ≥ 2 `02_*.png` | `source.json` present and `source.full_data` true, or `- Override: partial data - …` in the current run; profile schema 2 with the common keys for every column and the kind-specific keys for every column with at least one value; dictionary: column set equals the profile's (missing, extra, duplicate named), no blank word field, valid `available_at_prediction` and `role`, exactly one `target` row naming the profile target, no `feature` with `available_at_prediction = no`, every figure note passes §4.3; every profile column on some page in `pages.json` and every listed page on disk; missingness: every gappy column listed once with `n_missing` equal to the profile's, valid `mechanism`, non-empty `evidence`, `01_missing_pattern.png` when any column has gaps; label audit: file present, computed block present with class counts equal to the profile's `class_counts` (or the regression line), each of the five sections has ≥ 40 characters outside HTML comments, and the Leakage check section contains the name (case-insensitive) of every leakage suspect whose role is `feature` or `id` |
 | B | ≥ 1 `04_*.png`; model rationale | `cleaning_log.csv` with ≥ 1 row, or `- Cleaning: none needed - reason: …` in the current run; every missingness row has a valid `decision` and a `reason`; categorical plan: every categorical or bool column whose role is `feature` has one row with a valid `encoding` and a `reason`; `associations.json` with `computed_on.split = train` and `n_rows = n_train`; `07_correlations_train.png` and `07_feature_target_train.png` present |
 | C | ≥ 1 `12_*.png` | a full training run (§4.1); `importance.json` with `computed_on.split = validation` and `n_rows = n_val`; `12_permutation_importance.png`; ≥ 1 `12_attribution_*.png` |
 | D | ≥ 1 `13_*.png`; final-test line | — |
