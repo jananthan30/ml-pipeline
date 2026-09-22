@@ -1124,3 +1124,80 @@ def _association_figures(corr: pd.DataFrame, strengths: list[dict], pairs: list[
     else:
         explanation = f"No numeric or categorical feature to compare with the target among {n_rows:,} training rows."
     fig(7, "feature_target_train", f, explanation, state_dir)
+
+
+# ------------------------------------------------------------------ training and importance (steps 9-12)
+TRAINING_FILE = "training_runs.jsonl"
+IMPORTANCE_FILE = "importance.json"
+
+
+class NotValidationSplit(LeakageError):
+    """Importance was requested on a frame that is not the frozen validation split."""
+
+
+def _append_run(state_dir, name: str, n_rows: int) -> None:
+    state = _split_state(state_dir)
+    line = {"model": str(name), "n_rows": int(n_rows), "n_train": int(state["n_train"]),
+            "full": int(n_rows) == int(state["n_train"]), "date": date.today().isoformat()}
+    with (Path(state_dir) / TRAINING_FILE).open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(line) + "\n")
+
+
+def fit(model, X, y=None, *, name: str | None = None, state_dir: str | Path = "ml_pipeline", **fit_kwargs):
+    """Steps 9-10: train ``model`` and record how many rows it saw, so Gate C can prove a full-data run."""
+    _split_state(state_dir)  # no split, no training - checked before the model is touched
+    if y is None:
+        model.fit(X, **fit_kwargs)
+    else:
+        model.fit(X, y, **fit_kwargs)
+    _append_run(state_dir, name or type(model).__name__, len(X))
+    return model
+
+
+def record_training(data, *, name: str, state_dir: str | Path = "ml_pipeline") -> None:
+    """Custom training loops: record the rows ``data`` holds. It must support len(), so the count is measured."""
+    _append_run(state_dir, name, len(data))
+
+
+def importance(predict_fn, val: pd.DataFrame, *, target: str, metric_fn, greater_is_better: bool = True,
+               n_repeats: int = 5, seed: int = 0, state_dir: str | Path = "ml_pipeline") -> dict:
+    """Step 12: permutation importance on the frozen validation split, with a figure."""
+    state = _split_state(state_dir)
+    if len(val) != state["n_val"]:
+        raise NotValidationSplit(f"{len(val):,} rows, but the frozen validation split has {state['n_val']:,}")
+    X = val.drop(columns=[target])
+    y = val[target].to_numpy()
+    sign = 1.0 if greater_is_better else -1.0
+    baseline = float(metric_fn(y, np.asarray(predict_fn(X))))
+    rng = np.random.default_rng(seed)
+    features = []
+    for col in X.columns:
+        drops = []
+        for _ in range(n_repeats):
+            shuffled = X.copy()
+            shuffled[col] = rng.permutation(shuffled[col].to_numpy())
+            drops.append(sign * (baseline - float(metric_fn(y, np.asarray(predict_fn(shuffled))))))
+        features.append({"column": str(col), "importance_mean": round(float(np.mean(drops)), 6),
+                         "importance_std": round(float(np.std(drops)), 6)})
+    features.sort(key=lambda e: e["importance_mean"], reverse=True)
+    metric = getattr(metric_fn, "__name__", "metric")
+    result = {"schema_version": "1",
+              "computed_on": {"split": "validation", "n_rows": int(len(val)), "date": date.today().isoformat()},
+              "metric": metric, "baseline_score": round(baseline, 6), "n_repeats": int(n_repeats),
+              "features": features}
+    Path(state_dir).mkdir(parents=True, exist_ok=True)
+    (Path(state_dir) / IMPORTANCE_FILE).write_text(json.dumps(result, indent=2))
+
+    plt = _plt()
+    top = features[:25]
+    f, ax = plt.subplots(figsize=(8, max(3, 0.3 * len(top) + 1)))
+    ax.barh([e["column"] for e in top][::-1], [e["importance_mean"] for e in top][::-1],
+            xerr=[e["importance_std"] for e in top][::-1])
+    ax.set_xlabel(f"drop in {metric} when shuffled")
+    ax.set_title("Permutation importance, validation split")
+    cheap = sum(1 for e in features if e["importance_mean"] < 0.001)
+    explanation = (f"Shuffling {features[0]['column']} costs {features[0]['importance_mean']:.3f} of {metric} "
+                   f"(validation baseline {baseline:.3f}); {cheap} of {len(features)} features cost less than 0.001 "
+                   "and are candidates to drop.")
+    fig(12, "permutation_importance", f, explanation, state_dir)
+    return result

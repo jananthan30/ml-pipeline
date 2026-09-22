@@ -680,5 +680,79 @@ class CleaningAndAssociations(unittest.TestCase):
         with self.assertRaises(guard.LeakageError):
             guard.train_associations(self.signal_frame(), target="y", state_dir=self.state)
 
+
+class Stub:
+    """A model that remembers how many rows it was fit on."""
+    def fit(self, X, y=None):
+        self.n_rows = len(X)
+        return self
+
+
+class TrainingAndImportance(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.state = Path(self.tmp.name) / "ml_pipeline"
+        rng = np.random.default_rng(9)
+        signal = rng.normal(size=600)
+        df = pd.DataFrame({"signal": signal, "noise": rng.normal(size=600), "y": (signal > 0).astype(int)})
+        self.tr, self.va, self.te = guard.split(df, target="y", state_dir=self.state)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def runs(self):
+        return [json.loads(line) for line in (self.state / guard.TRAINING_FILE).read_text().splitlines()]
+
+    @staticmethod
+    def predict(X):
+        return (X["signal"] > 0).astype(int).to_numpy()
+
+    @staticmethod
+    def accuracy(y_true, y_pred):
+        return float((y_true == y_pred).mean())
+
+    def test_fit_records_a_full_run(self):
+        model = guard.fit(Stub(), self.tr.drop(columns="y"), self.tr["y"], state_dir=self.state)
+        self.assertEqual(model.n_rows, len(self.tr))
+        run = self.runs()[0]
+        self.assertEqual((run["model"], run["n_rows"], run["n_train"], run["full"]),
+                         ("Stub", len(self.tr), len(self.tr), True))
+
+    def test_a_slice_is_recorded_as_not_full(self):
+        guard.fit(Stub(), self.tr.drop(columns="y").iloc[:50], self.tr["y"].iloc[:50], name="pilot",
+                  state_dir=self.state)
+        self.assertEqual((self.runs()[0]["model"], self.runs()[0]["full"]), ("pilot", False))
+
+    def test_fit_needs_a_split_before_training(self):
+        model = Stub()
+        with self.assertRaises(guard.LeakageError):
+            guard.fit(model, self.tr, state_dir=Path(self.tmp.name) / "nosplit")
+        self.assertFalse(hasattr(model, "n_rows"))
+
+    def test_record_training_measures_len(self):
+        guard.record_training(self.tr, name="mlp", state_dir=self.state)
+        self.assertTrue(self.runs()[0]["full"])
+        with self.assertRaises(TypeError):
+            guard.record_training(5, name="typed", state_dir=self.state)
+
+    def test_importance_ranks_the_signal_first(self):
+        result = guard.importance(self.predict, self.va, target="y", metric_fn=self.accuracy, state_dir=self.state)
+        self.assertEqual([f["column"] for f in result["features"]], ["signal", "noise"])
+        self.assertGreater(result["features"][0]["importance_mean"], 0.3)
+        self.assertEqual(result["features"][1]["importance_mean"], 0.0)
+        self.assertEqual((result["computed_on"]["split"], result["computed_on"]["n_rows"]), ("validation", len(self.va)))
+        self.assertGreater((self.state / "figures" / "12_permutation_importance.png").stat().st_size, 1024)
+
+    def test_lower_is_better_metrics(self):
+        def mse(y_true, y_pred):
+            return float(((y_true - y_pred) ** 2).mean())
+        result = guard.importance(self.predict, self.va, target="y", metric_fn=mse, greater_is_better=False,
+                                  state_dir=self.state)
+        self.assertGreater(result["features"][0]["importance_mean"], 0.3)
+
+    def test_importance_refuses_other_frames(self):
+        with self.assertRaises(guard.NotValidationSplit):
+            guard.importance(self.predict, self.tr, target="y", metric_fn=self.accuracy, state_dir=self.state)
+
 if __name__ == "__main__":
     unittest.main()
