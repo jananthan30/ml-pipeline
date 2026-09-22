@@ -539,6 +539,57 @@ def profile(
     return result
 
 
+# ------------------------------------------------------------------ the real-explanation rule
+MIN_NOTE_CHARS = 40
+COLLINEAR_RHO = 0.9
+_NUMBER = re.compile(r"-?\d[\d,]*(?:\.\d+)?%?")
+
+
+def _stat_values(obj) -> list[float]:
+    """Every number inside a profile entry, recursively (booleans and NaN excluded)."""
+    if isinstance(obj, bool):
+        return []
+    if isinstance(obj, (int, float)):
+        return [float(obj)] if obj == obj else []
+    if isinstance(obj, dict):
+        return [v for value in obj.values() for v in _stat_values(value)]
+    if isinstance(obj, (list, tuple)):
+        return [v for value in obj for v in _stat_values(value)]
+    return []
+
+
+def _cites(note: str, stats: dict) -> bool:
+    """True when ``note`` has a number other than 0 or 1 equal to one of ``stats`` at its written precision."""
+    facts = _stat_values(stats)
+    for token in _NUMBER.findall(note):
+        percent = token.endswith("%")
+        text = token.rstrip("%").replace(",", "")
+        try:
+            value = float(text)
+        except ValueError:
+            continue
+        if value in (0.0, 1.0):
+            continue
+        decimals = len(text.split(".")[1]) if "." in text else 0
+        for fact in facts:
+            candidate = round(fact * 100, decimals) if percent else round(fact, decimals)
+            if abs(candidate - value) < 1e-9:
+                return True
+    return False
+
+
+def note_problem(note: str, stats: dict | None = None) -> str | None:
+    """Why ``note`` is not a real explanation, or None. With ``stats`` it is a column note and must cite them."""
+    text = " ".join(str(note or "").split())
+    if len(text) < MIN_NOTE_CHARS:
+        return f"shorter than {MIN_NOTE_CHARS} characters"
+    if not re.search(r"\d", text):
+        return "contains no number"
+    if stats is not None and not _cites(text, stats):
+        return "cites no statistic of this column"
+    return None
+
+
 # ------------------------------------------------------------------ figures (steps 1-2 and any step)
 FIGURES_DIR = "figures"
 
@@ -563,8 +614,9 @@ def _ledger(pipeline_md: Path, filename: str, explanation: str) -> None:
 
 def fig(step: int, name: str, figure, explanation: str, state_dir: str | Path = "ml_pipeline") -> Path:
     """Save a matplotlib figure as ml_pipeline/figures/NN_<slug>.png and record its explanation."""
-    if not explanation or not explanation.strip():
-        raise ValueError("every figure needs an explanation: what it shows and why it matters")
+    problem = note_problem(explanation)
+    if problem:
+        raise ValueError(f"figure explanation {problem}: say what it shows, with a number from the data")
     plt = _plt()
     figure = getattr(figure, "figure", figure)  # accept an Axes too
     state_dir = Path(state_dir)
@@ -591,9 +643,10 @@ def eda_figures(df: pd.DataFrame, *, target: str, time_col: str | None = None,
     ax.set_xlabel("missing fraction")
     ax.set_title("Missing values per column")
     n_missing = int((missing > 0).sum())
-    paths.append(fig(1, "missingness", f,
-                     f"{n_missing} of {len(missing)} columns have missing values; worst is {missing.index[0]} "
-                     f"at {missing.iloc[0]:.1%}." if n_missing else "No column has missing values.", state_dir))
+    explanation = (f"{n_missing} of {len(missing)} columns have missing values; worst is {missing.index[0]} "
+                   f"at {missing.iloc[0]:.1%}." if n_missing else
+                   f"0 of {len(missing)} columns have missing values, so step 4 needs no imputation.")
+    paths.append(fig(1, "missingness", f, explanation, state_dir))
 
     y = df[target]
     f, ax = plt.subplots(figsize=(6, 4))
@@ -626,11 +679,9 @@ def eda_figures(df: pd.DataFrame, *, target: str, time_col: str | None = None,
                          f"Histograms of {cols} numeric features; {len(skewed)} are strongly skewed "
                          f"({', '.join(skewed[:5]) or 'none'}), which matters for scaling and outliers.", state_dir))
 
-    with_target = df.select_dtypes("number").iloc[:, :30]
-    if target in df.columns and target not in with_target.columns:
-        with_target = with_target.assign(**{target: pd.factorize(df[target])[0]})
-    if with_target.shape[1] >= 2:
-        corr = with_target.corr()
+    numeric = df.select_dtypes("number").drop(columns=[target], errors="ignore").iloc[:, :30]
+    if numeric.shape[1] >= 2:
+        corr = numeric.corr()
         f, ax = plt.subplots(figsize=(7, 6))
         image = ax.imshow(corr.to_numpy(), vmin=-1, vmax=1, cmap="coolwarm")
         ax.set_xticks(range(len(corr)))
@@ -638,10 +689,18 @@ def eda_figures(df: pd.DataFrame, *, target: str, time_col: str | None = None,
         ax.set_yticks(range(len(corr)))
         ax.set_yticklabels([str(c) for c in corr.columns], fontsize=7)
         f.colorbar(image)
-        ax.set_title("Correlations")
-        ranked = corr[target].drop(target).abs().sort_values(ascending=False) if target in corr.columns else pd.Series(dtype=float)
-        explanation = (f"Strongest correlation with {target}: {ranked.index[0]} ({ranked.iloc[0]:.2f}); anything "
-                       "above 0.95 is a leakage suspect." if len(ranked) else "Correlations between numeric features.")
+        ax.set_title("Correlations between features (target left out until the split)")
+        values = corr.to_numpy()
+        pairs = [(abs(values[i, j]), corr.columns[i], corr.columns[j])
+                 for i in range(len(corr)) for j in range(i + 1, len(corr)) if values[i, j] == values[i, j]]
+        if pairs:
+            r, a, b = max(pairs, key=lambda t: t[0])
+            high = sum(1 for t in pairs if t[0] > COLLINEAR_RHO)
+            explanation = (f"Strongest pair among {len(corr)} numeric features: {a} and {b} (|r| = {r:.2f}); "
+                           f"{high} pairs exceed {COLLINEAR_RHO}. The target is left out until the split.")
+        else:
+            explanation = (f"Correlations between {len(corr)} numeric features could not be computed (constant "
+                           "columns). The target is left out until the split.")
         paths.append(fig(2, "correlations", f, explanation, state_dir))
 
     datetime_cols = [c for c in df.columns if pd.api.types.is_datetime64_any_dtype(df[c])]

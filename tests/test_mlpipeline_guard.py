@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sys
 import tempfile
 import unittest
@@ -379,6 +380,17 @@ class Profile(unittest.TestCase):
         self.assertIn("not in source.json", src["reason"])
 
 
+NOTE_CASES = json.loads((Path(__file__).resolve().parent / "note_rule_cases.json").read_text())
+
+
+class NoteRule(unittest.TestCase):
+    def test_shared_cases(self):
+        for case in NOTE_CASES["cases"]:
+            with self.subTest(note=case["note"]):
+                stats = NOTE_CASES["stats"] if case["column"] else None
+                self.assertEqual(guard.note_problem(case["note"], stats), case["problem"])
+
+
 class Figures(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -407,10 +419,28 @@ class Figures(unittest.TestCase):
         import matplotlib.pyplot as plt
         f, ax = plt.subplots()
         ax.plot([0, 1], [0, 1])
-        path = guard.fig(12, "ROC curve", f, "AUC 0.81 on validation, baseline 0.50.", state_dir=self.state)
+        path = guard.fig(12, "ROC curve", f, "AUC 0.81 on validation against a dummy baseline of 0.50.", state_dir=self.state)
         self.assertEqual(path.name, "12_roc_curve.png")
         self.assertGreater(path.stat().st_size, 1024)
         self.assertIn("- Figure 12_roc_curve.png: AUC 0.81", self.md.read_text())
+
+    def ledger(self):
+        return dict(re.findall(r"^- Figure (\S+): (.*)$", self.md.read_text(), re.M))
+
+    def test_fig_rejects_an_explanation_without_a_number(self):
+        import matplotlib.pyplot as plt
+        with self.assertRaises(ValueError):
+            guard.fig(4, "x", plt.figure(), "shows the distribution of values nicely here", state_dir=self.state)
+
+    def test_eda_explanations_are_real(self):
+        guard.eda_figures(frame(dates=True), target="y", time_col="date", state_dir=self.state)
+        for name, explanation in self.ledger().items():
+            with self.subTest(figure=name):
+                self.assertIsNone(guard.note_problem(explanation))
+
+    def test_correlations_leave_out_the_target(self):
+        guard.eda_figures(frame(), target="y", state_dir=self.state)
+        self.assertIn("target is left out", self.ledger()["02_correlations.png"])
 
     def test_fig_requires_explanation(self):
         import matplotlib.pyplot as plt
