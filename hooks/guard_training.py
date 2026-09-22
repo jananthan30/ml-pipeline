@@ -68,8 +68,12 @@ TRAIN_API = re.compile(
 BACKWARD = re.compile(r"\.\s*backward\s*\(")
 OPT_STEP = re.compile(r"\.\s*step\s*\(")
 # A slice of the rows inside a model-training call, or nrows= in code that trains: a pilot.
-SLICE = re.compile(r"\[\s*-?\d*\s*:\s*-?\d+\s*\]|\.\s*i?loc\s*\[\s*-?\d*\s*:\s*-?\d+|\.\s*(?:head|sample)\s*\(")
-NROWS = re.compile(r"\bnrows\s*=")
+# Row slices with a positive stop or a negative start (`[:5000]`, `.iloc[:500]`, `[-5000:]`), head() and sample().
+SLICE = re.compile(r"\[\s*-?\d*\s*:\s*\d+\s*\]|\[\s*-\d+\s*:\s*\]|\.\s*i?loc\s*\[\s*-?\d*\s*:\s*\d+|"
+                   r"\.\s*(?:head|sample)\s*\(")
+FULL_SHUFFLE = re.compile(r"\bfrac\s*=\s*1(?:\.0*)?\b")
+READER = re.compile(r"\bread_(?:csv|table|excel|json|fwf|parquet|feather|sas|stata|spss|sql)\s*\(")
+NROWS = re.compile(r"\bnrows\s*=\s*(?!0\s*(?:[,)]|$))")
 PILOT_OVERRIDE = re.compile(r"^[ \t]*-[ \t]*Override[ \t]*:[ \t]*pilot[ \t]*-", re.I | re.M)
 SELECTOR_NAMES = r"SelectKBest|SelectPercentile|GenericUnivariateSelect|SelectFpr|SelectFdr|SelectFwe"
 SELECTOR = re.compile(r"\b(?:" + SELECTOR_NAMES + r")\b")
@@ -101,6 +105,9 @@ TEST_SPLIT = re.compile(r"\b(?:\w+_test|test_\w+|test)\b")
 COMMENT = re.compile(r"#[^\n]*")
 
 # ------------------------------------------------------------------ following execution
+LAUNCHERS = {"torchrun", "accelerate", "deepspeed", "horovodrun"}
+LAUNCHER_MODULES = ("torch.distributed.run", "torch.distributed.launch", "accelerate.commands", "deepspeed")
+SHELLS = {"sh", "bash", "zsh"}
 PYTHON_EXE = re.compile(r"^(?:python(?:\d+(?:\.\d+)*)?|ipython3?|pypy3?)$")
 PYTHON_OPTS_WITH_VALUE = {"-W", "-X", "--check-hash-based-pycs"}
 SHELL_SEPARATOR = re.compile(r"&&|\|\||[;|\n]")
@@ -431,7 +438,17 @@ def _exec_targets(tokens: list[str]) -> list[tuple[str, str]]:
         files = [("file", t) for t in rest if t.lower().endswith((".py", ".ipynb"))]
         if PYTHON_EXE.match(name):
             target = _python_target(rest)
-            targets += [target] if target else []
+            if target and target[0] == "module" and target[1].startswith(LAUNCHER_MODULES):
+                targets += files
+            elif target:
+                targets.append(target)
+        elif name in LAUNCHERS:
+            targets += files
+        elif name in SHELLS and rest:
+            if rest[0].startswith("-") and "c" in rest[0] and len(rest) > 1:
+                targets.append(("shell-code", rest[1]))
+            elif not rest[0].startswith("-"):
+                targets.append(("shell-file", rest[0]))
         elif name == "uv" and rest[:1] == ["run"]:
             module = next((rest[j + 1] for j, t in enumerate(rest[:-1]) if t in ("-m", "--module")), None)
             targets += [("module", module)] if module else files
@@ -471,8 +488,11 @@ def _read_script(kind: str, name: str, base: Path) -> str:
     return ""
 
 
-def executed_code(command: str, cwd: str) -> str:
-    """Source of every Python file, module, or notebook ``command`` runs, resolved against cwd and ``cd``."""
+def executed_code(command: str, cwd: str, depth: int = 0) -> str:
+    """Source of every Python file, module, or notebook ``command`` runs, resolved against cwd and ``cd``.
+
+    Shell scripts and ``sh -c`` strings are read one level deep, so `bash train.sh` counts as what it runs.
+    """
     base = Path(cwd or ".")
     chunks: list[str] = []
     for segment in SHELL_SEPARATOR.split(command):
@@ -485,7 +505,16 @@ def executed_code(command: str, cwd: str) -> str:
                 base = base / Path(tokens[1]).expanduser()
                 continue
             for kind, name in _exec_targets(tokens):
-                chunks.append(_read_script(kind, name, base))
+                if kind == "shell-code":
+                    code = name
+                elif kind == "shell-file":
+                    code = _read_script("file", name, base)
+                else:
+                    chunks.append(_read_script(kind, name, base))
+                    continue
+                chunks.append(code)
+                if depth < 1:
+                    chunks.append(executed_code(code, str(base), depth + 1))
         except Exception:  # an unreadable path must never fail the whole hook open
             continue
     return "\n".join(chunk for chunk in chunks if chunk)
@@ -505,6 +534,18 @@ def _args(text: str, start: int, limit: int = 400) -> str:
                 break
         i += 1
     return text[start:i]
+
+
+def _slices_rows(args: str) -> bool:
+    """True when a fit call's arguments take a slice of the rows (not columns, not a shift, not a shuffle)."""
+    for match in SLICE.finditer(args):
+        before = args[:match.start()]
+        if before.count("[") > before.count("]") or before.rstrip().endswith(".columns"):
+            continue  # inside another subscript, or a slice of column names: column selection
+        if "sample" in match.group(0) and FULL_SHUFFLE.search(_args(args, match.end())):
+            continue  # sample(frac=1) shuffles every row
+        return True
+    return False
 
 
 def _classify(receiver: str, before: str, args: str) -> str:
@@ -541,7 +582,7 @@ def analyse(text: str) -> dict[str, str | None]:
         if TEST_SPLIT.search(args) and found["fit_on_test"] is None:
             found["fit_on_test"] = snippet
         kind = _classify(match.group(1) or "", code[max(0, match.start() - 200): match.start()], args)
-        if kind == "model" and found["pilot"] is None and SLICE.search(args):
+        if kind == "model" and found["pilot"] is None and _slices_rows(args):
             found["pilot"] = snippet
         if found[kind] is None:
             found[kind] = snippet
@@ -553,9 +594,12 @@ def analyse(text: str) -> dict[str, str | None]:
         args = _args(code, match.end())
         if TEST_SPLIT.search(args) and found["eval_on_test"] is None:
             found["eval_on_test"] = code[match.start(): match.end() + len(args) + 1][:SNIPPET]
-    nrows = NROWS.search(code)
-    if found["model"] and found["pilot"] is None and nrows:
-        found["pilot"] = code[max(0, nrows.start() - 30): nrows.end() + 10].strip()
+    if found["model"] and found["pilot"] is None:
+        for match in READER.finditer(code):
+            args = _args(code, match.end())
+            if NROWS.search(args):
+                found["pilot"] = code[match.start(): match.end() + len(args) + 1][:SNIPPET]
+                break
     return found
 
 

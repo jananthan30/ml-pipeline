@@ -406,6 +406,14 @@ class FollowsExecution(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertEqual(run({"command": cmd}, files={"train.py": TRAIN})[0], "deny")
 
+    def test_distributed_launchers_and_shell_scripts(self):
+        files = {"train.py": TRAIN, "train.sh": "python train.py\n"}
+        for cmd in ("torchrun --nproc_per_node=2 train.py", "accelerate launch train.py", "deepspeed train.py",
+                    "python -m torch.distributed.run --nproc_per_node=2 train.py", "bash train.sh",
+                    "sh -c 'python train.py'", "bash -lc 'python train.py'"):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(run({"command": cmd}, files=files)[0], "deny")
+
     def test_follows_cd(self):
         self.assertEqual(run({"command": "cd scripts && python train.py"}, files={"scripts/train.py": TRAIN})[0], "deny")
 
@@ -634,6 +642,19 @@ class PilotRule(unittest.TestCase):
                      "model.fit(X_train[:, :5], y_train)"):
             with self.subTest(code=code):
                 self.assertEqual(run({"command": code}, GATE_AB)[0], "allow")
+
+    def test_ordinary_code_is_not_a_pilot(self):
+        for code in ("fig, ax = plt.subplots(nrows=1, ncols=2)\nmodel.fit(X_train, y_train)",
+                     "cols = pd.read_csv('d.csv', nrows=0).columns\nmodel.fit(X_train, y_train)",
+                     "model.fit(X_train[X_train.columns[:20]], y_train)",
+                     "model.fit(X_train[top_features[:10]], y_train)",
+                     "model.fit(X[:-1], y[1:])",
+                     "model.fit(X_train.sample(frac=1.0, random_state=0), y_train)"):
+            with self.subTest(code=code):
+                self.assertEqual(run({"command": code}, GATE_AB)[0], "allow")
+
+    def test_tail_slices_are_pilots_too(self):
+        self.assertEqual(run({"command": "model.fit(X_train[-5000:], y_train[-5000:])"}, GATE_AB)[0], "deny")
 
     def test_override_allows_a_pilot(self):
         self.assertEqual(run({"command": "model.fit(X_train[:5000], y_train[:5000])"}, GATE_AB + self.PILOT)[0], "allow")
