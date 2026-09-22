@@ -1,0 +1,40 @@
+name: Tests
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+jobs:
+  hooks:
+    # The hooks run under whatever `python3` the user has: stdlib only, oldest macOS default through newest.
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.9", "3.14"]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Hook, canary, and session tests
+        run: python -m unittest tests/test_guard_training.py tests/test_post_tool_warn.py tests/test_session_start.py tests/test_mlpipeline_canary.py
+      - name: Hook audit probe (must report 0 wrong)
+        run: python tests/probe_hook_audit.py | tee probe.txt && grep -q "^0 of " probe.txt
+
+  guard-library:
+    # The guard library runs inside the user's project environment and needs pandas, numpy, and matplotlib.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+      - name: Install test dependencies
+        run: python -m pip install -r tests/requirements-dev.txt
+      - name: Guard library tests
+        run: python -m unittest tests/test_mlpipeline_guard.py

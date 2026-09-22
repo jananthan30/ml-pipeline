@@ -69,7 +69,20 @@ parses it:
 - Override: Gate B - user approved skipping to training 2026-09-17 - reason: <why>
 ```
 
-A line that says a gate is `todo`, `pending`, or `not yet approved` never counts as approval.
+Only these line shapes count: a line starting `- Gate X:` whose first word is `approved`, or a line
+starting `- Override: Gate X -`. Headings, table rows, bold prose, and checkboxes never count, and
+anything after `approved` is a note. For each gate the **last** such line decides, so
+`- Gate B: hold - <why>` locks a gate again.
+
+**Each new experiment is a new run.** Start it with a heading of this shape, and record its gates
+below it:
+
+```
+## Run: <short name> (2026-09-23)
+```
+
+Only lines after the newest `## Run:` heading count — approvals from earlier runs never carry
+over, so a new run starts with every gate locked. A ledger with no `## Run:` heading is one run.
 
 After recording a gate approval in a git repository, checkpoint it:
 `git add -A && git commit -m "ml-pipeline: Gate X approved" && git tag -f gate-X`. Every approved
@@ -166,14 +179,19 @@ Model rationale:
 ## Enforcement in Claude Code (hook)
 
 Installed as a Claude Code plugin, `hooks/guard_training.py` runs before every Bash, Write,
-Edit, and notebook tool call, scans the code for fitting and training calls, and **denies**:
+Edit, and notebook tool call, scans the Python code for fitting and training calls — including the
+file, module, or notebook a command runs (`python train.py`, `python -m pkg`, `uv run`, `marimo`,
+`jupyter nbconvert --execute`, `papermill`) — and **denies**:
 
-- **model training** until PIPELINE.md has `Gate B: approved …` or an `Override: Gate B …`
-  line. With no `ml_pipeline/PIPELINE.md` at all, training is denied with a pointer to step 1.
-- **any fitting** — scalers, encoders, imputers included — until `Gate A: approved …`.
+- **model training** — `.fit`, `cross_val_score` and its relatives, a backward pass plus optimizer
+  step, any `*Trainer(...)` — until the current run has `- Gate B: approved …` or
+  `- Override: Gate B - …`. With no `ml_pipeline/PIPELINE.md` at all, training is denied with a
+  pointer to step 1.
+- **any fitting** — scalers, encoders, imputers included — until `- Gate A: approved …`.
 - **fitting on the test split** (`X_test`, `df_test`, `test_*`) — always, at every gate.
 - **evaluating on the test split** — `.predict/.score` or a metric function whose arguments name
-  `X_test`, `df_test`, `test_*` — until `Gate C: approved …` (or `Override: Gate C …`).
+  `X_test`, `df_test`, `test_*` — until `- Gate C: approved …` (or `- Override: Gate C - …`).
+- **changing the enforcement setting** — only the user switches enforcement off.
 - **recording a gate before its artifacts exist** — `Gate A` needs `data_profile.json`, one `01_*.png`
   and two `02_*.png`; `Gate B` needs a `04_*.png` and the `Model rationale:` block; `Gate C` a
   `12_*.png`; `Gate D` a `13_*.png` and the `Step 14 final test:` line. Every PNG must be larger than
@@ -189,9 +207,9 @@ test accuracy cannot exceed 0.80, and `mlpipeline_canary.verdict(score, n_test)`
 number is above the ceiling.
 
 A denial is not an obstacle to route around: do the missing steps, get the user's explicit
-approval, record the gate line, and retry. The hook fails open on its own errors, and
-`ML_PIPELINE_ENFORCE=0` switches it off for projects that are not ML pipelines. Codex and Kimi
-have no hook support, so there the same rules apply as instructions only.
+approval, record the gate line, and retry. The hook fails open on its own errors. If the project
+is not an ML pipeline at all, ask the user to switch enforcement off — never change that setting
+yourself. Codex and Kimi have no hook support, so there the same rules apply as instructions only.
 
 ## Non-negotiables
 

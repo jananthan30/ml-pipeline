@@ -13,6 +13,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "hooks"))
 import guard_training as hook  # noqa: E402
@@ -22,6 +23,15 @@ GATE_AB = GATE_A + "- Gate B: approved 2026-09-17\n"
 OVERRIDE = GATE_A + "- Override: Gate B - user approved skipping to training 2026-09-17 - reason: deadline\n"
 GATE_ABC = GATE_AB + "- Gate C: approved 2026-09-18\n"
 OVERRIDE_C = GATE_AB + "- Override: Gate C - user approved evaluating on the test set 2026-09-18 - reason: demo\n"
+TRAIN = "model.fit(X_train, y_train)\n"
+TRAIN_CMD = {"command": "clf.fit(X_train, y_train)"}
+TEST_EVAL = {"command": "accuracy_score(y_test, clf.predict(X_test))"}
+
+
+def notebook(*cells):
+    """A minimal .ipynb; each cell is a (cell_type, source) pair."""
+    return json.dumps({"cells": [{"cell_type": kind, "metadata": {}, "source": [source]} for kind, source in cells],
+                       "metadata": {}, "nbformat": 4, "nbformat_minor": 5})
 
 
 @contextlib.contextmanager
@@ -313,6 +323,233 @@ class RedFlags(unittest.TestCase):
         self.assertEqual(run({"command": "train_test_split(X, y)"}, GATE_A)[0], "allow")
 
 
+class FollowsExecution(unittest.TestCase):
+    """Running a file trains whatever the file says, so the file is scanned as well as the command."""
+
+    def test_python_script(self):
+        self.assertEqual(run({"command": "python train.py"}, files={"train.py": TRAIN})[0], "deny")
+
+    def test_python_module(self):
+        self.assertEqual(run({"command": "python3 -m train_mod"}, files={"train_mod.py": TRAIN})[0], "deny")
+
+    def test_package_main_module(self):
+        self.assertEqual(run({"command": "python -m pkg.trainer"}, files={"pkg/trainer/__main__.py": TRAIN})[0], "deny")
+
+    def test_other_launchers(self):
+        for cmd in ("uv run train.py", "uv run python train.py", ".venv/bin/python -u train.py",
+                    "marimo export html train.py -o out.html", "cd . && python train.py"):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(run({"command": cmd}, files={"train.py": TRAIN})[0], "deny")
+
+    def test_follows_cd(self):
+        self.assertEqual(run({"command": "cd scripts && python train.py"}, files={"scripts/train.py": TRAIN})[0], "deny")
+
+    def test_executed_notebook_code_cells(self):
+        nb = notebook(("markdown", "# Train"), ("code", TRAIN))
+        for cmd in ("jupyter nbconvert --to notebook --execute nb.ipynb", "jupyter execute nb.ipynb",
+                    "papermill nb.ipynb out.ipynb"):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(run({"command": cmd}, files={"nb.ipynb": nb})[0], "deny")
+
+    def test_notebook_markdown_cells_are_not_code(self):
+        nb = notebook(("markdown", "Later we call " + TRAIN), ("code", "df.describe()"))
+        self.assertEqual(run({"command": "papermill nb.ipynb out.ipynb"}, files={"nb.ipynb": nb})[0], "allow")
+
+    def test_converting_without_executing_is_not_a_run(self):
+        nb = notebook(("code", TRAIN))
+        self.assertEqual(run({"command": "jupyter nbconvert --to html nb.ipynb"}, files={"nb.ipynb": nb})[0], "allow")
+
+    def test_harmless_script_allowed(self):
+        self.assertEqual(run({"command": "python clean.py"}, files={"clean.py": "df = df.dropna()\n"})[0], "allow")
+
+    def test_missing_script_allowed(self):
+        self.assertEqual(run({"command": "python nowhere.py"})[0], "allow")
+
+    def test_script_allowed_after_gate_b(self):
+        self.assertEqual(run({"command": "python train.py"}, GATE_AB, files={"train.py": TRAIN})[0], "allow")
+
+
+class WiderDetection(unittest.TestCase):
+    """Training spelled in ways the v0.4 patterns missed."""
+
+    def test_getattr_fit(self):
+        self.assertEqual(run({"command": 'getattr(model, "fit")(X, y)'})[0], "deny")
+
+    def test_bound_method_called_later(self):
+        self.assertEqual(run({"command": "m = model.fit\nm(X, y)"})[0], "deny")
+
+    def test_bound_transformer_is_still_preprocessing(self):
+        self.assertEqual(run({"command": "f = scaler.fit\nf(X_train)"}, GATE_A)[0], "allow")
+
+    def test_spaced_dot(self):
+        self.assertEqual(run({"command": "model . fit(X, y)"})[0], "deny")
+
+    def test_functions_that_train_internally(self):
+        for call in ("cross_val_score(RandomForestClassifier(), X_train, y_train, cv=5)",
+                     "cross_validate(clf, X_train, y_train)", "cross_val_predict(clf, X_train, y_train)",
+                     "learning_curve(clf, X_train, y_train)",
+                     "validation_curve(clf, X_train, y_train, param_name='C', param_range=grid)",
+                     "permutation_importance(clf, X_val, y_val)"):
+            with self.subTest(call=call):
+                self.assertEqual(run({"command": call}, GATE_A)[0], "deny")
+
+    def test_torch_loop_with_any_names(self):
+        self.assertEqual(run({"command": "total_loss = crit(out, y)\ntotal_loss.backward()\nopt.step()"})[0], "deny")
+
+    def test_any_trainer_class(self):
+        self.assertEqual(run({"command": "sft = SFTTrainer(model=m, train_dataset=ds)\nsft.train()"})[0], "deny")
+
+    def test_defining_a_trainer_class_is_not_constructing_one(self):
+        self.assertEqual(run({"command": "class MyTrainer(Trainer):\n    pass"})[0], "allow")
+
+
+class OnlyPythonIsScanned(unittest.TestCase):
+    """The plugin is user-scoped and runs in every project: other languages and prose are left alone."""
+
+    def test_typescript_fit_addon(self):
+        self.assertEqual(run({"file_path": "/x/term.ts", "content": "fitAddon.fit();\n"}, tool="Write")[0], "allow")
+
+    def test_javascript_view_fit(self):
+        self.assertEqual(run({"file_path": "/x/map.js", "content": "view.fit(extent);\n"}, tool="Write")[0], "allow")
+
+    def test_fit_code_in_a_txt_file_is_still_code(self):
+        self.assertEqual(run({"file_path": "/x/train.txt", "content": TRAIN}, tool="Write")[0], "deny")
+
+    def test_read_only_grep_for_a_gate_line(self):
+        self.assertEqual(run({"command": 'grep -n "Gate B: approved" ml_pipeline/PIPELINE.md'})[0], "allow")
+
+    def test_docs_page_quoting_the_approval_format(self):
+        tool_input = {"file_path": "./docs/howto.md", "content": "- Gate B: approved 2026-09-17\n"}
+        self.assertEqual(run(tool_input, tool="Write")[0], "allow")
+
+    def test_heredoc_into_the_ledger_is_a_recording(self):
+        cmd = "cat >> ml_pipeline/PIPELINE.md <<'EOF'\n- Gate A: approved 2026-09-16\nEOF"
+        self.assertEqual(run({"command": cmd}, pipeline_md="")[0], "deny")
+
+    def test_tee_into_the_ledger_is_a_recording(self):
+        cmd = "echo '- Gate A: approved 2026-09-16' | tee -a ml_pipeline/PIPELINE.md"
+        self.assertEqual(run({"command": cmd}, pipeline_md="")[0], "deny")
+
+
+class NoSelfDisable(unittest.TestCase):
+    """Only the user switches enforcement off; deny messages never teach the agent how."""
+
+    def assert_denied_without_naming_the_switch(self, tool_input, tool="Bash"):
+        decision, reason = run(tool_input, tool=tool)
+        self.assertEqual(decision, "deny")
+        self.assertIn("ask the user", reason.lower())
+        self.assertNotIn("ML_PIPELINE", reason)
+
+    def test_settings_file(self):
+        tool_input = {"file_path": "/x/.claude/settings.json", "content": '{"env": {"ML_PIPELINE_ENFORCE": "0"}}\n'}
+        self.assert_denied_without_naming_the_switch(tool_input, tool="Write")
+
+    def test_shell(self):
+        for cmd in ("export ML_PIPELINE_ENFORCE=0", "ML_PIPELINE_ENFORCE=0 python run.py",
+                    "echo 'export ML_PIPELINE_ENFORCE=off' >> ~/.zshrc", "launchctl setenv ML_PIPELINE_ENFORCE 0"):
+            with self.subTest(cmd=cmd):
+                self.assert_denied_without_naming_the_switch({"command": cmd})
+
+    def test_python_environ(self):
+        self.assert_denied_without_naming_the_switch(
+            {"command": "python -c 'import os; os.environ[\"ML_PIPELINE_ENFORCE\"] = \"0\"'"})
+
+    def test_pointing_at_another_ledger(self):
+        self.assert_denied_without_naming_the_switch({"command": "export ML_PIPELINE_FILE=/tmp/fake.md"})
+
+    def test_reading_the_setting_is_fine(self):
+        for cmd in ("echo $ML_PIPELINE_ENFORCE", "echo ${ML_PIPELINE_ENFORCE:-1}",
+                    '[ "$ML_PIPELINE_ENFORCE" == "0" ] && echo off'):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(run({"command": cmd})[0], "allow")
+
+    def test_no_pipeline_message_does_not_name_the_switch(self):
+        decision, reason = run(TRAIN_CMD)
+        self.assertEqual(decision, "deny")
+        self.assertIn("ask the user", reason.lower())
+        self.assertNotIn("ML_PIPELINE", reason)
+
+
+class StrictLedger(unittest.TestCase):
+    """Only '- Gate X: approved ...' and '- Override: Gate X - ...' lines count, in the newest run only."""
+
+    def trains(self, md):
+        return run(TRAIN_CMD, md)[0]
+
+    def test_lines_that_only_mention_approval_do_not_count(self):
+        for line in ("- Gate B: to be approved by the user", "- Gate B needs an approved model rationale first",
+                     "- Gate B: never approved", "### Gate B approved 2026-09-17", "**Gate B approved:** yes",
+                     "| — | **GATE B** | **APPROVED** 2026-09-17 |", "- [x] **Gate B: approved 2026-09-17**"):
+            with self.subTest(line=line):
+                self.assertEqual(self.trains(GATE_A + line + "\n"), "deny")
+
+    def test_other_overrides_never_unlock_training(self):
+        for line in ("- Override: red flag accuracy-imbalanced - user approved accuracy for model selection 2026-09-20 - reason: demo",
+                     "- Override: final test - user approved a second evaluation 2026-09-21 - reason: model retrained"):
+            with self.subTest(line=line):
+                self.assertEqual(self.trains(GATE_A + line + "\n"), "deny")
+
+    def test_a_trailing_note_never_revokes(self):
+        self.assertEqual(self.trains(GATE_A + "- Gate B: approved 2026-09-17 - split is not stratified by design\n"), "allow")
+
+    def test_any_case_and_no_date(self):
+        self.assertEqual(self.trains(GATE_A + "- Gate B: APPROVED\n"), "allow")
+
+    def test_newest_line_per_gate_wins(self):
+        self.assertEqual(self.trains(GATE_AB + "- Gate B: hold - run finished 2026-09-20\n"), "deny")
+        self.assertEqual(self.trains(GATE_A + "- Gate B: pending\n- Gate B: approved 2026-09-21\n"), "allow")
+
+    def test_a_new_run_starts_locked(self):
+        run2 = "\n## Run: second experiment (2026-09-23)\n"
+        self.assertEqual(self.trains(GATE_AB + run2), "deny")
+        self.assertEqual(self.trains(GATE_AB + run2 + "- Gate A: approved 2026-09-23\n- Gate B: approved 2026-09-23\n"), "allow")
+
+    def test_an_old_run_gate_c_does_not_unlock_the_test_set(self):
+        md = GATE_ABC + "\n## Run: retrain (2026-09-23)\n- Gate A: approved 2026-09-23\n- Gate B: approved 2026-09-23\n"
+        self.assertEqual(run(TEST_EVAL, md)[0], "deny")
+        self.assertEqual(self.trains(md), "allow")
+
+    def test_an_old_run_red_flag_override_does_not_carry_over(self):
+        md = (GATE_A + "- Override: red flag random-split-temporal - user approved a random split 2026-09-16 - reason: x\n"
+              "## Run: next (2026-09-23)\n- Gate A: approved 2026-09-23\n")
+        self.assertEqual(run({"command": "train_test_split(X, y)"}, md, files=profile_with(has_datetime=True))[0], "deny")
+
+    def test_a_red_flag_override_needs_the_documented_line(self):
+        md = GATE_A + "## Override of red flag random-split-temporal requested by the agent\n"
+        self.assertEqual(run({"command": "train_test_split(X, y)"}, md, files=profile_with(has_datetime=True))[0], "deny")
+
+    def test_writing_a_non_approval_gate_line_is_not_a_recording(self):
+        self.assertEqual(run(write_md("- Gate B: to be approved by the user\n"), pipeline_md="", tool="Write")[0], "allow")
+
+
+# The shapes of a real multi-experiment ledger (its Gate B approval line kept verbatim, the rest reworded):
+# old approvals written as headings, table rows and bold prose, and a newest run that approves B and stops
+# before C.
+REAL_LEDGER = (
+    "| — | **GATE A** | **APPROVED** 2026-08-19 | user asked to continue |\n"
+    "### 🔏 OWNER OVERRIDE 2026-08-22 — Gate B sample-size bar waived for an\n"
+    "### 🔏 GATE C APPROVED — owner override (2026-08-25)\n"
+    '**Gate C approved:** owner said "go ahead" for the error analysis.\n'
+    "## Model training and evaluation — Gate B approved 2026-09-09\n"
+    "- Gate B: APPROVED for this complete development run; record above is the permission\n"
+    "  to fit, not permission to call the result final.\n"
+    "- Gate C: stop after the result report. Test-set use and new data\n"
+    "  are outside this approval.\n"
+)
+
+
+class RealLedgerRegression(unittest.TestCase):
+    def test_parses_as_gate_b_only(self):
+        self.assertEqual(hook.gate_state(REAL_LEDGER),
+                         {"A": False, "B": True, "C": False, "D": False, "override": False, "override_c": False})
+
+    def test_training_allowed_but_the_test_set_stays_locked(self):
+        self.assertEqual(run(TRAIN_CMD, REAL_LEDGER)[0], "allow")
+        decision, reason = run(TEST_EVAL, REAL_LEDGER)
+        self.assertEqual(decision, "deny")
+        self.assertIn("Gate C", reason)
+
+
 class PipelineDiscovery(unittest.TestCase):
     def test_found_from_a_subdirectory(self):
         self.assertEqual(run({"command": "clf.fit(X_train, y_train)"}, GATE_AB, cwd_sub="notebooks/sub")[0], "allow")
@@ -329,7 +566,8 @@ class PipelineDiscovery(unittest.TestCase):
 class FailOpen(unittest.TestCase):
     def test_garbage_stdin_allows_and_reports(self):
         out = io.StringIO()
-        with contextlib.redirect_stdout(out), _stdin("this is not json"):
+        with mock.patch.dict(os.environ), contextlib.redirect_stdout(out), _stdin("this is not json"):
+            os.environ.pop("ML_PIPELINE_ENFORCE", None)  # a developer session may run with enforcement off
             hook.main()
         result = json.loads(out.getvalue())
         self.assertNotIn("hookSpecificOutput", result)

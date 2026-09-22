@@ -2,7 +2,8 @@
 """PreToolUse hook: no model training until the pipeline gates say so.
 
 Claude Code runs this before each matched tool call and pipes the call to stdin as
-JSON. Every string in ``tool_input`` is scanned for fitting/training calls, and the
+JSON. Every string in ``tool_input`` is scanned for fitting/training calls - and, when a
+Bash command runs a Python file, module, or notebook, that file's code too - and the
 call is denied unless ``ml_pipeline/PIPELINE.md`` records the gate that unlocks it:
 
     no gate approved  ->  nothing is fit; the data is still being understood
@@ -11,9 +12,14 @@ call is denied unless ``ml_pipeline/PIPELINE.md`` records the gate that unlocks 
     Gate C approved   ->  evaluating on the test split allowed (once, at step 14)
     always            ->  fitting on the test split is denied
 
+Only strict ledger lines count - ``- Gate X: approved ...`` and ``- Override: Gate X - ...`` -
+and only in the newest run: everything after the last ``## Run:`` heading, or the whole
+file when there is none. For each gate the last such line decides, so a later
+``- Gate B: hold`` locks it again.
+
 The hook fails open: an unexpected error allows the call and reports the error,
-so a bug here can never lock anyone out of their own tools. Set
-``ML_PIPELINE_ENFORCE=0`` to switch it off for projects that are not ML pipelines.
+so a bug here can never lock anyone out of their own tools. The user (never the agent)
+sets ``ML_PIPELINE_ENFORCE=0`` to switch it off for projects that are not ML pipelines.
 Stdlib only; no subprocesses, no network.
 """
 from __future__ import annotations
@@ -21,23 +27,43 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import sys
 from pathlib import Path
 
 PIPELINE_REL = Path("ml_pipeline") / "PIPELINE.md"
 SEARCH_UP = 4  # look in cwd and this many parent directories
-DOC_SUFFIXES = {".md", ".markdown", ".rst", ".txt", ".json", ".yaml", ".yml", ".toml", ".cfg", ".ini"}
+PROSE_SUFFIXES = {".md", ".markdown", ".rst"}
+# The plugin runs in every project; a fit/step/train call in these languages is not model training.
+OTHER_LANGUAGE_SUFFIXES = {
+    ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".vue", ".svelte", ".html", ".htm", ".css", ".scss",
+    ".java", ".kt", ".scala", ".go", ".rs", ".c", ".h", ".cc", ".cpp", ".hpp", ".cs", ".swift", ".rb",
+    ".php", ".dart", ".lua", ".sql",
+}
 SKIP_KEYS = {"old_string", "file_path", "path", "notebook_path", "description", "url", "pattern", "glob", "cwd"}
 SNIPPET = 80
+MAX_SCRIPT_BYTES = 2_000_000  # read at most this much of a file a command executes
 
 # ------------------------------------------------------------------ detection
-# `<receiver>.fit(` where receiver is `name` or `Name(...)`; also fit_transform / fit_predict.
-FIT_CALL = re.compile(r"(?:\b([A-Za-z_]\w*)\s*(?:\([^()]*\))?)?\.fit(?:_transform|_predict)?\s*\(")
-# APIs that only ever train models.
+FIT_NAME = r"fit(?:_transform|_predict)?"
+RECEIVER = r"\b([A-Za-z_]\w*)\s*(?:\([^()]*\))?"
+# `<receiver>.fit(` where receiver is `name` or `Name(...)`; also fit_transform / fit_predict, spaced dots too.
+FIT_CALL = re.compile(r"(?:" + RECEIVER + r")?\s*\.\s*" + FIT_NAME + r"\s*\(")
+# A fit method bound now and called later: `m = model.fit`, `partial(model.fit, ...)`.
+FIT_REF = re.compile(r"(?:=|[(,])\s*" + RECEIVER + r"\s*\.\s*" + FIT_NAME + r"\b(?!\s*\()")
+# A fit method looked up by name: `getattr(model, "fit")`.
+GETATTR_FIT = re.compile(r"\bgetattr\s*\(\s*([A-Za-z_]\w*)[^,()]*,\s*[\"']" + FIT_NAME + r"[\"']")
+# APIs that only ever train models. The sklearn helpers fit a fresh estimator per fold or point;
+# permutation_importance needs a fitted model, so it belongs after the baseline too.
 TRAIN_API = re.compile(
-    r"\b(?:xgb|xgboost|lgb|lightgbm)\.train\s*\(|\btrainer\.train\s*\(|\bTrainer\s*\(|"
-    r"\.fit_generator\s*\(|\.fit_one_cycle\s*\(|\bloss\.backward\s*\(|\boptimizer\.step\s*\("
+    r"\b(?:xgb|xgboost|lgb|lightgbm)\s*\.\s*train\s*\(|\btrainer\s*\.\s*train\s*\(|(?<!class )\b\w*Trainer\s*\(|"
+    r"\.fit_generator\s*\(|\.fit_one_cycle\s*\(|\bloss\.backward\s*\(|\boptimizer\.step\s*\(|"
+    r"\b(?:cross_val_score|cross_validate|cross_val_predict|learning_curve|validation_curve|"
+    r"permutation_importance)\s*\("
 )
+# A gradient step under any names: a backward pass plus an optimizer step in the same code.
+BACKWARD = re.compile(r"\.\s*backward\s*\(")
+OPT_STEP = re.compile(r"\.\s*step\s*\(")
 # Evaluating a model: predict/score methods and the usual sklearn metric functions.
 EVAL_CALL = re.compile(
     r"(?:\.(?:predict|predict_proba|decision_function|score|evaluate)|"
@@ -63,40 +89,69 @@ TRANSFORMER_VAR = re.compile(
 TEST_SPLIT = re.compile(r"\b(?:\w+_test|test_\w+|test)\b")
 COMMENT = re.compile(r"#[^\n]*")
 
+# ------------------------------------------------------------------ following execution
+PYTHON_EXE = re.compile(r"^(?:python(?:\d+(?:\.\d+)*)?|ipython3?|pypy3?)$")
+PYTHON_OPTS_WITH_VALUE = {"-W", "-X", "--check-hash-based-pycs"}
+SHELL_SEPARATOR = re.compile(r"&&|\|\||[;|\n]")
+
 # ------------------------------------------------------------------ gate state
-GATE_LINE = re.compile(r"^.*\bgate\s*[\[(]?([abcd])\b.*$", re.I | re.M)
-APPROVED = re.compile(r"\b(?:approved|approved-gate|overridden|override)\b", re.I)
-NEGATED = re.compile(r"\b(?:not|pending|awaiting|waiting|todo|unapproved|blocked|in progress)\b", re.I)
-OVERRIDE_LINE = re.compile(r"^.*\boverrid(?:e|den)\b.*\b(?:train|training|model|models|gate\s*b)\b.*$", re.I | re.M)
-OVERRIDE_C_LINE = re.compile(r"^.*\boverrid(?:e|den)\b.*\b(?:gate\s*c|final test|test set)\b.*$", re.I | re.M)
+RUN_HEAD = re.compile(r"^[ \t]*##[ \t]+Run[ \t]*:", re.I | re.M)
+GATE_RECORD = re.compile(r"^[ \t]*-[ \t]*Gate[ \t]+([A-D])[ \t]*:[ \t]*(\S*)", re.I)
+OVERRIDE_GATE = re.compile(r"^[ \t]*-[ \t]*Override[ \t]*:[ \t]*Gate[ \t]+([A-D])\b", re.I)
+APPROVED_WORD = re.compile(r"approved\b", re.I)
+# Recording a gate: the approval or override shape at a line start or right after a quote,
+# as in `echo '- Gate A: approved ...' >> ml_pipeline/PIPELINE.md`.
+RECORDING = re.compile(
+    r"(?:^|(?<=[\s'\"]))-[ \t]*(?:Gate[ \t]+([A-D])[ \t]*:[ \t]*approved\b|Override[ \t]*:[ \t]*Gate[ \t]+([A-D])\b)",
+    re.I | re.M,
+)
+# A shell command that changes the ledger (a read-only grep of it does not).
+LEDGER_WRITE = re.compile(
+    r">\s*[\"']?[^\s;|&<>]*PIPELINE\.md|\btee\b[^;|&\n]*PIPELINE\.md|"
+    r"\b(?:sed|perl)\b[^;|&\n]*\s-i[^;|&\n]*PIPELINE\.md|\b(?:cp|mv|install|dd|truncate)\b[^;|&\n]*PIPELINE\.md|"
+    r"\b(?:open|write_text|write|writelines)\s*\("
+)
+
+# ------------------------------------------------------------------ self-disable
+SWITCH = r"ML_PIPELINE_(?:ENFORCE|FILE)"
+# Assigning the switch (`X=0`, `"X": "0"`, `environ["X"] = ...`, `setenv X`), never reading it
+# (`$X`, `${X:-1}`, `"$X" == "0"`).
+SELF_DISABLE = re.compile(
+    SWITCH + r"[\"']?\]?\s*(?:=(?!=)|:(?!-))|\b(?:setenv|setdefault|putenv)\b\W*[\"']?" + SWITCH
+)
 
 # ------------------------------------------------------------------ messages
 NO_PIPELINE_MSG = (
     "ml-pipeline: model training detected ({0!r}) but there is no ml_pipeline/PIPELINE.md. "
     "Training starts at step 1, not step 10 - run the ml-pipeline skill: inspect the data, do EDA, "
     "define the prediction problem, and get the user's approval at Gate A. "
-    "Not an ML project? Set ML_PIPELINE_ENFORCE=0."
+    "Not an ML project? Ask the user to switch enforcement off."
 )
 GATE_A_MSG = (
     "ml-pipeline: nothing is fit before Gate A ({0!r}). Finish steps 1-3 (data inspection, EDA, "
     "prediction-problem contract), get the user's explicit approval, and record it in "
-    "ml_pipeline/PIPELINE.md as `Gate A: approved YYYY-MM-DD`."
+    "ml_pipeline/PIPELINE.md as `- Gate A: approved YYYY-MM-DD`."
 )
 GATE_B_MSG = (
     "ml-pipeline: model training is locked until Gate B ({0!r}). Finish steps 4-8 (cleaning, "
     "engineering, split, features, preprocessing), get the user's explicit approval, and record "
-    "`Gate B: approved YYYY-MM-DD` in ml_pipeline/PIPELINE.md. If the user explicitly chose to skip "
-    "ahead, record `Override: Gate B - user approved training YYYY-MM-DD - reason: ...` instead."
+    "`- Gate B: approved YYYY-MM-DD` in ml_pipeline/PIPELINE.md. If the user explicitly chose to skip "
+    "ahead, record `- Override: Gate B - user approved training YYYY-MM-DD - reason: ...` instead."
 )
 GATE_C_MSG = (
     "ml-pipeline: evaluating on the test split is locked until Gate C ({0!r}). The test set is touched "
     "exactly once, at step 14, after the user approves Gate C - tune and select on validation only. "
-    "Record `Gate C: approved YYYY-MM-DD` in ml_pipeline/PIPELINE.md first, or, if the user explicitly "
-    "chose otherwise, `Override: Gate C - user approved evaluating on the test set YYYY-MM-DD - reason: ...`."
+    "Record `- Gate C: approved YYYY-MM-DD` in ml_pipeline/PIPELINE.md first, or, if the user explicitly "
+    "chose otherwise, `- Override: Gate C - user approved evaluating on the test set YYYY-MM-DD - reason: ...`."
 )
 TEST_MSG = (
     "ml-pipeline: this fits on the test split ({0!r}). The test set is touched exactly once, at "
     "step 14, and is never fit on. Fit on the training split only."
+)
+SELF_DISABLE_MSG = (
+    "ml-pipeline: switching enforcement off, or pointing it at a different ledger, is the user's decision - "
+    "an agent may not change that setting. If this project is not an ML pipeline, ask the user to switch "
+    "enforcement off themselves."
 )
 
 # ------------------------------------------------------------------ gate recording
@@ -117,13 +172,8 @@ GATE_RECORD_MSG = "ml-pipeline: Gate {0} can't be recorded: {1}."
 
 
 def approved_gates_in(text: str) -> list[str]:
-    """Gate letters that ``text`` records as approved (non-negated lines only)."""
-    gates = []
-    for match in GATE_LINE.finditer(text):
-        line = match.group(0)
-        if APPROVED.search(line) and not NEGATED.search(line):
-            gates.append(match.group(1).upper())
-    return gates
+    """Gate letters that ``text`` records: a strict approval or override line for that gate."""
+    return [(m.group(1) or m.group(2)).upper() for m in RECORDING.finditer(text)]
 
 
 def rationale_missing(text: str) -> list[str]:
@@ -172,6 +222,19 @@ def _state_dir_for(tool_input: dict, cwd: str) -> Path:
     return found.parent if found else Path(cwd or ".").resolve() / "ml_pipeline"
 
 
+def _target(tool_input: dict) -> str:
+    return str(tool_input.get("file_path") or tool_input.get("notebook_path") or tool_input.get("path") or "")
+
+
+def _writes_ledger(tool_input: dict) -> bool:
+    """True when this call edits a PIPELINE.md: a file tool aimed at it, or a shell command writing to it."""
+    target = _target(tool_input)
+    if target:
+        return Path(target).name == "PIPELINE.md"
+    command = tool_input.get("command")
+    return isinstance(command, str) and "PIPELINE.md" in command and bool(LEDGER_WRITE.search(command))
+
+
 # ------------------------------------------------------------------ red flags (need a profile)
 RED_FLAGS = [
     ("neural-net-small-data", lambda t: bool(t.get("small_data")),
@@ -188,7 +251,7 @@ RED_FLAGS = [
      "the minority class is {minority_pct} of rows, so accuracy rewards ignoring it - select on average_precision, f1, or balanced_accuracy"),
 ]
 RESAMPLE = re.compile(r"fit_resample\s*\(([^)]*)\)")
-OVERRIDE_FLAG = re.compile(r"^.*\boverrid(?:e|den)\b.*\bred flag\s+([a-z-]+)\b.*$", re.I | re.M)
+OVERRIDE_FLAG = re.compile(r"^[ \t]*-[ \t]*Override[ \t]*:[ \t]*red flag[ \t]+([a-z-]+)", re.I | re.M)
 RED_FLAG_MSG = "ml-pipeline: red flag {0}: {1}. Override with '- Override: red flag {0} - ...' in ml_pipeline/PIPELINE.md."
 
 
@@ -203,14 +266,16 @@ def _load_profile(state_dir: Path) -> dict | None:
 
 
 def overridden_flags(markdown: str) -> set[str]:
-    return {m.group(1).lower() for m in OVERRIDE_FLAG.finditer(markdown) if not NEGATED.search(m.group(0))}
+    """Red flags the newest run overrides with a strict ``- Override: red flag <name> - ...`` line."""
+    return {m.group(1).lower() for m in OVERRIDE_FLAG.finditer(current_run(markdown))}
 
 
 def red_flag(code: str, traits: dict, overrides: set[str]) -> str | None:
     """The first red flag the code trips given the profile's traits, or None."""
     values = {"n_rows": int(traits.get("n_rows") or 0),
               "minority_pct": f"{float(traits.get('minority_frac') or 0):.1%}"}
-    trains = ".fit" in code or bool(TRAIN_API.search(code))
+    found = analyse(code)
+    trains = bool(found["model"] or found["transformer"])
     for name, applies, pattern, why in RED_FLAGS:
         if name in overrides or not applies(traits) or not pattern.search(code):
             continue
@@ -240,6 +305,92 @@ def _strings(obj, out: list[str] | None = None) -> list[str]:
     return out
 
 
+# ------------------------------------------------------------------ following execution
+def _python_target(args: list[str]) -> tuple[str, str] | None:
+    """What ``python <args>`` runs: ('module', name) or ('file', path); None for -c, stdin, or a REPL."""
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "-m":
+            return ("module", args[i + 1]) if i + 1 < len(args) else None
+        if arg in ("-c", "-"):
+            return None
+        if arg.startswith("-"):
+            i += 2 if arg in PYTHON_OPTS_WITH_VALUE else 1
+            continue
+        return ("file", arg)
+    return None
+
+
+def _exec_targets(tokens: list[str]) -> list[tuple[str, str]]:
+    """Python files and modules one shell command segment executes."""
+    targets: list[tuple[str, str]] = []
+    for i, token in enumerate(tokens):
+        name, rest = os.path.basename(token), tokens[i + 1:]
+        files = [("file", t) for t in rest if t.lower().endswith((".py", ".ipynb"))]
+        if PYTHON_EXE.match(name):
+            target = _python_target(rest)
+            targets += [target] if target else []
+        elif name == "uv" and rest[:1] == ["run"]:
+            module = next((rest[j + 1] for j, t in enumerate(rest[:-1]) if t in ("-m", "--module")), None)
+            targets += [("module", module)] if module else files
+        elif name == "marimo" or name == "papermill":
+            targets += files
+        elif name == "jupyter" and (rest[:1] in (["execute"], ["run"]) or "--execute" in rest):
+            targets += files
+    return targets
+
+
+def _notebook_code(text: str) -> str:
+    """The code cells of an .ipynb; the raw text when it is not a readable notebook."""
+    try:
+        cells = json.loads(text).get("cells") or []
+    except (ValueError, AttributeError):
+        return text
+    code = []
+    for cell in cells:
+        if isinstance(cell, dict) and cell.get("cell_type") == "code":
+            source = cell.get("source") or ""
+            code.append("".join(source) if isinstance(source, list) else str(source))
+    return "\n".join(code)
+
+
+def _read_script(kind: str, name: str, base: Path) -> str:
+    if kind == "module":
+        rel = Path(*name.split("."))
+        candidates = [base / (str(rel) + ".py"), base / rel / "__main__.py"]
+    else:
+        path = Path(name).expanduser()
+        candidates = [path if path.is_absolute() else base / path]
+    for path in candidates:
+        if path.is_file():
+            with path.open("rb") as handle:
+                text = handle.read(MAX_SCRIPT_BYTES).decode("utf-8", errors="replace")
+            return _notebook_code(text) if path.suffix.lower() == ".ipynb" else text
+    return ""
+
+
+def executed_code(command: str, cwd: str) -> str:
+    """Source of every Python file, module, or notebook ``command`` runs, resolved against cwd and ``cd``."""
+    base = Path(cwd or ".")
+    chunks: list[str] = []
+    for segment in SHELL_SEPARATOR.split(command):
+        try:
+            tokens = shlex.split(segment)
+        except ValueError:
+            tokens = segment.split()
+        if tokens[:1] == ["cd"] and len(tokens) > 1:
+            base = base / Path(tokens[1]).expanduser()
+            continue
+        for kind, name in _exec_targets(tokens):
+            try:
+                chunks.append(_read_script(kind, name, base))
+            except OSError:  # one unreadable file must not fail the whole hook open
+                continue
+    return "\n".join(chunk for chunk in chunks if chunk)
+
+
+# ------------------------------------------------------------------ analysis
 def _args(text: str, start: int, limit: int = 400) -> str:
     """The argument list starting just after an opening paren, up to its matching close."""
     depth, i = 1, start
@@ -278,14 +429,22 @@ def analyse(text: str) -> dict[str, str | None]:
     api = TRAIN_API.search(code)
     if api:
         found["model"] = api.group(0)
+    backward = BACKWARD.search(code)
+    if found["model"] is None and backward and OPT_STEP.search(code):
+        line_start = code.rfind("\n", 0, backward.start()) + 1
+        found["model"] = code[line_start: backward.end() + 1][:SNIPPET]
     for match in FIT_CALL.finditer(code):
         args = _args(code, match.end())
-        snippet = code[match.start(): match.end() + len(args) + 1][:SNIPPET]
+        snippet = code[match.start(): match.end() + len(args) + 1].strip()[:SNIPPET]
         if TEST_SPLIT.search(args) and found["fit_on_test"] is None:
             found["fit_on_test"] = snippet
         kind = _classify(match.group(1) or "", code[max(0, match.start() - 200): match.start()], args)
         if found[kind] is None:
             found[kind] = snippet
+    for match in (*FIT_REF.finditer(code), *GETATTR_FIT.finditer(code)):
+        kind = _classify(match.group(1) or "", code[max(0, match.start() - 200): match.start()], "")
+        if found[kind] is None:
+            found[kind] = match.group(0).lstrip("=(, \t")[:SNIPPET]
     for match in EVAL_CALL.finditer(code):
         args = _args(code, match.end())
         if TEST_SPLIT.search(args) and found["eval_on_test"] is None:
@@ -293,19 +452,27 @@ def analyse(text: str) -> dict[str, str | None]:
     return found
 
 
+# ------------------------------------------------------------------ ledger
+def current_run(markdown: str) -> str:
+    """The newest run: everything from the last ``## Run:`` heading on, or the whole file when there is none."""
+    heads = list(RUN_HEAD.finditer(markdown))
+    return markdown[heads[-1].start():] if heads else markdown
+
+
 def gate_state(markdown: str) -> dict[str, bool]:
-    """Which gates PIPELINE.md records as approved. A negated line never counts."""
-    state = {"A": False, "B": False, "C": False, "D": False, "override": False, "override_c": False}
-    for match in GATE_LINE.finditer(markdown):
-        line = match.group(0)
-        if APPROVED.search(line) and not NEGATED.search(line):
-            state[match.group(1).upper()] = True
-    for match in OVERRIDE_LINE.finditer(markdown):
-        if not NEGATED.search(match.group(0)):
-            state["override"] = True
-    for match in OVERRIDE_C_LINE.finditer(markdown):
-        if not NEGATED.search(match.group(0)):
-            state["override_c"] = True
+    """Which gates the newest run approves. For each gate the last strict line decides; nothing else counts."""
+    last: dict[str, str] = {}
+    for line in current_run(markdown).splitlines():
+        gate = GATE_RECORD.match(line)
+        if gate:
+            last[gate.group(1).upper()] = "approved" if APPROVED_WORD.match(gate.group(2)) else "other"
+            continue
+        override = OVERRIDE_GATE.match(line)
+        if override:
+            last[override.group(1).upper()] = "override"
+    state = {gate: last.get(gate) == "approved" for gate in "ABCD"}
+    state["override"] = last.get("B") == "override"
+    state["override_c"] = last.get("C") == "override"
     return state
 
 
@@ -365,31 +532,37 @@ def main() -> int:
         tool_input = payload.get("tool_input") or {}
         cwd = payload.get("cwd") or os.getcwd()
         text = "\n".join(_strings(tool_input))
-        # 1. Recording a gate: that gate's artifacts must already exist.
-        for gate in approved_gates_in(text):
-            state_dir = _state_dir_for(tool_input, cwd)
-            pipeline_md = state_dir / "PIPELINE.md"
-            existing = pipeline_md.read_text(encoding="utf-8", errors="replace") if pipeline_md.is_file() else ""
-            problems = gate_problems(gate, state_dir, existing + "\n" + text)
-            if problems:
-                return _emit(GATE_RECORD_MSG.format(gate, "; ".join(problems)))
-        # 2. Prose files are not code.
-        target = str(tool_input.get("file_path") or tool_input.get("notebook_path") or "")
-        if target and Path(target).suffix.lower() in DOC_SUFFIXES:
+        target = _target(tool_input)
+        suffix = Path(target).suffix.lower() if target else ""
+        # 1. Only the user switches enforcement off or points it at another ledger.
+        if suffix not in PROSE_SUFFIXES and SELF_DISABLE.search(text):
+            return _emit(SELF_DISABLE_MSG)
+        # 2. Recording a gate in the ledger: that gate's artifacts must already exist.
+        if _writes_ledger(tool_input):
+            for gate in approved_gates_in(text):
+                state_dir = _state_dir_for(tool_input, cwd)
+                pipeline_md = state_dir / "PIPELINE.md"
+                existing = pipeline_md.read_text(encoding="utf-8", errors="replace") if pipeline_md.is_file() else ""
+                problems = gate_problems(gate, state_dir, existing + "\n" + text)
+                if problems:
+                    return _emit(GATE_RECORD_MSG.format(gate, "; ".join(problems)))
+        # 3. Prose and other languages are not Python.
+        if suffix in PROSE_SUFFIXES or suffix in OTHER_LANGUAGE_SUFFIXES:
             return _emit(None)
-        # 2b. Red flags: wrong applications the data profile can prove.
+        # 4. A command that runs a file runs that file's code.
+        command = tool_input.get("command")
+        code = text + "\n" + executed_code(command, cwd) if isinstance(command, str) else text
+        # 5. Red flags: wrong applications the data profile can prove.
         state_dir = _state_dir_for(tool_input, cwd)
         profile = _load_profile(state_dir)
         if profile is not None:
             pipeline_md = state_dir / "PIPELINE.md"
             markdown = pipeline_md.read_text(encoding="utf-8", errors="replace") if pipeline_md.is_file() else ""
-            reason = red_flag(COMMENT.sub("", text), profile.get("traits") or {}, overridden_flags(markdown))
+            reason = red_flag(COMMENT.sub("", code), profile.get("traits") or {}, overridden_flags(markdown))
             if reason:
                 return _emit(reason)
-        # 3. Fast path: nothing to look at.
-        if ".fit" not in text and not TRAIN_API.search(text) and not EVAL_CALL.search(text):
-            return _emit(None)
-        found = analyse(text)
+        # 6. Training and test-set evaluation need their gates.
+        found = analyse(code)
         if not any(found.values()):
             return _emit(None)
         pipeline = find_pipeline(cwd)
