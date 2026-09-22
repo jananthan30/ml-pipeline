@@ -332,6 +332,22 @@ class RedFlags(unittest.TestCase):
     def test_no_profile_no_flags(self):
         self.assertEqual(run({"command": "train_test_split(X, y)"}, GATE_A)[0], "allow")
 
+    def test_target_stats_outside_the_training_split(self):
+        for code in ("scores = mutual_info_classif(X, y)", "f_classif(X_all, y_all)",
+                     "sel = SelectKBest(k=5)\nsel.fit(X, y)", "SelectKBest(chi2, k=5).fit_transform(X, y)"):
+            with self.subTest(code=code):
+                decision, reason = run({"command": code}, GATE_A, files=profile_with())
+                self.assertEqual(decision, "deny")
+                self.assertIn("red flag target-stats-outside-train", reason)
+        for code in ("mutual_info_classif(X_train, y_train)", "SelectKBest(k=5).fit(X_train, y_train)",
+                     "sel = SelectKBest(k=5).fit(X_train, y_train)\nmodel.fit(X_tr_sel, y_tr)"):
+            with self.subTest(code=code):
+                self.assertEqual(run({"command": code}, GATE_AB, files=profile_with())[0], "allow")
+
+    def test_target_stats_override(self):
+        md = GATE_A + "- Override: red flag target-stats-outside-train - user approved 2026-09-24 - reason: inside CV\n"
+        self.assertEqual(run({"command": "mutual_info_classif(X, y)"}, md, files=profile_with())[0], "allow")
+
 
 class FollowsExecution(unittest.TestCase):
     """Running a file trains whatever the file says, so the file is scanned as well as the command."""
@@ -551,13 +567,44 @@ REAL_LEDGER = (
 class RealLedgerRegression(unittest.TestCase):
     def test_parses_as_gate_b_only(self):
         self.assertEqual(hook.gate_state(REAL_LEDGER),
-                         {"A": False, "B": True, "C": False, "D": False, "override": False, "override_c": False})
+                         {"A": False, "B": True, "C": False, "D": False, "override": False, "override_c": False,
+                          "pilot": False})
 
     def test_training_allowed_but_the_test_set_stays_locked(self):
         self.assertEqual(run(TRAIN_CMD, REAL_LEDGER)[0], "allow")
         decision, reason = run(TEST_EVAL, REAL_LEDGER)
         self.assertEqual(decision, "deny")
         self.assertIn("Gate C", reason)
+
+
+class PilotRule(unittest.TestCase):
+    """After Gate B, training on a slice needs the user's pilot override; Gate C still needs a full run."""
+    PILOT = "- Override: pilot - 5,000 rows - user approved 2026-09-24 - reason: smoke test\n"
+
+    def test_slices_in_a_fit_call_denied(self):
+        for code in ("model.fit(X_train[:5000], y_train[:5000])", "model.fit(X_train.iloc[:500], y_train.iloc[:500])",
+                     "model.fit(X_train.sample(1000), y)", "guard.fit(clf, X_train.head(500), y_train.head(500))",
+                     "df = pd.read_csv('d.csv', nrows=1000)\nmodel.fit(X_train, y_train)"):
+            with self.subTest(code=code):
+                decision, reason = run({"command": code}, GATE_AB)
+                self.assertEqual(decision, "deny")
+                self.assertIn("slice of the data", reason)
+
+    def test_whole_split_and_column_selection_allowed(self):
+        for code in ("model.fit(X_train, y_train)", "model.fit(X_train.loc[:, features], y_train)",
+                     "model.fit(X_train[:, :5], y_train)"):
+            with self.subTest(code=code):
+                self.assertEqual(run({"command": code}, GATE_AB)[0], "allow")
+
+    def test_override_allows_a_pilot(self):
+        self.assertEqual(run({"command": "model.fit(X_train[:5000], y_train[:5000])"}, GATE_AB + self.PILOT)[0], "allow")
+
+    def test_override_from_an_older_run_does_not_count(self):
+        md = GATE_AB + self.PILOT + "## Run: next (2026-09-25)\n- Gate A: approved 2026-09-25\n- Gate B: approved 2026-09-25\n"
+        self.assertEqual(run({"command": "model.fit(X_train[:5000], y_train[:5000])"}, md)[0], "deny")
+
+    def test_transformer_slices_are_not_pilots(self):
+        self.assertEqual(run({"command": "scaler.fit(X_train[:1000])"}, GATE_AB)[0], "allow")
 
 
 class PipelineDiscovery(unittest.TestCase):

@@ -67,6 +67,14 @@ TRAIN_API = re.compile(
 # A gradient step under any names: a backward pass plus an optimizer step in the same code.
 BACKWARD = re.compile(r"\.\s*backward\s*\(")
 OPT_STEP = re.compile(r"\.\s*step\s*\(")
+# A slice of the rows inside a model-training call, or nrows= in code that trains: a pilot.
+SLICE = re.compile(r"\[\s*-?\d*\s*:\s*-?\d+\s*\]|\.\s*i?loc\s*\[\s*-?\d*\s*:\s*-?\d+|\.\s*(?:head|sample)\s*\(")
+NROWS = re.compile(r"\bnrows\s*=")
+PILOT_OVERRIDE = re.compile(r"^[ \t]*-[ \t]*Override[ \t]*:[ \t]*pilot[ \t]*-", re.I | re.M)
+SELECTOR_NAMES = r"SelectKBest|SelectPercentile|GenericUnivariateSelect|SelectFpr|SelectFdr|SelectFwe"
+SELECTOR = re.compile(r"\b(?:" + SELECTOR_NAMES + r")\b")
+SELECTION_SCORE = re.compile(
+    r"\b(?:mutual_info_classif|mutual_info_regression|f_classif|f_regression|chi2|r_regression)\s*\(")
 # Evaluating a model: predict/score methods and the usual sklearn metric functions.
 EVAL_CALL = re.compile(
     r"(?:\.(?:predict|predict_proba|decision_function|score|evaluate)|"
@@ -156,6 +164,13 @@ SELF_DISABLE_MSG = (
     "an agent may not change that setting. If this project is not an ML pipeline, ask the user to switch "
     "enforcement off themselves."
 )
+PILOT_MSG = (
+    "ml-pipeline: this trains on a slice of the data ({0!r}). Train on the full training split. If the user "
+    "explicitly agreed to a quick pilot, record `- Override: pilot - <size> - user approved YYYY-MM-DD - reason: ...` "
+    "first; Gate C still needs a full-data training run."
+)
+TARGET_STATS_WHY = ("target-based feature selection must use the training split only ({0}) - select features inside "
+                    "the training data or a CV fold")
 
 # ------------------------------------------------------------------ gate recording
 PROFILE_FILE = "data_profile.json"
@@ -280,6 +295,22 @@ def overridden_flags(markdown: str) -> set[str]:
     return {m.group(1).lower() for m in OVERRIDE_FLAG.finditer(current_run(markdown))}
 
 
+def _target_stats_outside_train(code: str) -> str | None:
+    """The first feature-selection call whose target statistics are not computed on the training split."""
+    for match in SELECTION_SCORE.finditer(code):
+        args = _args(code, match.end())
+        if "train" not in args.lower():
+            return code[match.start(): match.end() + len(args) + 1][:60]
+    for match in FIT_CALL.finditer(code):
+        receiver = match.group(1) or ""
+        args = _args(code, match.end())
+        assigned = bool(receiver) and re.search(
+            r"\b" + re.escape(receiver) + r"\s*=\s*[\w.]*\b(?:" + SELECTOR_NAMES + r")\s*\(", code)
+        if (SELECTOR.search(receiver) or assigned) and "train" not in args.lower():
+            return code[match.start(): match.end() + len(args) + 1].strip()[:60]
+    return None
+
+
 def red_flag(code: str, traits: dict, overrides: set[str]) -> str | None:
     """The first red flag the code trips given the profile's traits, or None."""
     values = {"n_rows": int(traits.get("n_rows") or 0),
@@ -297,6 +328,10 @@ def red_flag(code: str, traits: dict, overrides: set[str]) -> str | None:
             if "train" not in match.group(1).lower():
                 return RED_FLAG_MSG.format("resample-before-split",
                                            f"resampling must fit on the training split only ({match.group(0)[:60]}) - split first, then fit_resample(X_train, y_train)")
+    if "target-stats-outside-train" not in overrides:
+        snippet = _target_stats_outside_train(code)
+        if snippet:
+            return RED_FLAG_MSG.format("target-stats-outside-train", TARGET_STATS_WHY.format(snippet))
     return None
 
 
@@ -435,7 +470,8 @@ def _classify(receiver: str, before: str, args: str) -> str:
 def analyse(text: str) -> dict[str, str | None]:
     """First matching snippet for each kind of finding, or None."""
     code = COMMENT.sub("", text)
-    found: dict[str, str | None] = {"model": None, "transformer": None, "fit_on_test": None, "eval_on_test": None}
+    found: dict[str, str | None] = {"model": None, "transformer": None, "fit_on_test": None, "eval_on_test": None,
+                                   "pilot": None}
     api = TRAIN_API.search(code)
     if api:
         found["model"] = api.group(0)
@@ -449,6 +485,8 @@ def analyse(text: str) -> dict[str, str | None]:
         if TEST_SPLIT.search(args) and found["fit_on_test"] is None:
             found["fit_on_test"] = snippet
         kind = _classify(match.group(1) or "", code[max(0, match.start() - 200): match.start()], args)
+        if kind == "model" and found["pilot"] is None and SLICE.search(args):
+            found["pilot"] = snippet
         if found[kind] is None:
             found[kind] = snippet
     for match in (*FIT_REF.finditer(code), *GETATTR_FIT.finditer(code)):
@@ -459,6 +497,9 @@ def analyse(text: str) -> dict[str, str | None]:
         args = _args(code, match.end())
         if TEST_SPLIT.search(args) and found["eval_on_test"] is None:
             found["eval_on_test"] = code[match.start(): match.end() + len(args) + 1][:SNIPPET]
+    nrows = NROWS.search(code)
+    if found["model"] and found["pilot"] is None and nrows:
+        found["pilot"] = code[max(0, nrows.start() - 30): nrows.end() + 10].strip()
     return found
 
 
@@ -472,7 +513,8 @@ def current_run(markdown: str) -> str:
 def gate_state(markdown: str) -> dict[str, bool]:
     """Which gates the newest run approves. For each gate the last strict line decides; nothing else counts."""
     last: dict[str, str] = {}
-    for line in current_run(markdown).splitlines():
+    run = current_run(markdown)
+    for line in run.splitlines():
         gate = GATE_RECORD.match(line)
         if gate:
             last[gate.group(1).upper()] = "approved" if APPROVED_WORD.match(gate.group(2)) else "other"
@@ -483,6 +525,7 @@ def gate_state(markdown: str) -> dict[str, bool]:
     state = {gate: last.get(gate) == "approved" for gate in "ABCD"}
     state["override"] = last.get("B") == "override"
     state["override_c"] = last.get("C") == "override"
+    state["pilot"] = bool(PILOT_OVERRIDE.search(run))
     return state
 
 
@@ -513,6 +556,8 @@ def decide(found: dict[str, str | None], gates: dict[str, bool] | None) -> str |
     if gates is None:
         return NO_PIPELINE_MSG.format(found["model"]) if found["model"] else None
     if gates["B"] or gates["override"]:
+        if found["pilot"] and not gates.get("pilot"):
+            return PILOT_MSG.format(found["pilot"])
         return None
     if gates["A"]:
         return GATE_B_MSG.format(found["model"]) if found["model"] else None
