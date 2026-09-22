@@ -614,5 +614,71 @@ class VariablePagesAndLabels(unittest.TestCase):
                           state_dir=self.state)
         self.assertIn("- target: min ", (self.state / guard.LABEL_AUDIT_FILE).read_text())
 
+
+class CleaningAndAssociations(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.state = Path(self.tmp.name) / "ml_pipeline"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_log_cleaning_counts(self):
+        before = messy()
+        after = before.drop(index=range(10)).assign(age=before["age"].clip(upper=60))
+        returned = guard.log_cleaning("clip age at 60 and drop 10 rows", before, after,
+                                      reason="entry errors above 60", state_dir=self.state)
+        self.assertIs(returned, after)
+        with (self.state / guard.CLEANING_FILE).open(encoding="utf-8") as handle:
+            row = list(csv.DictReader(handle))[0]
+        changed = int((before["age"].drop(index=range(10)) > 60).sum())
+        self.assertEqual((row["rows_before"], row["rows_after"], row["cells_changed"], row["columns_changed"]),
+                         ("600", "590", str(changed), "age"))
+
+    def test_log_cleaning_needs_a_reason(self):
+        with self.assertRaises(ValueError):
+            guard.log_cleaning("drop rows", messy(), messy(), reason=" ", state_dir=self.state)
+
+    @staticmethod
+    def signal_frame(n=800):
+        rng = np.random.default_rng(5)
+        signal = rng.normal(size=n)
+        weight = rng.normal(70, 10, size=n)
+        return pd.DataFrame({"signal": signal, "noise": rng.normal(size=n), "weight": weight,
+                             "bmi": weight * 0.3 + rng.normal(0, 0.1, size=n), "plan": rng.choice(["a", "b"], n),
+                             "y": (signal + rng.normal(0, 0.3, size=n) > 0).astype(int)})
+
+    def test_train_associations(self):
+        tr, _, _ = guard.split(self.signal_frame(), target="y", state_dir=self.state)
+        result = guard.train_associations(tr, target="y", state_dir=self.state)
+        self.assertEqual(result["feature_target"][0]["column"], "signal")
+        self.assertEqual((result["computed_on"]["split"], result["computed_on"]["n_rows"]), ("train", len(tr)))
+        self.assertEqual([(p["a"], p["b"]) for p in result["collinear_pairs"]], [("weight", "bmi")])
+        measures = {e["column"]: e["measure"] for e in result["feature_target"]}
+        self.assertEqual((measures["signal"], measures["plan"]), ("eta", "cramers_v"))
+        for name in ("07_correlations_train.png", "07_feature_target_train.png"):
+            self.assertGreater((self.state / "figures" / name).stat().st_size, 1024)
+        saved = json.loads((self.state / guard.ASSOCIATIONS_FILE).read_text())
+        self.assertEqual(saved["computed_on"]["n_rows"], len(tr))
+
+    def test_regression_target_measures(self):
+        df = self.signal_frame()
+        df["y"] = df["signal"] * 2 + np.random.default_rng(1).normal(0, 0.1, len(df))
+        tr, _, _ = guard.split(df, target="y", state_dir=self.state)
+        result = guard.train_associations(tr, target="y", state_dir=self.state)
+        measures = {e["column"]: e["measure"] for e in result["feature_target"]}
+        self.assertEqual((measures["signal"], measures["plan"]), ("spearman", "eta"))
+        self.assertEqual(result["feature_target"][0]["column"], "signal")
+
+    def test_associations_refuse_the_full_frame(self):
+        df = self.signal_frame()
+        guard.split(df, target="y", state_dir=self.state)
+        with self.assertRaises(guard.NotTrainingSplit):
+            guard.train_associations(df, target="y", state_dir=self.state)
+
+    def test_associations_need_a_split(self):
+        with self.assertRaises(guard.LeakageError):
+            guard.train_associations(self.signal_frame(), target="y", state_dir=self.state)
+
 if __name__ == "__main__":
     unittest.main()

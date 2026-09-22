@@ -973,3 +973,154 @@ def label_audit(df: pd.DataFrame, *, target: str, state_dir: str | Path = "ml_pi
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text)
     return path
+
+
+# ------------------------------------------------------------------ preparation (steps 4-8)
+CLEANING_FILE = "cleaning_log.csv"
+CLEANING_HEADER = ["rule", "reason", "rows_before", "rows_after", "cells_changed", "columns_changed", "date"]
+ASSOCIATIONS_FILE = "associations.json"
+
+
+class NotTrainingSplit(LeakageError):
+    """Target statistics were requested on a frame that is not the frozen training split."""
+
+
+def log_cleaning(rule: str, before: pd.DataFrame, after: pd.DataFrame, *, reason: str,
+                 state_dir: str | Path = "ml_pipeline") -> pd.DataFrame:
+    """Step 4: record one cleaning rule with its before/after counts; returns ``after``.
+
+    Rows are matched by index label and cells compared on the shared columns, NaN equal to NaN.
+    """
+    if not str(rule).strip() or not str(reason).strip():
+        raise ValueError("every cleaning rule needs a name and a reason")
+    rows = before.index.intersection(after.index)
+    cols = [c for c in before.columns if c in after.columns]
+    a = before.loc[rows, cols].astype(object)
+    b = after.loc[rows, cols].astype(object)
+    changed = (~((a == b) | (a.isna() & b.isna()))).sum()
+    path = Path(state_dir) / CLEANING_FILE
+    new = not path.is_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=CLEANING_HEADER, lineterminator="\n")
+        if new:
+            writer.writeheader()
+        writer.writerow({"rule": str(rule).strip(), "reason": str(reason).strip(), "rows_before": len(before),
+                         "rows_after": len(after), "cells_changed": int(changed.sum()),
+                         "columns_changed": ";".join(str(c) for c in changed[changed > 0].index),
+                         "date": date.today().isoformat()})
+    return after
+
+
+def _finite(value) -> float:
+    value = float(value)
+    return value if np.isfinite(value) else 0.0
+
+
+def _eta(values: np.ndarray, groups: np.ndarray) -> float:
+    """Correlation ratio: the root of the share of spread in ``values`` explained by ``groups``, in [0, 1]."""
+    overall = values.mean()
+    total = float(((values - overall) ** 2).sum())
+    if total == 0:
+        return 0.0
+    between = sum(len(v) * (v.mean() - overall) ** 2 for v in (values[groups == g] for g in np.unique(groups)))
+    return float(np.sqrt(between / total))
+
+
+def _cramers_v(a: pd.Series, b: pd.Series) -> float:
+    table = pd.crosstab(a, b).to_numpy(dtype=float)
+    if min(table.shape) < 2:
+        return 0.0
+    n = table.sum()
+    expected = table.sum(1, keepdims=True) * table.sum(0, keepdims=True) / n
+    chi2 = float(((table - expected) ** 2 / expected).sum())
+    return float(np.sqrt(chi2 / (n * (min(table.shape) - 1))))
+
+
+def _feature_target(x: pd.Series, y: pd.Series, x_kind: str, task: str) -> tuple[str, float]:
+    both = pd.concat([x, y], axis=1).dropna()
+    if len(both) < 3:
+        return "none", 0.0
+    xs, ys = both.iloc[:, 0], both.iloc[:, 1]
+    categorical = x_kind in ("categorical", "bool")
+    if task == "regression":
+        if categorical:
+            return "eta", _eta(ys.astype(float).to_numpy(), xs.astype(str).to_numpy())
+        return "spearman", abs(_finite(xs.astype(float).rank().corr(ys.astype(float).rank())))
+    if categorical:
+        return "cramers_v", _cramers_v(xs.astype(str), ys.astype(str))
+    return "eta", _eta(xs.astype(float).to_numpy(), ys.astype(str).to_numpy())
+
+
+def train_associations(train: pd.DataFrame, *, target: str, state_dir: str | Path = "ml_pipeline") -> dict:
+    """Step 7: correlations and feature-target strength on the frozen training split only."""
+    state = _split_state(state_dir)
+    if len(train) != state["n_train"]:
+        raise NotTrainingSplit(f"{len(train):,} rows, but the frozen training split has {state['n_train']:,}: "
+                               "compute target statistics on the training split only")
+    task = _target_info(train[target])["task"]
+    kinds = {c: _column_kind(train[c]) for c in train.columns if c != target}
+    usable = [c for c, k in kinds.items() if k in ("numeric", "bool", "categorical")]
+    strengths = []
+    for col in usable:
+        measure, value = _feature_target(train[col], train[target], kinds[col], task)
+        entry = {"column": str(col), "measure": measure, "value": round(_finite(value), 4)}
+        if kinds[col] == "categorical" and train[col].nunique() > HIGH_CARD_LEVELS:
+            entry["high_cardinality"] = True
+        strengths.append(entry)
+    strengths.sort(key=lambda e: e["value"], reverse=True)
+    numeric = [c for c in usable if kinds[c] in ("numeric", "bool")]
+    corr = train[numeric].astype(float).rank().corr() if len(numeric) >= 2 else pd.DataFrame()
+    pairs = []
+    for i, a in enumerate(numeric):
+        for b in numeric[i + 1:]:
+            rho = float(corr.loc[a, b])
+            if rho == rho and abs(rho) > COLLINEAR_RHO:
+                pairs.append({"a": str(a), "b": str(b), "rho": round(rho, 4)})
+    result = {"schema_version": "1",
+              "computed_on": {"split": "train", "n_rows": int(len(train)), "date": date.today().isoformat()},
+              "target": str(target), "task": task, "feature_target": strengths, "collinear_pairs": pairs}
+    Path(state_dir).mkdir(parents=True, exist_ok=True)
+    (Path(state_dir) / ASSOCIATIONS_FILE).write_text(json.dumps(result, indent=2))
+    _association_figures(corr, strengths, pairs, len(train), state_dir)
+    return result
+
+
+def _association_figures(corr: pd.DataFrame, strengths: list[dict], pairs: list[dict], n_rows: int,
+                         state_dir) -> None:
+    plt = _plt()
+    shown = corr.iloc[:40, :40]
+    f, ax = plt.subplots(figsize=(8, 7))
+    if len(shown) >= 2:
+        image = ax.imshow(shown.to_numpy(), vmin=-1, vmax=1, cmap="coolwarm")
+        ax.set_xticks(range(len(shown)))
+        ax.set_xticklabels([str(c) for c in shown.columns], rotation=90, fontsize=7)
+        ax.set_yticks(range(len(shown)))
+        ax.set_yticklabels([str(c) for c in shown.columns], fontsize=7)
+        f.colorbar(image)
+    else:
+        ax.text(0.5, 0.5, "fewer than 2 numeric features", ha="center", va="center")
+        ax.set_axis_off()
+    ax.set_title("Spearman correlations, training split")
+    if pairs:
+        top = max(pairs, key=lambda p: abs(p["rho"]))
+        explanation = (f"{len(pairs)} feature pairs have |rho| above {COLLINEAR_RHO} on the training split; "
+                       f"strongest {top['a']} and {top['b']} ({top['rho']:.2f}).")
+    else:
+        explanation = (f"No pair of the {len(shown)} numeric features exceeds |rho| {COLLINEAR_RHO} on the "
+                       f"{n_rows:,} training rows.")
+    fig(7, "correlations_train", f, explanation, state_dir)
+
+    f, ax = plt.subplots(figsize=(8, max(3, 0.3 * min(len(strengths), 25) + 1)))
+    top25 = strengths[:25]
+    ax.barh([e["column"] for e in top25][::-1], [e["value"] for e in top25][::-1])
+    ax.set_xlabel("strength of link to the target (0 to 1)")
+    ax.set_title("Feature-target strength, training split")
+    if strengths:
+        best = strengths[0]
+        weak = sum(1 for e in strengths if e["value"] < 0.05)
+        explanation = (f"Strongest link to the target on the training split: {best['column']} "
+                       f"({best['measure']} {best['value']:.2f}); {weak} of {len(strengths)} features score below 0.05.")
+    else:
+        explanation = f"No numeric or categorical feature to compare with the target among {n_rows:,} training rows."
+    fig(7, "feature_target_train", f, explanation, state_dir)
