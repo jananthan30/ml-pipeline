@@ -204,6 +204,18 @@ class GateA(unittest.TestCase):
             "No column is recorded after discharge;", "Plan is chosen at admission, before the outcome;")
         self.assertEqual(problems("A", files), [])
 
+    def test_integer_named_suspects_are_matched(self):
+        p = fx.profile()
+        p["columns"]["0"] = fx.profile()["columns"]["plan"]
+        p["shape"]["n_cols"] = 5
+        p["leakage_suspects"] = [{"column": 0, "reason": "|corr| with target = 0.99"}]
+        rows = fx.dictionary_rows() + [dict(fx.dictionary_rows()[1], column="0",
+                                            figure_note="0: a coded column where basic fills 100 of 200 rows")]
+        files = fx.records("A")
+        files.update({fx.PROFILE: json.dumps(p), fx.DICTIONARY: fx.dictionary_csv(rows),
+                      fx.PAGES: json.dumps({"02_variables_p01.png": ["age", "plan", "patient_id", "y", "0"]})})
+        self.assertIn("must discuss each leakage suspect kept as a feature or id: 0", joined("A", files))
+
     def test_regression_label_line(self):
         p = fx.profile()
         p["target"] = {"name": "y", "task": "regression", "n_classes": None, "class_balance": None,
@@ -262,6 +274,11 @@ class GateC(unittest.TestCase):
         self.assertIn("no full-data training run", joined("C", with_(fx.TRAINING, None, "C")))
         pilot = json.dumps({"model": "pilot", "n_rows": 50, "n_train": 120, "full": False, "date": "2026-09-24"}) + "\n"
         self.assertIn("no full-data training run", joined("C", with_(fx.TRAINING, pilot, "C")))
+
+    def test_resampled_run_counts_as_full(self):
+        run = json.dumps({"model": "smote+lr", "n_rows": 230, "rows_from": 120, "n_train": 120, "full": True,
+                          "date": "2026-09-24"}) + "\n"
+        self.assertEqual(problems("C", with_(fx.TRAINING, run, "C")), [])
 
     def test_importance_on_validation(self):
         imp = fx.importance()

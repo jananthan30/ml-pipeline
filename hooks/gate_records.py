@@ -354,8 +354,8 @@ def _label_audit_problems(state_dir: Path, profile: dict, dictionary: list[dict]
         problems.append(f"label_audit.md sections need at least {MIN_NOTE_CHARS} characters of writing: {_listing(thin)}")
     roles = {r.get("column"): r.get("role", "").lower() for r in (dictionary or [])}
     leak_text = sections.get("Leakage check", "").lower()
-    kept = sorted({s.get("column") for s in profile.get("leakage_suspects") or []
-                   if roles.get(s.get("column")) in ("feature", "id")})
+    kept = sorted({str(s.get("column")) for s in profile.get("leakage_suspects") or []
+                   if roles.get(str(s.get("column"))) in ("feature", "id")})
     unnamed = [c for c in kept if str(c).lower() not in leak_text]
     if unnamed:
         problems.append("label_audit.md Leakage check must discuss each leakage suspect kept as a feature or id: "
@@ -436,7 +436,8 @@ def gate_c_problems(state_dir: Path, run_text: str) -> list[str]:
     problems = []
     state = _json(state_dir / STATE_FILE) or {}
     runs = _jsonl(state_dir / TRAINING_FILE)
-    if not any(r.get("full") is True and "n_train" in state and r.get("n_rows") == state["n_train"] for r in runs):
+    if not any(r.get("full") is True and "n_train" in state
+               and state["n_train"] in (r.get("n_rows"), r.get("rows_from")) for r in runs):
         problems.append("no full-data training run on record: train on the whole training split with guard.fit(...) "
                         "or record it with guard.record_training(...)")
     problems += _split_record_problems(state_dir, IMPORTANCE_FILE, "validation", "n_val",

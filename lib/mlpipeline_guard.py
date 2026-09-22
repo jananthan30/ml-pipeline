@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import io
 import json
 import re
 import warnings
@@ -260,7 +261,7 @@ _READERS = {
     ".json": ("read_json", {}), ".jsonl": ("read_json", {"lines": True}), ".ndjson": ("read_json", {"lines": True}),
     ".feather": ("read_feather", {}),
 }
-_PARTIAL_KWARGS = ("nrows", "skiprows", "skipfooter", "chunksize", "iterator", "usecols")
+_PARTIAL_KWARGS = ("nrows", "skiprows", "skipfooter", "chunksize", "iterator", "usecols", "columns", "filters")
 
 
 class PartialData(LeakageError):
@@ -458,18 +459,18 @@ def _leakage_suspects(df: pd.DataFrame, target: str, time_col, kinds: dict, task
             if x.notna().sum() > 2 and x.std() > 0 and y_num.std() > 0:
                 corr = abs(np.corrcoef(x.fillna(x.median()), y_num)[0, 1])
                 if corr > LEAK_CORR:
-                    suspects.append({"column": col, "reason": f"|corr| with target = {corr:.2f}"})
+                    suspects.append({"column": str(col), "reason": f"|corr| with target = {corr:.2f}"})
         elif kind in ("categorical", "bool") and task != "regression" and df[col].nunique() <= HIGH_CARD_LEVELS:
             table = pd.crosstab(df[col].astype(str), y.astype(str))
             purity = float(table.max(axis=1).sum() / table.to_numpy().sum())
             if purity > LEAK_PURITY:
-                suspects.append({"column": col, "reason": f"predicts target with {purity:.0%} purity"})
+                suspects.append({"column": str(col), "reason": f"predicts target with {purity:.0%} purity"})
         elif kind == "datetime" and time_col and col != time_col:
             later = float((df[col] > df[time_col]).mean())
             if later > 0.5:
-                suspects.append({"column": col, "reason": f"datetime later than {time_col} in {later:.0%} of rows"})
+                suspects.append({"column": str(col), "reason": f"datetime later than {time_col} in {later:.0%} of rows"})
         if _LEAK_NAME.search(str(col)):
-            suspects.append({"column": col, "reason": "name suggests post-outcome information"})
+            suspects.append({"column": str(col), "reason": "name suggests post-outcome information"})
     return suspects
 
 
@@ -810,10 +811,7 @@ def _merge_csv(path: Path, header: list[str], rows: list[dict], *, key: str, com
     Computed fields always come from ``rows``; word fields keep a non-empty earlier value, else take the
     default in ``rows``. Reads ``utf-8-sig`` so files saved by Excel or Numbers still merge.
     """
-    old: dict[str, dict] = {}
-    if path.is_file():
-        with path.open(newline="", encoding="utf-8-sig") as handle:
-            old = {r.get(key) or "": r for r in csv.DictReader(handle)}
+    old = _read_record(path, key) if path.is_file() else {}
     merged = [{h: (row.get(h, "") if h in computed else (old.get(row[key], {}).get(h) or row.get(h, "")))
                for h in header} for row in rows]
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -823,6 +821,24 @@ def _merge_csv(path: Path, header: list[str], rows: list[dict], *, key: str, com
         writer.writerows(merged)
     current = {row[key] for row in rows}
     return sorted(k for k in old if k and k not in current)
+
+
+def _read_record(path: Path, key: str) -> dict[str, dict]:
+    """An existing record's rows by ``key``, as Excel or Numbers may have saved it (BOM, cp1252, ``;`` or tab).
+
+    Raises instead of guessing, so a record that can't be read is never overwritten and its words never lost.
+    """
+    raw = path.read_bytes()
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        text = raw.decode("cp1252")
+    for delimiter in (",", ";", "\t"):
+        reader = csv.DictReader(io.StringIO(text, newline=""), delimiter=delimiter)
+        if reader.fieldnames and key in [f.strip() for f in reader.fieldnames]:
+            return {(r.get(key) or "").strip(): {(k or "").strip(): v for k, v in r.items()} for r in reader}
+    raise ValueError(f"can't read {path.name}: no '{key}' column. Save it as 'CSV UTF-8 (comma delimited)' and "
+                     "re-run; the file was left unchanged")
 
 
 def _warn_removed(removed: list[str], path: Path) -> None:
@@ -1135,28 +1151,47 @@ class NotValidationSplit(LeakageError):
     """Importance was requested on a frame that is not the frozen validation split."""
 
 
-def _append_run(state_dir, name: str, n_rows: int) -> None:
+def _rows(data) -> int:
+    """How many rows ``data`` holds: ``shape[0]`` for frames, arrays, and sparse matrices, else ``len()``."""
+    shape = getattr(data, "shape", None)
+    return int(shape[0]) if shape is not None and len(shape) else len(data)
+
+
+def _append_run(state_dir, name: str, n_rows: int, rows_from: int | None = None) -> None:
     state = _split_state(state_dir)
+    source = n_rows if rows_from is None else rows_from
     line = {"model": str(name), "n_rows": int(n_rows), "n_train": int(state["n_train"]),
-            "full": int(n_rows) == int(state["n_train"]), "date": date.today().isoformat()}
+            "full": int(source) == int(state["n_train"]), "date": date.today().isoformat()}
+    if rows_from is not None:
+        line["rows_from"] = int(rows_from)
     with (Path(state_dir) / TRAINING_FILE).open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(line) + "\n")
 
 
-def fit(model, X, y=None, *, name: str | None = None, state_dir: str | Path = "ml_pipeline", **fit_kwargs):
-    """Steps 9-10: train ``model`` and record how many rows it saw, so Gate C can prove a full-data run."""
+def fit(model, X, y=None, *, name: str | None = None, rows_from=None, state_dir: str | Path = "ml_pipeline",
+        **fit_kwargs):
+    """Steps 9-10: train ``model`` and record how many rows it saw, so Gate C can prove a full-data run.
+
+    After resampling (``fit_resample(X_train, y_train)``) pass ``rows_from=X_train``: the run is full when
+    the frame it was resampled from is the whole training split, and the receipt keeps both counts.
+    """
     _split_state(state_dir)  # no split, no training - checked before the model is touched
+    n_rows = _rows(X)
+    source = None if rows_from is None else _rows(rows_from)
     if y is None:
         model.fit(X, **fit_kwargs)
     else:
         model.fit(X, y, **fit_kwargs)
-    _append_run(state_dir, name or type(model).__name__, len(X))
+    _append_run(state_dir, name or type(model).__name__, n_rows, source)
     return model
 
 
-def record_training(data, *, name: str, state_dir: str | Path = "ml_pipeline") -> None:
-    """Custom training loops: record the rows ``data`` holds. It must support len(), so the count is measured."""
-    _append_run(state_dir, name, len(data))
+def record_training(data, *, name: str, rows_from=None, state_dir: str | Path = "ml_pipeline") -> None:
+    """Custom training loops: record the rows ``data`` holds (pass the dataset, not a batch loader).
+
+    ``data`` must have a shape or support len(), so the count is measured, never typed.
+    """
+    _append_run(state_dir, name, _rows(data), None if rows_from is None else _rows(rows_from))
 
 
 def importance(predict_fn, val: pd.DataFrame, *, target: str, metric_fn, greater_is_better: bool = True,

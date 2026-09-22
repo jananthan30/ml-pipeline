@@ -215,6 +215,11 @@ class Sources(unittest.TestCase):
                 guard.load(self.csv, state_dir=self.state, **kwargs)
         self.assertFalse((self.state / guard.SOURCE_FILE).exists())
 
+    def test_parquet_and_feather_subsets_are_refused(self):
+        for kwargs in ({"columns": ["a"]}, {"filters": [("y", "=", 1)]}):
+            with self.subTest(kwargs=kwargs), self.assertRaises(guard.PartialData):
+                guard.load(self.csv, state_dir=self.state, **kwargs)
+
     def test_other_read_options_pass_through(self):
         self.assertEqual(str(guard.load(self.csv, state_dir=self.state, dtype={"b": "float64"})["b"].dtype), "float64")
 
@@ -360,6 +365,14 @@ class Profile(unittest.TestCase):
         info = guard.profile(df, target="y", time_col="admitted_at", state_dir=self.state)["columns"]["empty"]
         self.assertEqual((info["missing"], info["non_null"]), (1000, 0))
         self.assertNotIn("mean", info)
+
+    def test_integer_named_leakage_suspects_are_strings(self):
+        n = 200
+        df = pd.DataFrame({0: np.arange(n) % 2 + 0.001 * np.arange(n), 1: np.random.default_rng(0).normal(size=n),
+                           "y": np.arange(n) % 2})
+        suspects = guard.profile(df, target="y", state_dir=self.state)["leakage_suspects"]
+        self.assertIn("0", [s["column"] for s in suspects])
+        self.assertTrue(all(isinstance(s["column"], str) for s in suspects))
 
     def test_target_counts_and_regression_stats(self):
         df = self._df()
@@ -532,6 +545,28 @@ class Records(unittest.TestCase):
         guard.profile(df, target="y", state_dir=self.state)
         guard.data_dictionary(df, state_dir=self.state)
         self.assertEqual([r["column"] for r in self.rows(guard.DICTIONARY_FILE)], ["0", 'weight, "kg"', "y"])
+
+    def test_semicolon_and_legacy_excel_saves_keep_the_words(self):
+        guard.data_dictionary(self.df, state_dir=self.state)
+        rows = self.rows(guard.DICTIONARY_FILE)
+        rows[0].update(meaning="age at admission", unit="years °")
+        path = self.state / guard.DICTIONARY_FILE
+        for encoding, delimiter in (("cp1252", ";"), ("cp1252", ","), ("utf-8", ";")):
+            with self.subTest(encoding=encoding, delimiter=delimiter):
+                with path.open("w", newline="", encoding=encoding) as handle:
+                    writer = csv.DictWriter(handle, fieldnames=list(rows[0]), delimiter=delimiter)
+                    writer.writeheader()
+                    writer.writerows(rows)
+                guard.data_dictionary(self.df, state_dir=self.state)
+                again = self.rows(guard.DICTIONARY_FILE)
+                self.assertEqual((again[0]["meaning"], again[0]["unit"]), ("age at admission", "years °"))
+
+    def test_an_unreadable_record_is_never_overwritten(self):
+        path = self.state / guard.DICTIONARY_FILE
+        path.write_text("colonne|sens\nage|âge\n", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            guard.data_dictionary(self.df, state_dir=self.state)
+        self.assertEqual(path.read_text(encoding="utf-8"), "colonne|sens\nage|âge\n")
 
     def test_missingness_rows_counts_and_pattern(self):
         guard.missingness(self.df, state_dir=self.state)
@@ -734,6 +769,29 @@ class TrainingAndImportance(unittest.TestCase):
         self.assertTrue(self.runs()[0]["full"])
         with self.assertRaises(TypeError):
             guard.record_training(5, name="typed", state_dir=self.state)
+
+    def test_sparse_like_inputs_are_counted_by_shape(self):
+        class SparseLike:
+            def __init__(self, n):
+                self.shape = (n, 3)
+
+            def __len__(self):
+                raise TypeError("sparse array length is ambiguous")
+
+        class ShapeStub:
+            def fit(self, X, y=None):
+                self.n_rows = X.shape[0]
+                return self
+
+        guard.fit(ShapeStub(), SparseLike(len(self.tr)), self.tr["y"], state_dir=self.state)
+        self.assertEqual((self.runs()[0]["n_rows"], self.runs()[0]["full"]), (len(self.tr), True))
+
+    def test_resampled_training_counts_its_source_rows(self):
+        X, y = self.tr.drop(columns="y"), self.tr["y"]
+        X_res, y_res = pd.concat([X, X.iloc[:100]]), pd.concat([y, y.iloc[:100]])
+        guard.fit(Stub(), X_res, y_res, rows_from=X, state_dir=self.state)
+        run = self.runs()[0]
+        self.assertEqual((run["n_rows"], run["rows_from"], run["full"]), (len(X) + 100, len(X), True))
 
     def test_importance_ranks_the_signal_first(self):
         result = guard.importance(self.predict, self.va, target="y", metric_fn=self.accuracy, state_dir=self.state)
