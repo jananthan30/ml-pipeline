@@ -69,6 +69,15 @@ are denied outright from the profile: a neural net on a small table, a random sp
 data, a non-group split on grouped data, accuracy as the selection metric on an imbalanced target,
 and resampling before the split.
 
+v0.5 makes the data work complete and provable. `guard.load()` records each file's hash and row count, and
+Gate A needs a profile of the whole file — a sample or an `nrows=` slice is stopped. Every column gets a
+data-dictionary row, a place on a figure page, a written note that cites a real number from that column, and
+— if it has gaps — a likely cause and a decision; the label gets an audit. Correlations and feature–target
+strength are computed on the training split only, training runs are recorded so Gate C can prove one used
+the whole training split, and permutation importance comes from the validation split after the baseline.
+The harness checks completeness against the real columns and rows; you judge the quality at each gate.
+Approvals never carry over between experiments: each starts with a `## Run: <name> (date)` heading.
+
 Prove it on the **canary**: `examples/canary/canary.csv` has a known honest ceiling of 0.80
 accuracy. Beat it and you leaked. `ML_PIPELINE_ENFORCE=0` switches enforcement off for non-ML
 projects. Codex and Kimi get the same rules as instructions (no hook support there).
