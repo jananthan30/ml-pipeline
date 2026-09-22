@@ -474,3 +474,40 @@ Removed: `SAMPLE_ROWS`.
   dependencies. Canary stays stdlib.
 - Versions → `0.5.0` in `.claude-plugin/plugin.json` and `.codex-plugin/plugin.json`.
 - Commits end with `Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>`.
+
+## Amendments after the final review (2026-09-22)
+
+A fresh whole-branch review found ten Important issues; these amendments record the resulting
+behaviour and supersede the text above where they differ.
+
+1. **The hook never fails open on unreadable input.** Each shell segment is read under its own error
+   guard (a `~user` path that cannot be resolved is skipped, not fatal). A crash while checking a gate's
+   records denies that ledger write only (`could not check the Gate X records (...)`); no tool is locked.
+2. **Records saved by Excel or Numbers parse:** UTF-8 with or without a byte-order mark, cp1252, and `,`,
+   `;`, or tab delimiters (the delimiter whose header has the record's key). The guard never overwrites
+   a record it cannot read; it raises and leaves the file unchanged.
+3. **Only gate lines a call adds are checked.** A recording line counts as new when it occurs more often in
+   the new text than in what the call replaces (the `old_string` of an Edit, otherwise the existing
+   ledger). Rewriting the ledger or anchoring an edit on a recorded gate does not re-check that gate; a new
+   run's gate lines are checked.
+4. **Overrides need the same records as approvals** (owner-facing ruling; the gate messages and the skill
+   say so). An override records the user's choice; it does not skip the data work.
+5. **Pilot rule, narrowed:** a row slice inside a model-training call is `[:N]`, `[a:N]`, `[-N:]`,
+   `.iloc/.loc[...:N]`, `.head(`, or `.sample(` without `frac=1`; slices nested inside another subscript
+   or taken of `.columns` are column selection, and negative stops are shifts. `nrows=` counts only inside
+   a pandas `read_*(` call and never as `nrows=0`.
+6. **Following execution, widened:** `torchrun`, `accelerate`, `deepspeed`, `horovodrun`, and
+   `python -m torch.distributed.run|launch|accelerate.commands|deepspeed` run the `.py` files in their
+   arguments; `sh|bash|zsh <file>` and `-c '<code>'` are read one level deep.
+7. **Training receipts** count rows by `shape[0]` when the input has a shape (sparse matrices), else
+   `len()`. `guard.fit(..., rows_from=X_train)` and `guard.record_training(..., rows_from=...)` record
+   training on a resampled frame; the run is full when `rows_from` is the whole training split, and
+   Gate C accepts a receipt whose `n_rows` or `rows_from` equals `n_train`.
+8. **Column notes cite the column's own figures** (§4.3): the statistics a note may cite are its kind's
+   figures (numeric percentiles, mean, std, min, max, skew, kurtosis, zeros, negatives, outliers;
+   categorical and bool levels, top fractions and counts, rare levels; datetime span; text lengths) plus
+   its missing count and fraction when it has gaps. Columns without such figures (ids, all-missing
+   columns) may cite unique and missing counts. Row, non-null, distinct-value, and memory counts no
+   longer count, so one template cannot pass every column.
+9. **`load()` also refuses `columns=` and `filters=`** (parquet and feather subsets), and leakage suspects
+   are stored by column-name string.

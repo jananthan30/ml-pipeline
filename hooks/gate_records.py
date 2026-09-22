@@ -68,8 +68,22 @@ def _stat_values(obj) -> list[float]:
     return []
 
 
+def _citable(stats: dict) -> dict:
+    """The statistics a column note may cite: the kind's own figures, plus the missing count when there are gaps.
+
+    Counts every column has (rows, non-null values, distinct values, memory) do not prove the column was
+    looked at, so they only count for columns without figures of their own: ids and all-missing columns.
+    """
+    own = {k: stats[k] for k in PROFILE_KEYS.get(stats.get("kind"), ()) if k in stats}
+    if not own:
+        return {k: stats[k] for k in ("n_unique", "unique_frac", "missing", "missing_frac") if k in stats}
+    if (stats.get("missing") or 0) > 0:
+        own.update(missing=stats["missing"], missing_frac=stats.get("missing_frac"))
+    return own
+
+
 def _cites(note: str, stats: dict) -> bool:
-    facts = _stat_values(stats)
+    facts = _stat_values(_citable(stats))
     for token in _NUMBER.findall(note):
         percent = token.endswith("%")
         text = token.rstrip("%").replace(",", "")

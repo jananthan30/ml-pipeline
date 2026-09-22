@@ -561,9 +561,33 @@ def _stat_values(obj) -> list[float]:
     return []
 
 
+_KIND_STATS = {
+    "numeric": ("mean", "std", "min", "p01", "p05", "p25", "median", "p75", "p95", "p99", "max", "skew",
+                "kurtosis", "zeros", "negatives", "outliers", "outlier_frac"),
+    "categorical": ("n_levels", "top", "top_counts", "rare_levels"),
+    "bool": ("n_levels", "top", "top_counts", "rare_levels"),
+    "datetime": ("span_days",),
+    "text": ("length_min", "length_median", "length_max"),
+}
+
+
+def _citable(stats: dict) -> dict:
+    """The statistics a column note may cite: the kind's own figures, plus the missing count when there are gaps.
+
+    Counts every column has (rows, non-null values, distinct values, memory) do not prove the column was
+    looked at, so they only count for columns without figures of their own: ids and all-missing columns.
+    """
+    own = {k: stats[k] for k in _KIND_STATS.get(stats.get("kind"), ()) if k in stats}
+    if not own:
+        return {k: stats[k] for k in ("n_unique", "unique_frac", "missing", "missing_frac") if k in stats}
+    if (stats.get("missing") or 0) > 0:
+        own.update(missing=stats["missing"], missing_frac=stats.get("missing_frac"))
+    return own
+
+
 def _cites(note: str, stats: dict) -> bool:
     """True when ``note`` has a number other than 0 or 1 equal to one of ``stats`` at its written precision."""
-    facts = _stat_values(stats)
+    facts = _stat_values(_citable(stats))
     for token in _NUMBER.findall(note):
         percent = token.endswith("%")
         text = token.rstrip("%").replace(",", "")

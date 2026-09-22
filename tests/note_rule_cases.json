@@ -9,7 +9,9 @@
     {"note": "age: right-skewed, median 54, 2% missing; cap at the 99th percentile (91) before scaling", "column": true, "problem": null},
     {"note": "age: median 54.0 years, which is typical for this cohort", "column": true, "problem": null},
     {"note": "age: 2.13% of values are missing, spread evenly over time", "column": true, "problem": null},
-    {"note": "age: 196 recorded values in total, which is nearly every row", "column": true, "problem": null},
+    {"note": "age: 196 recorded values in total, which is nearly every row", "column": true, "problem": "cites no statistic of this column"},
+    {"note": "age: 71 distinct values in the full data, reviewed on its page", "column": true, "problem": "cites no statistic of this column"},
+    {"note": "age: 4 rows are missing, so impute before scaling this column", "column": true, "problem": null},
     {"note": "Page 1 of 3: 12 columns, 4 with missing values and 2 skewed", "column": false, "problem": null},
     {"note": "Page one shows every column's distribution in a grid", "column": false, "problem": "contains no number"}
   ]

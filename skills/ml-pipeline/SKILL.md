@@ -50,7 +50,8 @@ At each gate, STOP and give the user, in plain non-jargon language:
 
 If the user says "skip ahead" or "just train it": explain in 2–3 sentences which steps are
 missing and the concrete risk (usually leakage or garbage-in), then ask once for explicit
-override confirmation. If they confirm, proceed and record the override in PIPELINE.md.
+override confirmation. If they confirm, proceed and record the override in PIPELINE.md. An override
+records their choice; it does not skip the data work — the gate's records are still required.
 
 ## Progress tracking (survives across sessions)
 
@@ -131,8 +132,9 @@ Model rationale:
    column on grouped pages. Then fill every word field: in `data_dictionary.csv` the meaning, unit, allowed
    values, source, available-at-prediction (yes/no), role (feature/target/id/leak/drop), and a `figure_note`
    for every column; in `missingness.csv` the likely cause and evidence; every section of `label_audit.md`,
-   naming each leakage suspect kept as a feature. A note is at least 40 characters and cites a real statistic
-   of its column from the profile ("median 54, 2% missing"); no two columns share a note. Add other figures
+   naming each leakage suspect kept as a feature. A note is at least 40 characters and cites a figure of that
+   column's own from the profile — a percentile, mean, level count, top count, span, or its missing count
+   ("median 54, 2% missing") — not a count every column has; no two columns share a note. Add other figures
    with `guard.fig(step, name, figure, explanation)`; every explanation has a number. If matplotlib is
    missing, install it — text descriptions are not figures. The Gate A report shows the row chain (file rows
    → profiled rows), the dictionary, the missingness table, and the label audit.
@@ -168,7 +170,7 @@ Model rationale:
    (logistic/linear regression or small tree). Record their metrics. Every later model is
    judged against this line; a complex model that can't beat it gets reported as such. Train through
    `guard.fit(model, X_train, y_train)` (custom loops: `guard.record_training(train_data, name=...)`) so each
-   run's row count is recorded; Gate C needs one run on the whole training split, and a pilot on a slice
+   run's row count is recorded (after `fit_resample(X_train, y_train)`, pass `rows_from=X_train`); Gate C needs one run on the whole training split, and a pilot on a slice
    needs the user's `- Override: pilot - ...` first.
 10. **Model training** — train candidate models on train, compare on validation. Log every
     run's config and score.

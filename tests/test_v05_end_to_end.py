@@ -123,13 +123,22 @@ class EndToEnd(unittest.TestCase):
         guard.data_dictionary(df, state_dir=self.state)
         roles = {"y": "target", "patient_id": "id"}
 
+        def cite(info):
+            """A figure of the column's own, as a person reading its variable page would note."""
+            if info["kind"] == "numeric":
+                return f"mean {info['mean']}"
+            if info["kind"] in ("categorical", "bool"):
+                return f"{info['n_levels']} levels"
+            if info["kind"] == "datetime":
+                return f"{info['span_days']} days covered"
+            return f"{info['unique_frac']:.0%} unique"
+
         def fill(row):
             info = prof["columns"][row["column"]]
             row.update(meaning=f"{row['column']} as recorded at admission", unit="none", allowed="as observed",
                        source="admissions.csv", available_at_prediction="no" if row["column"] == "y" else "yes",
                        role=roles.get(row["column"], "feature"),
-                       figure_note=(f"{row['column']}: {info['non_null']:,} recorded values and "
-                                    f"{info['n_unique']:,} distinct ones in the full data"))
+                       figure_note=f"{row['column']}: {cite(info)} in the full data, checked on its variable page")
         self.edit_csv(guard.DICTIONARY_FILE, fill)
         guard.missingness(df, state_dir=self.state)
         self.edit_csv(guard.MISSINGNESS_FILE, lambda r: r.update(
