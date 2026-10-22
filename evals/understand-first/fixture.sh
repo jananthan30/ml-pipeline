@@ -16,6 +16,6 @@ with open("data.csv", "w", newline="") as f:
     w.writerows(rows)
 PY
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cp "$HERE/../../lib/mlpipeline_guard.py" ./mlpipeline_guard.py 2>/dev/null || echo "guard not copied (scaffold ran outside the repo)"
+cp "$HERE/../../skills/ml-pipeline/lib/mlpipeline_guard.py" ./mlpipeline_guard.py 2>/dev/null || echo "guard not copied (scaffold ran outside the repo)"
 python3 -m pip install --quiet --user pandas matplotlib >/dev/null 2>&1 || echo "pip install failed (no network?)"
 exit 0

@@ -3,7 +3,7 @@
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "lib"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "skills" / "ml-pipeline" / "lib"))
 import mlpipeline_canary as canary  # noqa: E402
 
 out = Path(__file__).with_name("canary.csv")

@@ -23,21 +23,23 @@ model on data — any modality, any framework — read and follow the pipeline s
 Never jump straight to model training — understand the data first, in this order. Stop at
 the phase gates (after steps 3, 8, 12, and at wrap-up) to report in plain language what was
 done and what comes next, and wait for the user's explicit permission before continuing.
+Only the user approves a gate, in their own words; never record one yourself without that.
 Work in marimo notebooks (\`marimo edit <file>\`) and produce matplotlib figures at every
-data-facing step; save figures to \`ml_pipeline/figures/\`. Track progress in
-\`ml_pipeline/PIPELINE.md\` and resume from it across sessions.
+data-facing step; save figures to \`ml_pipeline/figures/\`. Track progress in the append-only
+\`ml_pipeline/PIPELINE.md\` ledger (\`- Step N done: <result>\`, one step at a time) and resume from
+it across sessions. For large files, pass paths to the guard library (it streams) instead of
+loading them whole.
 EOF
 }
 
 install_for() {
   local name="$1" home_dir="$2"
   [ -d "$home_dir" ] || { echo "skip: $name not found ($home_dir missing)"; return 0; }
-  mkdir -p "$home_dir/skills/ml-pipeline"
-  cp "$SKILL" "$home_dir/skills/ml-pipeline/SKILL.md"
-  mkdir -p "$home_dir/skills/ml-pipeline/lib"
-  cp "$HERE"/lib/mlpipeline_guard.py "$HERE"/lib/mlpipeline_canary.py "$home_dir/skills/ml-pipeline/lib/"
-  mkdir -p "$home_dir/skills/ml-pipeline/references"
-  cp "$HERE"/skills/ml-pipeline/references/model-selection.md "$home_dir/skills/ml-pipeline/references/"
+  # the whole skill folder: SKILL.md, references/, and lib/ (the guard library and the canary)
+  rm -rf "$home_dir/skills/ml-pipeline"
+  mkdir -p "$home_dir/skills"
+  cp -R "$HERE/skills/ml-pipeline" "$home_dir/skills/ml-pipeline"
+  find "$home_dir/skills/ml-pipeline" -name __pycache__ -type d -prune -exec rm -rf {} +
   if ! grep -q "ML pipeline enforcement" "$home_dir/AGENTS.md" 2>/dev/null; then
     enforcement_section "$home_dir/skills/ml-pipeline/SKILL.md" >> "$home_dir/AGENTS.md"
   fi
