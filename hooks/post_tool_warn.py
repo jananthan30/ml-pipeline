@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """PostToolUse hook: warn when a result or a split looks like leakage. Never blocks.
 
-Two checks, both cheap:
+Checks, all cheap:
   - a reported metric that is too good to be honest (accuracy / AUC / F1 / R² >= 0.98)
   - train_test_split() without stratify=, or on code that mentions dates, where a random
     split leaks the future into training
+  - smells the data profile makes visible (slow models on big data, one-hot on high cardinality)
+  - a tool output so large it floods the agent's context (common with big or wide data)
 Stdlib only; fails open.
 """
 from __future__ import annotations
@@ -28,6 +30,7 @@ LARGE_N = 50_000
 SLOW_MODELS = re.compile(r"\b(?:KNeighbors\w+|SVC|SVR)\b")
 ONE_HOT = re.compile(r"\b(?:OneHotEncoder|get_dummies)\b")
 ACCURACY = re.compile(r"\baccuracy_score\s*\(")
+LARGE_OUTPUT = 30_000  # characters
 
 
 def trait_warnings(code: str, traits: dict) -> list[str]:
@@ -61,6 +64,10 @@ def warnings(code: str, output: str, traits: dict | None = None) -> list[str]:
             found.append("train_test_split() on data that mentions dates: a random split leaks the future "
                          "into training; use a chronological split (guard.split(..., time_col=...)).")
     found.extend(trait_warnings(code, traits or {}))
+    if len(output or "") > LARGE_OUTPUT:
+        found.append(f"that output was {len(output):,} characters, which crowds out the context you need to reason - "
+                     "print shapes, .head(10), and summaries; write full tables to files under ml_pipeline/ and read "
+                     "data_profile_summary.md instead of whole frames or the full profile JSON.")
     return found
 
 

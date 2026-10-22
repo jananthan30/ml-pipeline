@@ -32,8 +32,8 @@ class SessionStart(unittest.TestCase):
         result = run({"CLAUDE_PLUGIN_ROOT": "/plug"})
         context = result["hookSpecificOutput"]["additionalContext"]
         self.assertEqual(result["hookSpecificOutput"]["hookEventName"], "SessionStart")
-        self.assertIn("/plug/lib/mlpipeline_guard.py", context)
-        self.assertIn("/plug/lib/mlpipeline_canary.py", context)
+        self.assertIn("/plug/skills/ml-pipeline/lib/mlpipeline_guard.py", context)
+        self.assertIn("/plug/skills/ml-pipeline/lib/mlpipeline_canary.py", context)
         self.assertIn("ml_pipeline/guard.py", context)
         self.assertIn("/plug/skills/ml-pipeline/references/model-selection.md", context)
 

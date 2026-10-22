@@ -1,4 +1,4 @@
-"""Tests for lib/mlpipeline_canary.py (stdlib only): python3 -m unittest tests/test_mlpipeline_canary.py"""
+"""Tests for skills/ml-pipeline/lib/mlpipeline_canary.py (stdlib only): python3 -m unittest tests/test_mlpipeline_canary.py"""
 from __future__ import annotations
 
 import csv
@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "skills" / "ml-pipeline" / "lib"))
 import mlpipeline_canary as canary  # noqa: E402
 
 

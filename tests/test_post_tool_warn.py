@@ -22,6 +22,11 @@ def _stdin(text: str):
 
 
 class Warnings(unittest.TestCase):
+    def test_huge_output_warns(self):
+        out = hook.warnings("print(df)", "x" * 40_000)
+        self.assertTrue(any("crowds out the context" in w for w in out))
+        self.assertEqual(hook.warnings("print(df.head())", "x" * 2_000), [])
+
     def test_too_good_metric(self):
         out = hook.warnings("", "Test accuracy: 0.995\n")
         self.assertEqual(len(out), 1)
