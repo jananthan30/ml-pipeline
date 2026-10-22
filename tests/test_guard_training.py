@@ -592,6 +592,101 @@ class PipelineDiscovery(unittest.TestCase):
         self.assertEqual(decision, "allow")
 
 
+class ReviewFixes(unittest.TestCase):
+    """Regressions found by an independent review of v0.5."""
+
+    def test_what_a_receiver_was_built_from_decides(self):
+        for cmd in ("km = RandomForestClassifier()\nkm.fit(X, y)", "norm_clf = SVC()\nnorm_clf.fit(X, y)",
+                    "scaler = StandardScaler()\nXs = scaler.fit_transform(X)\nmodel = make_model()\nmodel.fit(Xs, y)",
+                    "poly_reg = LinearRegression()\npoly_reg.fit(X_poly, y)", "improved_model.fit(X_train, y_train)",
+                    "encoder_net = Sequential()\nencoder_net.fit(X_train, y_train)", "m. fit(X, y)"):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(run({"command": cmd}, GATE_A)[0], "deny")
+
+    def test_training_helpers_count_as_training(self):
+        for cmd in ("cross_val_score(RandomForestClassifier(), X, y)", "cross_validate(clf, X, y)", "cross_val_predict(clf, X, y)"):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(run({"command": cmd})[0], "deny")
+                self.assertEqual(run({"command": cmd}, GATE_A)[0], "deny")
+
+    def test_final_test_call_needs_gate_c(self):
+        cmd = {"command": "score = guard.final_test(model.predict, test, target='y', metric_fn=f1)"}
+        self.assertEqual(run(cmd, GATE_AB + STEP_9)[0], "deny")
+        self.assertEqual(run(cmd, GATE_ABC + STEP_9)[0], "allow")
+
+    def test_more_ways_to_run_a_script(self):
+        rf = "from sklearn.ensemble import RandomForestClassifier\nRandomForestClassifier().fit(X, y)\n"
+        cases = (("python -m train", {"train.py": rf}), ("cd src && python train.py", {"src/train.py": rf}),
+                 ("python run.py", {"run.py": "from pkg import trainer_mod\ntrainer_mod.go()\n", "pkg/__init__.py": "",
+                                    "pkg/trainer_mod.py": rf}),
+                 ("python src/guard.py", {"src/guard.py": rf}))
+        for cmd, files in cases:
+            with self.subTest(cmd=cmd):
+                self.assertEqual(run({"command": cmd}, GATE_A, files=files)[0], "deny")
+
+    def test_indirect_state_writes(self):
+        for cmd in ("python -c \"open('ml_pipeline/.appr'+'ovals.json','w').write('{}')\"",
+                    "python -c \"import guard; (Path('ml_pipeline')/guard.APPROVALS_FILE).write_text('{}')\"",
+                    "python -c \"import guard; guard._write_state('ml_pipeline', {'test_touches': 0})\"",
+                    "python -c \"import record_approval as r; r.record(Path('ml_pipeline'), ['B'], [], 'x', None)\""):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(run({"command": cmd}, GATE_A)[0], "deny")
+        files = {"helper.py": "import json\njson.dump({}, open('ml_pipeline/.approvals.json', 'w'))\n"}
+        self.assertEqual(run({"command": "python helper.py"}, GATE_A, files=files)[0], "deny")
+
+    def test_indirect_step_line_is_checked(self):
+        cmd = {"command": "python -c \"open('ml_pipeline/PIPELINE'+'.md','a').write('- Step 9 done: x')\""}
+        self.assertEqual(run(cmd, GATE_A)[0], "deny")
+
+    def test_git_restore_of_the_pipeline_folder(self):
+        self.assertEqual(run({"command": "git checkout gate-C -- ml_pipeline/"}, GATE_A)[0], "deny")
+        self.assertEqual(run({"command": "git reset --hard HEAD~1"}, GATE_A)[0], "deny")
+        self.assertEqual(run({"command": "git checkout -b experiment"}, GATE_A)[0], "allow")
+
+    def test_ordinary_names_are_not_the_test_split(self):
+        md = GATE_AB + STEP_9
+        for cmd in ("LogisticRegression().fit(train[['age','lab_test']], train.y)",
+                    "LogisticRegression().fit(df[df.split != 'test'], y)",
+                    "for train_index, test_index in kf.split(X_train):\n    clf.score(X_train[test_index], y_train[test_index])"):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(run({"command": cmd}, md)[0], "allow")
+
+    def test_not_in_a_reason_does_not_cancel_the_line(self):
+        md = GATE_A + "- Override: Gate B - user approved skipping 2026-09-17 - reason: data is not changing\n"
+        self.assertEqual(run({"command": "clf.fit(X_train, y_train)"}, md)[0], "allow")
+        md = GATE_A + "- Gate B: approved 2026-09-17 (user: drop zip code, it is not stable)\n"
+        self.assertEqual(run({"command": "LogisticRegression().fit(X_train, y_train)"}, md)[0], "allow")
+
+    def test_words_like_dd_and_rm_in_a_ledger_line(self):
+        md = LEDGER_A + STEPS_A + CONTRACT + "- Gate A: approved 2026-09-16\n"
+        files = ARTIFACTS_A
+        for note in ("parsed dates as dd/mm/yyyy", "removed rm-coded rows", "mv'd nothing"):
+            with self.subTest(note=note):
+                cmd = {"command": f"echo '- Step 4 done: {note}' >> ml_pipeline/PIPELINE.md"}
+                self.assertEqual(run(cmd, md, files=files)[0], "allow")
+
+    def test_read_only_commands(self):
+        files = profile_with(has_datetime=True)
+        for cmd in ("cat ml_pipeline/.approvals.json | jq .", "grep test_touches ml_pipeline/.guard_state.json",
+                    "grep -n -- '- Step 4 done: ' ml_pipeline/PIPELINE.md", "grep -rn 'train_test_split(' src/"):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(run({"command": cmd}, GATE_A, files=files)[0], "allow")
+        self.assertEqual(run({"command": "cat x | python train.py"}, GATE_A, files={"train.py": "clf.fit(X, y)"})[0], "deny")
+
+    def test_np_fmin_is_not_tuning(self):
+        self.assertEqual(run({"command": "np.fmin(a, b)"}, "# Pipeline\n")[0], "allow")
+
+    def test_short_train_names_for_resampling(self):
+        self.assertEqual(run({"command": "SMOTE().fit_resample(X_tr, y_tr)"}, GATE_AB, files=profile_with())[0], "allow")
+
+    def test_plot_titles_are_not_models(self):
+        cmd = "LogisticRegression().fit(X_train, y_train)\nplt.title('Logistic Regression vs Random Forest')"
+        self.assertEqual(run({"command": cmd}, GATE_AB)[0], "allow")
+
+    def test_scaling_for_an_eda_embedding(self):
+        self.assertEqual(run({"command": "Xs = StandardScaler().fit_transform(X)\nemb = TSNE(2).fit_transform(Xs)"}, "# P\n")[0], "allow")
+        self.assertEqual(run({"command": "StandardScaler().fit(X)"}, "# P\n")[0], "deny")
+
 class FailOpen(unittest.TestCase):
     def test_garbage_stdin_allows_and_reports(self):
         out = io.StringIO()

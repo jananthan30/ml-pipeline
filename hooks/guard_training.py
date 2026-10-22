@@ -42,7 +42,7 @@ RUNS_FILE = "runs.jsonl"
 
 # ------------------------------------------------------------------ detection
 # `<receiver>.fit(` where receiver is `name` or `Name(...)`; also partial_fit, fit_transform, fit_predict.
-FIT_CALL = re.compile(r"(?:\b([A-Za-z_]\w*)\s*(?:\([^()]*\))?)?\.(?:partial_)?fit(?:_transform|_predict)?\s*\(")
+FIT_CALL = re.compile(r"(?:\b([A-Za-z_]\w*)\s*(?:\([^()]*\))?)?\.\s*(?:partial_)?fit(?:_transform|_predict)?\s*\(")
 # The fit method taken as a value (`f = clf.fit`, `getattr(clf, "fit")`): a way to call it unseen.
 FIT_REF = re.compile(r"\b([A-Za-z_]\w*)\s*\.\s*(?:partial_)?fit(?:_transform|_predict)?\b(?!\s*\()")
 GETATTR_FIT = re.compile(r"getattr\s*\(\s*([A-Za-z_]\w*)\s*,\s*[\"'](?:partial_)?fit(?:_transform|_predict)?[\"']")
@@ -51,10 +51,15 @@ TRAIN_API = re.compile(
     r"\b(?:xgb|xgboost|lgb|lightgbm|catboost)\.(?:train|cv)\s*\(|\btrainer\.train\s*\(|\bTrainer\s*\(|"
     r"\.fit_generator\s*\(|\.fit_one_cycle\s*\(|\bloss\.backward\s*\(|\boptimizer\.step\s*\("
 )
+# Helpers that fit a model inside them (cross-validation, learning curves).
+TRAIN_HELPER = re.compile(r"\b(?:cross_val_score|cross_validate|cross_val_predict|learning_curve|validation_curve|"
+                          r"permutation_test_score)\s*\(")
+# The guard library's step 14 call scores the frozen test set.
+FINAL_TEST_CALL = re.compile(r"\bfinal_test\s*\(")
 # Hyperparameter search: step 11, after the candidates of step 10.
 TUNING = re.compile(
     r"\b(?:GridSearchCV|RandomizedSearchCV|HalvingGridSearchCV|HalvingRandomSearchCV|BayesSearchCV|TuneSearchCV)\s*\(|"
-    r"\boptuna\.create_study\s*\(|\.optimize\s*\(\s*\w+|\btune\.(?:run|Tuner)\s*\(|\bhyperopt\.fmin\s*\(|\bfmin\s*\("
+    r"\boptuna\.create_study\s*\(|\.optimize\s*\(\s*\w+|\btune\.(?:run|Tuner)\s*\(|\bhyperopt\.fmin\s*\(|(?<![\w.])fmin\s*\("
 )
 # Evaluating a model: predict/score methods and the usual sklearn metric functions.
 EVAL_CALL = re.compile(
@@ -79,9 +84,11 @@ TRANSFORMER = re.compile(
     r"\b\w*(?:Scaler|Imputer|Encoder|Vectorizer|PCA|Normalizer|Binarizer|Discretizer|"
     r"Transformer|SelectKBest|TruncatedSVD|PolynomialFeatures)\w*\b"
 )
+_VAR_SUFFIX = r"(?:_?\d+|_(?:num|cat|x|y|text|txt|feat|features?|cols?|train|all|in|out))?"
 TRANSFORMER_VAR = re.compile(
-    r"^(?:scaler|scale|std|mms|imputer|imp|encoder|enc|ohe|ordinal|vectorizer|vec|tfidf|"
-    r"svd|preproc|preprocessor|prep|ct|transformer|selector|poly|binner|pipe_prep)\w*$",
+    r"^(?:scaler|std_?scaler|mms|imputer|imp|encoder|enc|ohe|ordinal_?encoder|vectorizer|vec|tfidf|svd|preproc|"
+    r"preprocessor|prep|ct|col_?transformer|transformer|selector|poly|poly_?features|binner|pipe_prep)" + _VAR_SUFFIX + r"$"
+    r"|^\w+_(?:scaler|imputer|encoder|vectorizer|tfidf|preprocessor|transformer|selector)$",
     re.I,
 )
 # Unsupervised fits that EDA needs (embeddings, clustering, outlier scores, distribution fits).
@@ -91,14 +98,15 @@ EXPLORATORY = re.compile(
     r"IsolationForest|LocalOutlierFactor|EllipticEnvelope|lowess)\b|\bstats\.\w+\b"
 )
 EXPLORATORY_VAR = re.compile(
-    r"^(?:tsne|umap|reducer|embedder|kmeans|km|clusterer|cluster\w*|gmm|kde|iforest|iso_forest|lof|pca|"
-    r"norm|lognorm|expon|gamma|beta|weibull_min|weibull_max|pareto|poisson|nbinom|lowess)\w*$",
+    r"^(?:tsne|umap|reducer|embedder|kmeans|km|clusterer|clustering|gmm|kde|iforest|iso_forest|lof|pca|"
+    r"norm|lognorm|expon|gamma|beta|weibull_min|weibull_max|pareto|poisson|nbinom|lowess)(?:_?\d+|_[23]d)?$",
     re.I,
 )
-_TEST_WORDS = (r"\w+_test|test_(?!size\b|ratio\b|frac\w*\b|split\b|fraction\b)\w+|test|"
+_TEST_WORDS = (r"\w+_test|test_(?!size\b|ratio\b|frac\w*\b|split\b|fraction\b|index\b|idx\b|indices\b|fold\w*\b|ids?\b)\w+|test|"
                r"\w*hold_?out\w*|[A-Za-z]+_te|te_[A-Za-z]+|\w+_tst|test[A-Z]\w*|[A-Za-z]+Test\b")
 TEST_SPLIT = re.compile(r"\b(?:" + _TEST_WORDS + r")\b")
 COMMENT = re.compile(r"#[^\n]*")
+STRING = re.compile(r"'[^'\n]*'|\"[^\"\n]*\"")
 
 
 def _test_split_pattern() -> re.Pattern:
@@ -124,12 +132,22 @@ def _norm(what: str) -> str:
     return re.sub(r"\s+", " ", what.strip().lower())
 
 
+def _status_part(line: str) -> str:
+    """The part of a ledger line that states its status: up to 'approved', before any free-text reason."""
+    cut = len(line)
+    for marker in (re.search(r"\breason\b", line, re.I), re.search(r"[(\[]", line)):
+        if marker:
+            cut = min(cut, marker.start())
+    approved = APPROVED.search(line[:cut])
+    return line[: approved.end()] if approved else line[:cut]
+
+
 def override_targets(text: str) -> list[str]:
     """Normalized override targets ('gate b', 'red flag x', 'final test') on non-negated override lines."""
     out = []
     for line in OVERRIDE_ANY.finditer(text):
         m = OVERRIDE_TARGET.search(line.group(0))
-        if m and not NEGATED.search(line.group(0)):
+        if m and not NEGATED.search(_status_part(line.group(0))):
             out.append(_norm(m.group(1)))
     return out
 
@@ -246,7 +264,7 @@ def approved_gates_in(text: str) -> list[str]:
     gates = []
     for match in GATE_LINE.finditer(text):
         line = match.group(0)
-        if APPROVED.search(line) and not NEGATED.search(line) and not OVERRIDE_ANY.match(line):
+        if APPROVED.search(line) and not NEGATED.search(_status_part(line)) and not OVERRIDE_ANY.match(line):
             gates.append(match.group(1).upper())
     return gates
 
@@ -397,7 +415,7 @@ def _load_profile(state_dir: Path) -> dict | None:
 
 
 def overridden_flags(markdown: str, approvals: dict | None = None) -> set[str]:
-    flags = {m.group(1).lower() for m in OVERRIDE_FLAG.finditer(markdown) if not NEGATED.search(m.group(0))}
+    flags = {m.group(1).lower() for m in OVERRIDE_FLAG.finditer(markdown) if not NEGATED.search(_status_part(m.group(0)))}
     if approvals is not None:
         flags = {f for f in flags if user_overrode(approvals, f"red flag {f}")}
     return flags
@@ -417,7 +435,7 @@ def red_flag(code: str, traits: dict, overrides: set[str]) -> str | None:
         return RED_FLAG_MSG.format(name, why.format(**values))
     if "resample-before-split" not in overrides:
         for match in RESAMPLE.finditer(code):
-            if "train" not in match.group(1).lower():
+            if not re.search(r"train|\btr_|_tr\b|\btrn\b|_trn\b", match.group(1), re.I):
                 return RED_FLAG_MSG.format("resample-before-split",
                                            f"resampling must fit on the training split only ({match.group(0)[:60]}) - split first, then fit_resample(X_train, y_train)")
     return None
@@ -460,9 +478,22 @@ RUNNER = re.compile(
 DATA_SUFFIXES = {".csv", ".tsv", ".parquet", ".pq", ".feather", ".arrow", ".pkl", ".pickle", ".joblib", ".pt", ".pth",
                  ".h5", ".hdf5", ".npy", ".npz", ".zip", ".gz", ".bz2", ".xz", ".png", ".jpg", ".jpeg", ".gif", ".pdf",
                  ".onnx", ".bin", ".safetensors", ".db", ".sqlite"}
-GUARD_MODULES = {"guard.py", "mlpipeline_guard.py", "mlpipeline_canary.py"}
-IMPORT_LINE = re.compile(r"^\s*(?:from\s+([\w.]+)\s+import\b|import\s+([\w.]+(?:\s*,\s*[\w.]+)*))", re.M)
-MAX_FILES, MAX_BYTES = 25, 5_000_000
+# The plugin's own libraries are recognized by their opening docstring, not their file name.
+GUARD_MARKERS = (b"Runtime guard for the ml-pipeline skill", b"A dataset with a known ceiling: beat it and you leaked")
+IMPORT_LINE = re.compile(r"^[ \t]*(?:from[ \t]+([\w.]+)[ \t]+import[ \t]+(?:\(([^)]*)\)|([\w \t,]+))|import[ \t]+([\w.]+(?:[ \t]*,[ \t]*[\w.]+)*))", re.M)
+MODULE_FLAG = re.compile(r"(?:^|\s)-m\s+([\w.]+)")
+CD = re.compile(r"^\s*(?:pushd|cd)\s+([\"']?)([^\"';&|]+)\1\s*$")
+SEGMENT = re.compile(r"&&|\|\||;|\n")
+MAX_FILES, MAX_BYTES = 40, 5_000_000
+
+
+def _is_guard_lib(path: Path) -> bool:
+    try:
+        with path.open("rb") as fh:
+            head = fh.read(400)
+    except OSError:
+        return False
+    return any(marker in head for marker in GUARD_MARKERS)
 
 
 def _read_source(path: Path) -> str:
@@ -492,47 +523,79 @@ def _candidate_paths(command: str) -> list[str]:
     return out
 
 
+def _module_files(name: str, roots: list[Path]) -> list[Path]:
+    parts = name.split(".")
+    out = []
+    for root in roots:
+        out += [root.joinpath(*parts).with_suffix(".py"), root.joinpath(*parts, "__main__.py"),
+                root.joinpath(*parts, "__init__.py")]
+    return out
+
+
+def _take(path: Path, seen: set, sources: list[str]) -> str | None:
+    """Read ``path`` once (bounded) unless it is data or the plugin's own library."""
+    try:
+        if not path.is_file() or path.suffix.lower() in DATA_SUFFIXES:
+            return None
+        path = path.resolve()
+        if path in seen or len(seen) >= MAX_FILES or path.stat().st_size > MAX_BYTES or _is_guard_lib(path):
+            return None
+    except OSError:
+        return None
+    seen.add(path)
+    text = _read_source(path)
+    sources.append(text)
+    return text
+
+
 def executed_sources(command: str, cwd: str, depth: int = 2, seen: set | None = None) -> list[str]:
-    """Contents of local scripts/notebooks a shell command runs, and the local modules they import."""
+    """Contents of local scripts/notebooks a shell command runs, and the local modules they import.
+
+    Follows `cd dir && ...`, `python -m pkg.mod`, `from pkg import mod`, `exec(open(...))`, and shell
+    scripts that run other scripts (``depth`` levels).
+    """
     seen = set() if seen is None else seen
     if depth < 0 or not RUNNER.search(command):
         return []
     base = Path(cwd or ".")
     sources: list[str] = []
-    for tok in _candidate_paths(command):
-        path = Path(tok) if Path(tok).is_absolute() else base / tok
-        try:
-            if not path.is_file() or path.suffix.lower() in DATA_SUFFIXES or path.name in GUARD_MODULES:
-                continue
-            path = path.resolve()
-            if path in seen or len(seen) >= MAX_FILES or path.stat().st_size > MAX_BYTES:
-                continue
-        except OSError:
+    for segment in SEGMENT.split(command):
+        cd = CD.match(segment)
+        if cd:
+            target = Path(os.path.expanduser(cd.group(2).strip()))
+            base = target if target.is_absolute() else base / target
             continue
-        seen.add(path)
-        text = _read_source(path)
-        sources.append(text)
-        sources += _imported_sources(text, path.parent, base, seen)
-        sources += executed_sources(text, str(path.parent), depth - 1, seen)
+        if not RUNNER.search(segment):
+            continue
+        paths = [Path(t) if Path(t).is_absolute() else base / t for t in _candidate_paths(segment)]
+        for name in MODULE_FLAG.findall(segment):
+            paths += _module_files(name, [base, Path(cwd or ".")])
+        for path in paths:
+            text = _take(path, seen, sources)
+            if text is None:
+                continue
+            here = path.resolve().parent
+            sources += _imported_sources(text, here, base, seen)
+            sources += executed_sources(text, str(here), depth - 1, seen)
     return sources
 
 
-def _imported_sources(text: str, here: Path, base: Path, seen: set) -> list[str]:
-    out = []
+def _imported_sources(text: str, here: Path, base: Path, seen: set, depth: int = 2) -> list[str]:
+    if depth < 0:
+        return []
+    out: list[str] = []
     for match in IMPORT_LINE.finditer(text):
-        names = [match.group(1)] if match.group(1) else [n.strip() for n in match.group(2).split(",")]
-        for name in names:
-            parts = name.split(".")
-            for root in (here, base):
-                for candidate in (root.joinpath(*parts).with_suffix(".py"), root.joinpath(*parts, "__init__.py")):
-                    try:
-                        if candidate.is_file() and candidate.name not in GUARD_MODULES:
-                            resolved = candidate.resolve()
-                            if resolved not in seen and len(seen) < MAX_FILES and resolved.stat().st_size <= MAX_BYTES:
-                                seen.add(resolved)
-                                out.append(_read_source(resolved))
-                    except OSError:
-                        continue
+        if match.group(1):
+            listed = match.group(2) if match.group(2) is not None else match.group(3)
+            names = [n.split()[0] for n in listed.replace("\n", " ").split(",") if n.strip()]
+            candidates = [match.group(1)] + [f"{match.group(1)}.{n}" for n in names]
+        else:
+            candidates = [n.strip() for n in match.group(4).split(",")]
+        for name in candidates:
+            for path in _module_files(name, [here, base]):
+                found = _take(path, seen, out)
+                if found is not None:
+                    out += _imported_sources(found, path.resolve().parent, base, seen, depth - 1)
     return out
 
 
@@ -552,29 +615,52 @@ def _args(text: str, start: int, limit: int = 400) -> str:
     return text[start:i]
 
 
-def _classify(receiver: str, before: str, args: str) -> str:
-    """'explore', 'transformer', or 'model' for a fit call.
+def _constructor(receiver: str, code_before: str) -> str | None:
+    """'Name(args...)' from the last `receiver = Name(...)` before the call, or None."""
+    if not receiver:
+        return None
+    last = None
+    for m in re.finditer(r"(?<![\w.])" + re.escape(receiver) + r"\s*=\s*([A-Za-z_][\w.]*)\s*\(", code_before):
+        last = m
+    if last is None:
+        return None
+    return last.group(1) + "(" + _args(code_before, last.end())
 
-    Unknown receivers (``model.fit``, ``clf.fit``) count as models: the conservative reading is the
-    one that keeps the test set honest.
+
+def _classify(receiver: str, code_before: str = "") -> str:
+    """'explore', 'transformer', or 'model' for a fit on ``receiver``.
+
+    What the receiver was built from decides first (`km = RandomForestClassifier()` is a model whatever
+    its name), then the receiver's own name. Anything unknown counts as a model: the conservative
+    reading is the one that keeps the test set honest.
     """
+    built = _constructor(receiver, code_before)
+    if built is not None:
+        name = built.split("(", 1)[0].split(".")[-1]
+        if ESTIMATOR.search(built) or TRAIN_HELPER.search(built):
+            return "model"
+        if EXPLORATORY.fullmatch(name) or EXPLORATORY.search(built.split("(", 1)[0]):
+            return "explore"
+        if TRANSFORMER.search(built):
+            return "transformer"
+        return "model"
+    if ESTIMATOR.search(receiver):
+        return "model"
     if EXPLORATORY_VAR.match(receiver) or (receiver and EXPLORATORY.fullmatch(receiver)):
         return "explore"
     if TRANSFORMER_VAR.match(receiver) or TRANSFORMER.search(receiver):
         return "transformer"
-    if ESTIMATOR.search(receiver):
-        return "model"
-    context = before + args
-    if EXPLORATORY.search(context) and not ESTIMATOR.search(context):
-        return "explore"
-    if TRANSFORMER.search(context) and not ESTIMATOR.search(context):
-        return "transformer"
     return "model"
+
+
+def _code(text: str) -> str:
+    """Code to scan: comments removed, and literal \\n / \\t (one-line `python -c "a\\nb"`) turned into real ones."""
+    return COMMENT.sub("", text.replace("\\n", "\n").replace("\\t", "\t"))
 
 
 def analyse(text: str) -> dict[str, str | None]:
     """First matching snippet for each kind of finding, or None."""
-    code = COMMENT.sub("", text)
+    code = _code(text)
     test_split = _test_split_pattern()
     found: dict[str, str | None] = {"model": None, "transformer": None, "explore": None, "fit_on_test": None,
                                     "eval_on_test": None, "tuning": None, "non_baseline": None}
@@ -584,29 +670,35 @@ def analyse(text: str) -> dict[str, str | None]:
     for match in FIT_CALL.finditer(code):
         args = _args(code, match.end())
         snippet = code[match.start(): match.end() + len(args) + 1][:SNIPPET]
-        if test_split.search(args) and found["fit_on_test"] is None:
+        if test_split.search(STRING.sub('""', args)) and found["fit_on_test"] is None:
             found["fit_on_test"] = snippet
-        kind = _classify(match.group(1) or "", code[max(0, match.start() - 200): match.start()], args)
+        kind = _classify(match.group(1) or "", code[: match.start()])
         if found[kind] is None:
             found[kind] = snippet
     for pattern in (GETATTR_FIT, FIT_REF):
         for match in pattern.finditer(code):
-            kind = _classify(match.group(1) or "", code[max(0, match.start() - 200): match.start()], "")
+            kind = _classify(match.group(1) or "", code[: match.start()])
             if found[kind] is None:
                 found[kind] = code[match.start(): match.end()][:SNIPPET]
+    helper = TRAIN_HELPER.search(code)
+    if helper:
+        found["model"] = found["model"] or helper.group(0)
     tuning = TUNING.search(code)
     if tuning:
         found["tuning"] = tuning.group(0)
         found["model"] = found["model"] or tuning.group(0)
     if found["model"]:
-        for match in ESTIMATOR.finditer(code):
+        for match in ESTIMATOR.finditer(STRING.sub('""', code)):  # a plot title saying "Regression" is not a model
             if not BASELINE.fullmatch(match.group(0)) and not re.fullmatch(r"\w*(?:Transformer|Encoder)\w*", match.group(0)):
                 found["non_baseline"] = found["non_baseline"] or match.group(0)
                 break
     for match in EVAL_CALL.finditer(code):
         args = _args(code, match.end())
-        if test_split.search(args) and found["eval_on_test"] is None:
+        if test_split.search(STRING.sub('""', args)) and found["eval_on_test"] is None:
             found["eval_on_test"] = code[match.start(): match.end() + len(args) + 1][:SNIPPET]
+    final = FINAL_TEST_CALL.search(code)
+    if final and found["eval_on_test"] is None:
+        found["eval_on_test"] = code[final.start(): final.end() + 60][:SNIPPET]
     return found
 
 
@@ -671,27 +763,48 @@ def decide(found: dict[str, str | None], gates: dict[str, bool] | None, steps: d
         return None
     if gates["A"]:
         return (GATE_B_MSG.format(found["model"]) + _proof_hint(gates, "B")) if found["model"] else None
+    if not found["model"] and found.get("explore"):
+        return None  # scaling only to feed an EDA embedding/clustering (e.g. StandardScaler -> t-SNE) is exploration
     return GATE_A_MSG.format(found["model"] or found["transformer"]) + _proof_hint(gates, "A")
 
 
 # ------------------------------------------------------------------ tamper protection
-PROTECTED_NAME = re.compile(r"\.guard_state\.json|\.approvals\.json")
-READ_ONLY_CMD = re.compile(r"^\s*(?:cat|less|more|head|tail|jq|ls|stat|wc|file)\b[^;&|<>`$()]*$")
-DESTRUCTIVE = re.compile(r"\bsed\s+(?:-\w*\s+)*-\w*i|\bperl\s+-\w*i|\brm\b|\bmv\b|\btruncate\b|\bdd\b|"
-                         r"\bcp\b[^\n;&|]*PIPELINE\.md\s*(?:$|[;&|])|"
-                         r"\btee\s+(?!-a\b)(?!--append\b)[^\n;&|]*PIPELINE\.md|"
-                         r"(?<![>&])>(?!>)\s*[\"']?[^\s|;&]*PIPELINE\.md|\bopen\s*\([^)]*PIPELINE\.md[^)]*[\"'][wx]|"
-                         r"PIPELINE\.md[^\n]*\.write_text\s*\(|\bgit\s+(?:checkout|restore|reset|stash)\b")
+# The state files by name, by the library's constants and writers, and by common string-splitting.
+PROTECTED_NAME = re.compile(
+    r"\.guard_state\.json|\.approvals\.json|\bAPPROVALS_FILE\b|\bSTATE_FILE\b|\b_write_state\s*\(|\brecord_approval\b|"
+    r"[\"'][^\"'\n]*(?:\.appr|approvals?\.js|guard_st|_state\.js)[^\"'\n]*[\"']"
+)
+READ_ONLY_TOOL = re.compile(r"^\s*(?:cat|less|more|head|tail|jq|ls|stat|wc|file|grep|egrep|fgrep|rg|sort|uniq|cut|column|"
+                            r"diff|echo|printf|pwd|which|du|df|tree|basename|dirname|realpath|nl)\b")
+DESTRUCTIVE_CMD = re.compile(r"(?:^|[;&|(`]\s*|\bsudo\s+|\bxargs\s+)(?:rm|mv|dd|truncate|shred|unlink)\s|"
+                             r"\bsed\s+(?:-\w*\s+)*-\w*i|\bperl\s+-\w*i|\bcp\b[^\n;&|]*PIPELINE\.md\s*(?:$|[;&|])|"
+                             r"\btee\s+(?!-a\b)(?!--append\b)[^\n;&|]*PIPELINE\.md")
+DESTRUCTIVE_WRITE = re.compile(r"(?<![>&\d])>(?!>)\s*[\"']?[^\s|;&]*PIPELINE\.md|\bopen\s*\([^)]*PIPELINE\.md[^)]*[\"'][wx]|"
+                               r"PIPELINE\.md[^\n]*\.write_text\s*\(")
+GIT_RESTORE = re.compile(r"(?:^|[;&|(]\s*)git\s+(?:checkout|restore|reset|stash|clean|switch)\b[^\n;&|]*")
 
 
-def protected_violation(tool_name: str, tool_input: dict, cwd: str = "") -> str | None:
-    """Deny edits to the guard's state files and deletion of recorded PIPELINE.md lines."""
-    texts = _all_strings(tool_input)
+def read_only_command(command: str) -> bool:
+    """A command made only of reading tools: no redirection, substitution, or execution."""
+    if not command.strip() or re.search(r"(?<![\d&])>|`|\$\(|<\(", command):
+        return False
+    if re.search(r"\bfind\b.*-(?:exec|delete|ok)\b", command):
+        return False
+    return all(READ_ONLY_TOOL.match(part) for part in re.split(r"\|\|?|&&|;|\n", command) if part.strip())
+
+
+def _ledger_recorded(cwd: str) -> bool:
+    ledger = find_pipeline(cwd)
+    return ledger is not None and bool(PROTECTED_LINE.search(ledger.read_text(encoding="utf-8", errors="replace")))
+
+
+def protected_violation(tool_name: str, tool_input: dict, cwd: str = "", executed: list[str] | None = None) -> str | None:
+    """Deny writes to the guard's state files and deletion of recorded PIPELINE.md lines."""
     command = str(tool_input.get("command") or "")
-    for text in texts:
+    for text in _all_strings(tool_input) + list(executed or []):
         match = PROTECTED_NAME.search(text)
-        if match and not (command and text == command and READ_ONLY_CMD.match(command)):
-            return PROTECTED_MSG.format(match.group(0))
+        if match:
+            return PROTECTED_MSG.format(match.group(0).strip("'\""))
     target = str(tool_input.get("file_path") or tool_input.get("notebook_path") or "")
     if target.endswith("PIPELINE.md"):
         edits = tool_input.get("edits") if isinstance(tool_input.get("edits"), list) else []
@@ -707,11 +820,18 @@ def protected_violation(tool_name: str, tool_input: dict, cwd: str = "") -> str 
             lost = [m.group(0).strip() for m in PROTECTED_LINE.finditer(existing) if m.group(0).strip() not in tool_input["content"]]
             if lost:
                 return LEDGER_MSG.format(lost[0][:80])
-    if command and "PIPELINE.md" in command and DESTRUCTIVE.search(command):
-        ledger = find_pipeline(cwd)
-        recorded = ledger is not None and PROTECTED_LINE.search(ledger.read_text(encoding="utf-8", errors="replace"))
-        if recorded:  # creating or rewriting a ledger with nothing recorded yet is fine
-            return LEDGER_MSG.format("shell command rewrites, moves, or deletes PIPELINE.md")
+    if command:
+        unquoted = STRING.sub("''", command)
+        rewrites = "PIPELINE.md" in command and (DESTRUCTIVE_CMD.search(unquoted) or DESTRUCTIVE_WRITE.search(command))
+        restore = GIT_RESTORE.search(command)
+        restores_state = restore and re.search(r"ml_pipeline|--hard|\s--\s+\.|\bclean\b|\bstash\b", restore.group(0))
+        if (rewrites or restores_state) and _ledger_recorded(cwd):  # a ledger with nothing recorded yet is fair game
+            what = "shell command rewrites, moves, or deletes PIPELINE.md" if rewrites else \
+                "git would restore ml_pipeline/ to an older state (resetting the test-set count and approvals)"
+            return LEDGER_MSG.format(what)
+    for source in executed or []:
+        if "PIPELINE.md" in source and DESTRUCTIVE_WRITE.search(source) and _ledger_recorded(cwd):
+            return LEDGER_MSG.format("a script this command runs rewrites PIPELINE.md")
     return None
 
 
@@ -731,11 +851,10 @@ def _after_text(tool_input: dict, existing: str, text: str) -> str:
 def recording_problem(tool_input: dict, text: str, cwd: str) -> str | None:
     """Recording a gate, override, or step line in PIPELINE.md: the prerequisites must already hold."""
     target = str(tool_input.get("file_path") or tool_input.get("notebook_path") or "")
-    command = tool_input.get("command")
     if target and not target.endswith("PIPELINE.md"):
-        return None
-    if not target and not (isinstance(command, str) and "PIPELINE.md" in command):
-        return None
+        return None  # a step or gate line in another file is not a recording
+    if not target and not (STEP_LINE.search(text) or GATE_LINE.search(text) or OVERRIDE_ANY.search(text)):
+        return None  # shell commands are checked whatever file name they spell, since names can be built
     state_dir = _state_dir_for(tool_input, cwd)
     pipeline_md = state_dir / "PIPELINE.md"
     existing = pipeline_md.read_text(encoding="utf-8", errors="replace") if pipeline_md.is_file() else ""
@@ -787,22 +906,25 @@ def main() -> int:
         tool_name = str(payload.get("tool_name") or "")
         cwd = payload.get("cwd") or os.getcwd()
         text = "\n".join(_strings(tool_input))
+        command = tool_input.get("command") if isinstance(tool_input.get("command"), str) else None
+        # Reading (cat, grep, jq, ...) changes nothing and runs nothing.
+        if command is not None and read_only_command(command):
+            return _emit(None)
+        # Shell commands are judged with the local scripts, notebooks and modules they run.
+        executed = executed_sources(command, cwd) if command is not None else []
         # 0. The guard's own state and the ledger's recorded lines are not editable.
-        reason = protected_violation(tool_name, tool_input, cwd)
+        reason = protected_violation(tool_name, tool_input, cwd, executed)
         if reason:
             return _emit(reason)
         # 1. Recording a gate, override, or step: its prerequisites must already hold.
-        reason = recording_problem(tool_input, text, cwd)
+        reason = recording_problem(tool_input, "\n".join([text, *executed]), cwd)
         if reason:
             return _emit(reason)
-        # 2. Prose files are not code (running one is checked below, when a command executes it).
+        # 2. Prose files are not code (running one is checked when a command executes it).
         target = str(tool_input.get("file_path") or tool_input.get("notebook_path") or "")
         if target and Path(target).suffix.lower() in DOC_SUFFIXES:
             return _emit(None)
-        # 2a. Shell commands: also read the local scripts and notebooks they run.
-        command = tool_input.get("command")
-        if isinstance(command, str):
-            text = "\n".join([text, *executed_sources(command, cwd)])
+        text = "\n".join([text, *executed])
         # 2b. Red flags: wrong applications the data profile can prove.
         state_dir = _state_dir_for(tool_input, cwd)
         pipeline = find_pipeline(cwd)
@@ -813,12 +935,13 @@ def main() -> int:
         overrides = overridden_flags(markdown, approvals)
         profile = _load_profile(state_dir)
         if profile is not None:
-            reason = red_flag(COMMENT.sub("", text), profile.get("traits") or {}, overrides)
+            reason = red_flag(_code(text), profile.get("traits") or {}, overrides)
             if reason:
                 return _emit(reason)
         # 3. Fast path: nothing to look at.
         if (not re.search(r"\.fit\b|fit\w*\s*\(|fit[\"']", text) and not TRAIN_API.search(text)
-                and not EVAL_CALL.search(text) and not TUNING.search(text)):
+                and not EVAL_CALL.search(text) and not TUNING.search(text) and not TRAIN_HELPER.search(text)
+                and not FINAL_TEST_CALL.search(text)):
             return _emit(None)
         found = analyse(text)
         if not any(found.values()):

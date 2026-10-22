@@ -91,6 +91,11 @@ accuracy. Beat it and you leaked. `ML_PIPELINE_ENFORCE=0` switches enforcement o
 projects; `ML_PIPELINE_TEST_NAMES=X_lockbox,y_lockbox` teaches the hook your own test-set names.
 Codex and Kimi get the same rules as instructions (no hook support there).
 
+The hooks stop an agent from skipping steps by accident or by habit, and from the common shortcuts
+(running a hidden script, renaming the test set, editing its own approvals). They are pattern checks,
+not a sandbox: code built specifically to evade them can still run. For a hard boundary, run the agent
+without direct write access to `ml_pipeline/.approvals.json` and `.guard_state.json`.
+
 ## Development
 
 ```bash

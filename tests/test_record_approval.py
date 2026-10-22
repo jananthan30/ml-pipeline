@@ -38,6 +38,17 @@ class Parse(unittest.TestCase):
         self.assertEqual(hook.parse("yes", "Gate B report attached."), ([], []))
         self.assertEqual(hook.parse("yes"), ([], []))
 
+    def test_questions_and_mentions_are_not_approvals(self):
+        for prompt in ("Is gate B ok?", "ok, what does gate C require?", "Yes please explain gate B first",
+                       "go ahead and fix the bug, then we'll talk about gate B",
+                       "approval for gate B depends on the split, show me the figures"):
+            with self.subTest(prompt=prompt):
+                self.assertEqual(hook.parse(prompt), ([], []))
+
+    def test_bare_yes_needs_an_approval_question(self):
+        self.assertEqual(hook.parse("yes", "Steps 4-8 come next, then Gate B. Shall I start cleaning?"), ([], []))
+        self.assertEqual(hook.parse("ok", "I won't override red flag group-split unless you say so. Want me to continue?"), ([], []))
+
     def test_long_or_negated_yes_is_nothing(self):
         self.assertEqual(hook.parse("yes but not yet, first check the outliers", ASK_B), ([], []))
 

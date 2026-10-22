@@ -49,7 +49,8 @@ At each gate, STOP and give the user, in plain non-jargon language:
    Silence, ambiguity, or "hmm" is not a yes. If the user redirects, incorporate it.
 
 **Only the user can approve a gate.** In Claude Code a hook records approvals from the user's own
-messages ("approve gate B", "gate B approved", or a plain "yes" right after you asked about Gate B)
+messages ("approve gate B", "gate B approved", or a plain "yes" when your last question was
+"Do you approve Gate B?"; questions and passing mentions of a gate never count)
 in `ml_pipeline/.approvals.json`. A gate line you write without that record does not count, and the
 hook refuses to record it. Never write, edit, move, or delete `.approvals.json` or `.guard_state.json`.
 
@@ -165,7 +166,8 @@ Model rationale:
    approve this contract at Gate A** — it controls everything after. Consult
    `references/model-selection.md` with the profile's traits when choosing the metric and the
    candidate model families.
-4. **Data cleaning** — missing values, duplicates, invalid/impossible values, inconsistent
+4. **Data cleaning** — rows with no target value (the split refuses them — drop or label them here and
+   record the rule), missing values, duplicates, invalid/impossible values, inconsistent
    categories, unit/format issues. Report before/after counts for every rule. Document every
    rule in PIPELINE.md. Prefer preserving data over deleting. Never use information from the
    future or from the test rows to decide a cleaning rule.

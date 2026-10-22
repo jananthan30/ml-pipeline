@@ -607,12 +607,12 @@ class Overrides(Tmp):
         md = self.state / "PIPELINE.md"
         acc = lambda a, b: float((a == b).mean())  # noqa: E731
         pred = lambda X: np.zeros(len(X), dtype=int)  # noqa: E731
-        (self.state / guard.APPROVALS_FILE).write_text(json.dumps({"gates": {}, "overrides": []}))
+        (self.state / guard.APPROVALS_FILE).write_text(json.dumps({"gates": {"C": {}}, "overrides": []}))
         guard.final_test(pred, te, target="y", metric_fn=acc, state_dir=self.state, pipeline_md=md)
         md.write_text(md.read_text() + "- Override: final test - agent wrote this itself\n")
         with self.assertRaises(guard.TestSetAlreadyUsed):   # a ledger line alone is not the user's word
             guard.final_test(pred, te, target="y", metric_fn=acc, state_dir=self.state, pipeline_md=md)
-        (self.state / guard.APPROVALS_FILE).write_text(json.dumps({"gates": {}, "overrides": [{"what": "final test"}]}))
+        (self.state / guard.APPROVALS_FILE).write_text(json.dumps({"gates": {"C": {}}, "overrides": [{"what": "final test"}]}))
         guard.final_test(pred, te, target="y", metric_fn=acc, state_dir=self.state, pipeline_md=md)
 
     def test_resetting_state_does_not_reset_the_count(self):
@@ -634,6 +634,97 @@ class Overrides(Tmp):
         (self.state / guard.STATE_FILE).write_text(json.dumps(state))
         guard.final_test(lambda X: np.zeros(len(X), dtype=int), te, target="y", metric_fn=lambda a, b: 0.5,
                          state_dir=self.state, pipeline_md=self.state / "PIPELINE.md")
+
+
+
+# ====================================================================== review fixes
+class ReviewFixes(Tmp):
+    def test_mixed_utc_offsets_parse(self):
+        df = frame(400)
+        stamps = pd.date_range("2024-03-01", periods=400, freq="h", tz="America/New_York")   # crosses the DST change
+        df["ts"] = [t.isoformat() for t in stamps]
+        self.assertEqual(guard.datetime_columns(df), {"ts": "text"})
+        p = guard.profile(df, target="y", time_col="ts", state_dir=self.state)
+        self.assertEqual(p["columns"]["ts"]["kind"], "datetime")
+        tr, va, te = guard.split(df, target="y", time_col="ts", state_dir=self.state)
+        self.assertEqual(len(tr) + len(va) + len(te), 400)
+        guard.eda_figures(df, target="y", time_col="ts", state_dir=self.state)
+
+    def test_missing_targets_are_refused_not_dropped(self):
+        df = frame(400).astype({"y": float})
+        df.loc[:39, "y"] = np.nan
+        with self.assertRaises(ValueError):
+            guard.split(df, target="y", state_dir=self.state)
+        with self.assertRaises(ValueError):
+            guard.cv_splits(df, target="y")
+
+    def test_late_text_in_a_numeric_looking_csv_column(self):
+        df = frame(1500)
+        df["code"] = np.arange(1500).astype(str)
+        df.loc[1200, "code"] = "A12"
+        path = self.root / "late.csv"
+        df.to_csv(path, index=False)
+        saved = guard.BATCH_ROWS
+        guard.BATCH_ROWS = 500
+        try:
+            p = guard.profile(str(path), target="y", state_dir=self.state)
+            batches = list(guard.scan(str(path)))
+        finally:
+            guard.BATCH_ROWS = saved
+        self.assertEqual(p["shape"]["n_rows"], 1500)
+        self.assertEqual(batches[0]["b"].dtype, np.int64)       # integer columns stay integers
+        self.assertEqual(batches[0]["code"].dtype, object)
+
+    def test_inf_does_not_break_figures(self):
+        df = frame(500)
+        df.loc[3, "a"] = np.inf
+        p = guard.profile(df, target="y", state_dir=self.state)
+        self.assertGreater(p["columns"]["a"]["inf_frac"], 0)
+        guard.eda_figures(df, target="y", state_dir=self.state)
+
+    def test_split_to_files_unifies_late_types(self):
+        rows = [{"x": i, "note": None, "y": i % 2} for i in range(300)] + \
+               [{"x": i, "note": "text", "y": i % 2} for i in range(300, 600)]
+        path = self.root / "late.jsonl"
+        path.write_text("\n".join(json.dumps(r) for r in rows))
+        saved = guard.BATCH_ROWS
+        guard.BATCH_ROWS = 200
+        try:
+            paths = guard.split_to_files(str(path), target="y", out_dir=self.state / "s", state_dir=self.state)
+        finally:
+            guard.BATCH_ROWS = saved
+        total = sum(len(pd.read_parquet(p)) for p in paths.values())
+        self.assertEqual(total, 600)
+
+    def test_split_to_files_refuses_missing_targets(self):
+        df = frame(500).astype({"y": float})
+        df.loc[10, "y"] = np.nan
+        path = self.root / "d.parquet"
+        df.to_parquet(path, index=False)
+        with self.assertRaises(ValueError):
+            guard.split_to_files(str(path), target="y", out_dir=self.state / "s", state_dir=self.state)
+
+    def test_final_test_needs_gate_c_when_approvals_are_recorded(self):
+        tr, va, te = guard.split(frame(), target="y", state_dir=self.state)
+        (self.state / guard.APPROVALS_FILE).write_text(json.dumps({"gates": {"A": {}, "B": {}}, "overrides": []}))
+        with self.assertRaises(guard.LeakageError):
+            guard.final_test(lambda X: np.zeros(len(X)), te, target="y", metric_fn=lambda a, b: 0.0, state_dir=self.state,
+                             pipeline_md=self.state / "PIPELINE.md")
+
+    def test_another_ledger_path_does_not_reset_the_count(self):
+        tr, va, te = guard.split(frame(), target="y", state_dir=self.state)
+        acc = lambda a, b: float((a == b).mean())  # noqa: E731
+        pred = lambda X: np.zeros(len(X), dtype=int)  # noqa: E731
+        guard.final_test(pred, te, target="y", metric_fn=acc, state_dir=self.state, pipeline_md=self.state / "PIPELINE.md")
+        state = json.loads((self.state / guard.STATE_FILE).read_text())
+        state["test_touches"] = 0
+        (self.state / guard.STATE_FILE).write_text(json.dumps(state))
+        with self.assertRaises(guard.TestSetAlreadyUsed):
+            guard.final_test(pred, te, target="y", metric_fn=acc, state_dir=self.state, pipeline_md=self.root / "other.md")
+
+    def test_empty_data_is_an_error(self):
+        with self.assertRaises(ValueError):
+            guard.profile(frame(10).iloc[:0], target="y", state_dir=self.state)
 
 
 if __name__ == "__main__":

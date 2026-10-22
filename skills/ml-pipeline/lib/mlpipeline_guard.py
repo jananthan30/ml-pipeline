@@ -85,11 +85,33 @@ def _is_path(source) -> bool:
     return isinstance(source, (str, Path))
 
 
-def _csv_dtypes(path: Path, sep: str, columns) -> dict:
-    """Fix dtypes from a head sample so every CSV chunk hashes identically (int vs float drift)."""
-    head = pd.read_csv(path, sep=sep, nrows=100_000, usecols=columns, low_memory=False)
-    return {c: ("float64" if pd.api.types.is_numeric_dtype(head[c]) and not pd.api.types.is_bool_dtype(head[c])
-                else "object") for c in head.columns}
+_CSV_TYPES: dict = {}
+
+
+def _csv_dtypes(path: Path, sep: str, columns) -> tuple[dict, list]:
+    """(read dtypes, integer columns) from one pass over the WHOLE file, so a late "A12" in a numeric-looking
+    column can't break a later chunk, and every chunk hashes identically. Cached per file version."""
+    stat = path.stat()
+    key = (str(path.resolve()), stat.st_mtime_ns, stat.st_size, sep, tuple(columns) if columns else None)
+    if key in _CSV_TYPES:
+        return _CSV_TYPES[key]
+    numeric: dict = {}
+    integral: dict = {}
+    for chunk in pd.read_csv(path, sep=sep, chunksize=BATCH_ROWS, usecols=columns, dtype=str, keep_default_na=True):
+        for col in chunk.columns:
+            raw = chunk[col]
+            present = raw.notna() & (raw.str.strip() != "")
+            values = pd.to_numeric(raw.where(present), errors="coerce")
+            ok = not bool((present & values.isna()).any())
+            numeric[col] = numeric.get(col, True) and ok
+            if numeric[col]:
+                finite = values.dropna()
+                integral[col] = integral.get(col, True) and bool(np.all(np.mod(finite.to_numpy(dtype=float), 1) == 0)) \
+                    and not bool(raw.isna().any() | (~present).any())
+    dtypes = {c: ("float64" if numeric[c] else "object") for c in numeric}
+    ints = [c for c in numeric if numeric[c] and integral.get(c)]
+    _CSV_TYPES[key] = (dtypes, ints)
+    return dtypes, ints
 
 
 def scan(source, *, columns=None, batch_rows: int | None = None):
@@ -145,9 +167,9 @@ def scan(source, *, columns=None, batch_rows: int | None = None):
         return
     if suffix in (".csv", ".tsv", ".txt", ".gz", ".bz2", ".zip", ".xz"):
         sep = "\t" if ".tsv" in path.name.lower() else ","
-        dtypes = _csv_dtypes(path, sep, columns)
+        dtypes, ints = _csv_dtypes(path, sep, columns)
         for chunk in pd.read_csv(path, sep=sep, chunksize=batch_rows, usecols=columns, dtype=dtypes, low_memory=False):
-            yield chunk
+            yield chunk.astype({c: "int64" for c in ints if c in chunk.columns}) if ints else chunk
         return
     raise ValueError(f"don't know how to read {path.name}: use Parquet, CSV/TSV, JSON lines, or Feather")
 
@@ -325,13 +347,7 @@ def _datetime_source(series: pd.Series) -> str | None:
         text = head.astype(str)
         if text.str.match(_DATE_TEXT).mean() < 0.9:
             return None
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            try:
-                parsed = pd.to_datetime(text, errors="coerce", format="mixed")
-            except (TypeError, ValueError):
-                parsed = pd.to_datetime(text, errors="coerce")
-        return "text" if parsed.notna().mean() >= 0.9 else None
+        return "text" if _parse_text_dates(text).notna().mean() >= 0.9 else None
     if (pd.api.types.is_numeric_dtype(series) and not pd.api.types.is_bool_dtype(series)
             and _DATE_NAME.search(str(series.name or ""))):
         med, low = float(head.median()), float(head.min())
@@ -341,20 +357,36 @@ def _datetime_source(series: pd.Series) -> str | None:
     return None
 
 
+def _naive_utc(parsed: pd.Series) -> pd.Series:
+    if isinstance(parsed.dtype, pd.DatetimeTZDtype):
+        return parsed.dt.tz_convert("UTC").dt.tz_localize(None)
+    return parsed
+
+
+def _parse_text_dates(text: pd.Series) -> pd.Series:
+    """Parse date strings; mixed UTC offsets (any data crossing a DST change) are normalized to UTC."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        for kwargs in ({"format": "mixed"}, {}, {"format": "mixed", "utc": True}, {"utc": True}):
+            try:
+                return _naive_utc(pd.to_datetime(text, errors="coerce", **kwargs))
+            except (TypeError, ValueError):
+                continue
+    return pd.Series(pd.NaT, index=text.index)
+
+
 def as_datetime(series: pd.Series, source: str | None = None) -> pd.Series:
-    """Convert a native, text, or epoch date column to datetime64 (unparseable values become NaT)."""
+    """Convert a native, text, or epoch date column to timezone-naive datetime64 (UTC for zoned input).
+
+    Unparseable values become NaT.
+    """
     source = source or _datetime_source(series) or "text"
     if source == "native":
-        return series
+        return _naive_utc(series)
     if source.startswith("epoch"):
         unit = dict((n, u) for n, _, _, u in _EPOCH_RANGES)[source]
         return pd.to_datetime(series, unit=unit, errors="coerce")
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        try:
-            return pd.to_datetime(series, errors="coerce", format="mixed")
-        except (TypeError, ValueError):
-            return pd.to_datetime(series, errors="coerce")
+    return _parse_text_dates(series)
 
 
 def datetime_columns(df: pd.DataFrame) -> dict[str, str]:
@@ -392,7 +424,8 @@ def _integer_like(values: pd.Series) -> bool:
     if pd.api.types.is_integer_dtype(values):
         return True
     if pd.api.types.is_float_dtype(values):
-        return bool(np.all(np.mod(values.to_numpy(dtype=float), 1) == 0))
+        with np.errstate(invalid="ignore"):
+            return bool(np.all(np.mod(values.to_numpy(dtype=float), 1) == 0))
     return False
 
 
@@ -555,6 +588,11 @@ def _num(x):
 def _column_stats(sample: pd.Series, kind: str) -> dict:
     info: dict = {"kind": kind}
     values = sample.dropna()
+    if kind == "numeric" and len(values):
+        finite = np.isfinite(values.astype(float))
+        if not finite.all():
+            info["inf_frac"] = round(float((~finite).mean()), 4)
+            values = values[finite]
     if not len(values):
         return info
     if kind == "numeric":
@@ -686,6 +724,8 @@ def profile(
     memory is profiled in batches. Read the summary first; the JSON is the per-column reference.
     """
     sample, n_total = load_sample(source)
+    if not n_total:
+        raise ValueError("the data has no rows")
     if target not in sample.columns:
         raise KeyError(f"target column {target!r} not in data")
     if time_col is not None and time_col not in sample.columns:
@@ -853,8 +893,10 @@ def eda_figures(source, *, target: str, time_col: str | None = None, state_dir: 
     if time_col is not None:
         date_sources.setdefault(str(time_col), _datetime_source(df[time_col]) or "text")
     for col, src in date_sources.items():
-        if src != "native":
-            df[col] = as_datetime(df[col], src)
+        df[col] = as_datetime(df[col], src)
+    for col in df.select_dtypes("number").columns:  # inf breaks histograms and binning; it is reported in the profile
+        if col != target and not pd.api.types.is_bool_dtype(df[col]):
+            df[col] = df[col].astype(float).replace([np.inf, -np.inf], np.nan)
     sampled_note = f" (uniform sample of {len(df):,} of {n_total:,} rows)" if n_total > len(df) else ""
     profile_path = state_dir / PROFILE_FILE
     prof = json.loads(profile_path.read_text()) if profile_path.is_file() else None
@@ -1167,6 +1209,7 @@ def split(
         raise ValueError("test_size and val_size must be in (0, 1) and sum to less than 1")
     if target not in df.columns:
         raise KeyError(f"target column {target!r} not in frame")
+    _no_missing_target(df[target])
     dates = _guard_rails(df, target, time_col, group_col, not_temporal_reason, not_grouped_reason)
 
     hashes = _row_hashes(df)
@@ -1220,6 +1263,13 @@ def split(
         "created": date.today().isoformat(),
     })
     return train, val, test
+
+
+def _no_missing_target(y: pd.Series) -> None:
+    missing = int(y.isna().sum())
+    if missing:
+        raise ValueError(f"{missing} row(s) have no target value; drop or label them at step 4 (and record the rule) "
+                         "before splitting - they can't be stratified, scored, or silently dropped")
 
 
 def _write_state(state_dir, state: dict) -> None:
@@ -1278,13 +1328,18 @@ def split_to_files(
 
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    paths = {name: out_dir / f"{name}.parquet" for name in ("train", "val", "test")}
-    writers: dict = {}
-    counts = dict.fromkeys(paths, 0)
-    dropped_gap = 0
-    schema = None
+    names = ("train", "val", "test")
+    paths = {name: out_dir / f"{name}.parquet" for name in names}
+    parts_dir = out_dir / ".parts"
+    parts: dict = {name: [] for name in names}
+    counts = dict.fromkeys(names, 0)
+    dropped_gap = missing_target = 0
+    import shutil
+    shutil.rmtree(parts_dir, ignore_errors=True)
+    parts_dir.mkdir(parents=True)
     try:
-        for batch in scan(source):
+        for i, batch in enumerate(scan(source)):
+            missing_target += int(batch[target].isna().sum())
             if time_col is not None:
                 t = as_datetime(batch[time_col], t_src).to_numpy(dtype="datetime64[ns]")
                 part = np.where(t <= cut_train, 0, np.where(t <= cut_val, 1, 2))
@@ -1298,25 +1353,26 @@ def split_to_files(
                        else pd.util.hash_pandas_object(batch, index=False)).to_numpy(dtype=np.uint64) ^ salt
                 u = _u01(key)
                 part = np.where(u < test_size, 2, np.where(u < test_size + val_size, 1, 0))
-            table_all = pa.Table.from_pandas(batch, preserve_index=False)
-            if schema is None:
-                schema = table_all.schema
-            else:
-                table_all = table_all.cast(schema)
-            for code, name in enumerate(("train", "val", "test")):
+            for code, name in enumerate(names):
                 mask = part == code
-                if not mask.any():
-                    continue
-                if name not in writers:
-                    writers[name] = pq.ParquetWriter(str(paths[name]), schema)
-                writers[name].write_table(table_all.filter(pa.array(mask)))
-                counts[name] += int(mask.sum())
+                if mask.any():
+                    piece = parts_dir / f"{name}-{i:06d}.parquet"
+                    pq.write_table(_null_typed(pa.Table.from_pandas(batch[mask], preserve_index=False)), str(piece))
+                    parts[name].append(piece)
+                    counts[name] += int(mask.sum())
+        if missing_target:
+            raise ValueError(f"{missing_target} row(s) have no target value; drop or label them at step 4 before splitting")
+        # one schema for every part: a column that is all-null early and text later is text, ints mixed with floats are floats
+        schemas = [pq.read_schema(str(p)) for name in names for p in parts[name]]
+        if not schemas:
+            raise ValueError("the data source has no rows")
+        schema = _unified_schema(schemas)
+        for name in names:
+            with pq.ParquetWriter(str(paths[name]), schema) as writer:
+                for piece in parts[name]:
+                    writer.write_table(pq.read_table(str(piece)).cast(schema))
     finally:
-        for writer in writers.values():
-            writer.close()
-    for name, path in paths.items():
-        if name not in writers and schema is not None:
-            pq.write_table(schema.empty_table(), str(path))
+        shutil.rmtree(parts_dir, ignore_errors=True)
     test_fp, n_test = _fingerprint_source(paths["test"])
     kind = "time" if time_col is not None else "group" if group_col is not None else "hashed"
     _write_state(state_dir, {
@@ -1338,6 +1394,35 @@ def split_to_files(
 
 
 # ====================================================================== cross-validation folds (steps 10-11)
+def _null_typed(table):
+    """Columns that are entirely null in this batch get the null type, so a later batch decides their real type."""
+    import pyarrow as pa
+    for i, field in enumerate(table.schema):
+        if table.num_rows and table.column(i).null_count == table.num_rows and not pa.types.is_null(field.type):
+            table = table.set_column(i, pa.field(field.name, pa.null()), pa.nulls(table.num_rows))
+    return table
+
+
+def _unified_schema(schemas: list):
+    """One schema for all parts: permissive promotion, and text for a column that is numbers in some parts and text in others."""
+    import pyarrow as pa
+    try:
+        return pa.unify_schemas(schemas, promote_options="permissive")
+    except (pa.ArrowTypeError, pa.ArrowInvalid):
+        fields = {}
+        for schema in schemas:
+            for field in schema:
+                fields.setdefault(field.name, []).append(field.type)
+        out = []
+        for name, types in fields.items():
+            try:
+                merged = pa.unify_schemas([pa.schema([pa.field(name, t)]) for t in types], promote_options="permissive")
+                out.append(merged.field(name))
+            except (pa.ArrowTypeError, pa.ArrowInvalid):
+                out.append(pa.field(name, pa.large_string()))
+        return pa.schema(out)
+
+
 def cv_splits(
     train: pd.DataFrame,
     *,
@@ -1356,6 +1441,7 @@ def cv_splits(
     straight to scikit-learn as ``cv=folds``.
     """
     n = len(train)
+    _no_missing_target(train[target])
     if n_splits < 2 or n < n_splits + 1:
         raise ValueError("need n_splits >= 2 and more rows than folds")
     folds: list[tuple[np.ndarray, np.ndarray]] = []
@@ -1449,7 +1535,12 @@ def final_test(
         fingerprint = _fingerprint_v1(frame)
     if fingerprint != state["test_fingerprint"]:
         raise TestSetTampered("this is not the test set frozen at step 6")
-    logged = len(_FINAL_LINE.findall(pipeline_md.read_text())) if pipeline_md.is_file() else 0
+    record = _approvals(state_dir)
+    if record is not None and "C" not in (record.get("gates") or {}) and not any(
+            str(o.get("what", "")).lower() == "gate c" for o in record.get("overrides", [])):
+        raise LeakageError("the user has not approved Gate C yet; the test set is scored only after that approval")
+    ledgers = {pipeline_md.resolve(), (state_dir / "PIPELINE.md").resolve()}
+    logged = max((len(_FINAL_LINE.findall(p.read_text())) for p in ledgers if p.is_file()), default=0)
     touches = max(int(state.get("test_touches", 0)), logged)
     if touches >= 1 + _overrides_granted(state_dir, pipeline_md, "final test"):
         raise TestSetAlreadyUsed(

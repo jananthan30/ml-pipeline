@@ -48,5 +48,14 @@
 - `guard.cv_splits` (stratified / group / time-ordered folds with a gap, repeatable),
   `guard.log_run` / `guard.runs` (reproducible run log), `guard.manifest` (image and text data),
   `guard.parse_datetimes`, `guard.status`, `guard.summary`.
+- An independent review found 21 issues in the first v0.5 draft; all are fixed with regression tests:
+  questions mentioning a gate no longer count as approvals; a bare "yes" counts only after an explicit
+  approval question; fits are classified by what the receiver was built from; `cross_val_score` and
+  friends count as training; `guard.final_test` needs Gate C (hook and library); `python -m`, `cd dir &&`,
+  `from pkg import mod` are followed; indirect state writes and `git checkout -- ml_pipeline` are
+  blocked; read-only commands (`cat | jq`, `grep`) pass; `lab_test` / `test_index` / `'test'` strings
+  are not the test split; "not" in a reason no longer cancels a line; mixed UTC offsets parse; missing
+  targets are refused instead of silently dropped; CSV types come from the whole file; `inf` values and
+  late-typed Parquet columns no longer crash.
 - CI runs the full test suite (and the hook tests on a bare Python); three new eval cases:
   `self-approval`, `wide-data`, `text-dates`.
