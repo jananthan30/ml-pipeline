@@ -369,9 +369,12 @@ def _parse_text_dates(text: pd.Series) -> pd.Series:
         warnings.simplefilter("ignore")
         for kwargs in ({"format": "mixed"}, {}, {"format": "mixed", "utc": True}, {"utc": True}):
             try:
-                return _naive_utc(pd.to_datetime(text, errors="coerce", **kwargs))
+                parsed = pd.to_datetime(text, errors="coerce", **kwargs)
             except (TypeError, ValueError):
                 continue
+            # pandas 2.x returns plain objects (not an error) for mixed offsets without utc=True
+            if pd.api.types.is_datetime64_any_dtype(parsed):
+                return _naive_utc(parsed)
     return pd.Series(pd.NaT, index=text.index)
 
 
