@@ -1268,8 +1268,11 @@ def _joblib_array_bytes(state) -> tuple[int | None, bool, bool]:
     return count * itemsize, False, "numpy_array_alignment_bytes" in state
 
 
-def scan_pickle(stream, found: set, depth: int = 0) -> None:
-    """Walk one pickle from ``stream`` to its STOP, adding every imported name to ``found``. Raises Unverified."""
+def scan_pickle(stream, found: set, depth: int = 0, skip_arrays: bool = True) -> None:
+    """Walk one pickle from ``stream`` to its STOP, adding every imported name to ``found``. Raises Unverified.
+
+    ``skip_arrays`` follows joblib: the bytes after a NumpyArrayWrapper are array data. Plain pickle.load reads
+    them as opcodes instead, so scan_model also walks every file with ``skip_arrays=False``."""
     import pickletools
     if depth > 3:
         raise Unverified("nested pickles too deep")
@@ -1379,7 +1382,7 @@ def scan_pickle(stream, found: set, depth: int = 0) -> None:
                     if isinstance(obj, _Call):
                         obj.state = state
                         func = obj.func
-                        if isinstance(func, _Global) and func.name == "joblib.numpy_pickle.NumpyArrayWrapper":
+                        if skip_arrays and isinstance(func, _Global) and func.name == "joblib.numpy_pickle.NumpyArrayWrapper":
                             nbytes, objects, padded = _joblib_array_bytes(state)
                             if objects:
                                 scan_pickle(stream, found, depth + 1)  # joblib pickles object arrays as a nested pickle
@@ -1447,12 +1450,35 @@ def _decompressed(head: bytes, path: Path) -> bytes | None:
     return data
 
 
+IDENTIFIER = re.compile(r"^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+$")
+
+
+def _is_dangerous(name: str) -> bool:
+    return (name.split(".")[0] in DANGEROUS_MODULES or "Lambda" in name or
+            (name.startswith("builtins.") and name.split(".", 1)[1] in DANGEROUS_BUILTINS))
+
+
+def _plain_walk(raw: bytes) -> set:
+    """Dangerous names a plain pickle.load would reach, reading joblib array bytes as opcodes. A parse error here is
+    normal for real joblib files (array data is not opcodes); only well-formed, known-dangerous names count."""
+    names: set = set()
+    stream = io.BytesIO(raw)
+    try:
+        while stream.read(1):
+            stream.seek(-1, 1)
+            scan_pickle(stream, names, skip_arrays=False)
+    except Unverified:
+        pass
+    return {n for n in names if IDENTIFIER.match(n) and _is_dangerous(n)}
+
+
 def scan_model(path: Path) -> dict:
     """{'status': 'clean'|'risky'|'unverified'|'code-free', 'imports': [...], 'dangerous': [...], 'unlisted': [...], 'why'}"""
     suffix = path.suffix.lower()
     if suffix in CODE_FREE:
         return {"status": "code-free", "imports": [], "why": CODE_FREE[suffix]}
     found: set = set()
+    hidden: set = set()  # dangerous names only a plain pickle.load would reach
     try:
         with path.open("rb") as fh:
             head = fh.read(8)
@@ -1467,8 +1493,9 @@ def scan_model(path: Path) -> dict:
                     if not members and not config:
                         raise Unverified("a zip file with no pickle or model config inside")
                     for member in members:
-                        with zf.open(member) as fh:
-                            scan_pickle(io.BytesIO(fh.read()), found)
+                        raw = zf.read(member)
+                        hidden |= _plain_walk(raw)
+                        scan_pickle(io.BytesIO(raw), found)
                     for member in config:
                         text = zf.read(member).decode("utf-8", "replace")
                         if re.search(r'"class_name"\s*:\s*"(?:Lambda|TFOpLambda)"|"function_type"', text):
@@ -1479,7 +1506,9 @@ def scan_model(path: Path) -> dict:
             raise Unverified("HDF5/Keras files are not scanned (Lambda layers can hold code)")
         else:
             data = _decompressed(head, path)
-            stream = io.BytesIO(data) if data is not None else path.open("rb")
+            raw = data if data is not None else path.read_bytes()
+            hidden |= _plain_walk(raw)
+            stream = io.BytesIO(raw)
             try:
                 if (data[:1] if data is not None else head[:1]) != b"\x80" and head[:1] not in (b"(", b"c", b"]", b"}"):
                     raise Unverified("not a pickle (unknown format)")
@@ -1493,12 +1522,14 @@ def scan_model(path: Path) -> dict:
             finally:
                 stream.close()
     except Unverified as exc:
+        if hidden:
+            return {"status": "risky", "imports": sorted(found | hidden), "dangerous": sorted(hidden), "unlisted": [],
+                    "why": str(exc)}
         return {"status": "unverified", "imports": sorted(found), "why": str(exc)}
     except OSError as exc:
         return {"status": "unverified", "imports": sorted(found), "why": f"could not be read ({exc.strerror})"}
-    found = {"builtins." + n.split(".", 1)[1] if n.startswith("__builtin__.") else n for n in found}  # Python 2 name
-    dangerous = sorted(n for n in found if n.split(".")[0] in DANGEROUS_MODULES or
-                       (n.startswith("builtins.") and n.split(".", 1)[1] in DANGEROUS_BUILTINS) or "Lambda" in n)
+    found = {"builtins." + n.split(".", 1)[1] if n.startswith("__builtin__.") else n for n in found | hidden}
+    dangerous = sorted(n for n in found if _is_dangerous(n))
     unlisted = sorted(n for n in found if n not in dangerous and not SAFE_GLOBALS.match(n))
     status = "risky" if dangerous or unlisted else "clean"
     return {"status": status, "imports": sorted(found), "dangerous": dangerous, "unlisted": unlisted, "why": ""}

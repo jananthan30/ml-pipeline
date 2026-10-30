@@ -666,3 +666,16 @@ def xy_split_files(root: Path, *, set_target: bool = True) -> Path:
     if set_target:
         _json(root / "ml_audit" / "inventory.json", {"target": "y"})
     return root
+
+
+def joblib_array_disguise() -> bytes:
+    """A joblib array header whose 'array bytes' are pickle opcodes calling os.system: joblib.load reads them as data,
+    plain pickle.load runs them. Scan-only; never loaded by any test."""
+    payload = b"cos\nsystem\n" + _binunicode("true") + b"\x85R"
+    dtype = (b"cnumpy\ndtype\n" + _binunicode("u1") + b"\x89\x88\x87R" + b"(K\x03" + _binunicode("|") +
+             b"NNNJ\xff\xff\xff\xffJ\xff\xff\xff\xffK\x00tb")
+    header = (b"\x80\x02cjoblib.numpy_pickle\nNumpyArrayWrapper\n)\x81}(" + _binunicode("subclass") +
+              b"cnumpy\nndarray\n" + _binunicode("shape") + b"K" + bytes([len(payload)]) + b"\x85" +
+              _binunicode("order") + _binunicode("C") + _binunicode("dtype") + dtype +
+              _binunicode("allow_mmap") + b"\x88ub")
+    return header + payload + b"."

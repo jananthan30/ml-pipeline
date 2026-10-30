@@ -67,6 +67,8 @@ PLANTED = [
     ("pickle that writes a file on load", _marker, [], "risky-imports", "high", "proven", NEE, False),
     ("pickle importing os.system", _models({"models/a.pkl": fx.DANGEROUS_PICKLE}), [], "risky-imports", "high", "proven", NEE, False),
     ("STACK_GLOBAL from the memo", _models({"models/c.pkl": fx.MEMO_STACK_GLOBAL}), [], "risky-imports", "high", "proven", NEE, False),
+    ("opcodes disguised as joblib array bytes", _models({"models/d.joblib": fx.joblib_array_disguise()}), [],
+     "risky-imports", "high", "proven", NEE, False),
     ("truncated pickle", _models({"models/t.pkl": fx.TRUNCATED_PICKLE}), [], "unverified-model", "medium", "could-not-check", TW, False),
     ("weak subgroup (region)", fx.weak_subgroup, [], "weak-subgroup", "medium", "proven", TW, False),
     ("weak group of 31 rows", lambda r: fx.small_weak_group(r, 31), [], "weak-subgroup", "medium", "proven", TW, False),

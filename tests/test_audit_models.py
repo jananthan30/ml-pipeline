@@ -99,6 +99,16 @@ class Scanner(unittest.TestCase):
         self.assertIn("_io.open", hit["detail"])  # open() pickles under its C module
         self.assertFalse(marker.exists())
 
+    def test_opcodes_disguised_as_joblib_array_bytes_are_still_found(self):
+        proj = fx.model_project(self.root / "p", {"models/disguised.joblib": fx.joblib_array_disguise(),
+                                                  "models/disguised.pkl": fx.joblib_array_disguise()})
+        _, _, f = fx.run_audit(proj)
+        for path in ("models/disguised.joblib", "models/disguised.pkl"):
+            with self.subTest(path=path):
+                hit = model_findings(f, path)[0]
+                self.assertEqual((hit["code"], hit["severity"]), ("risky-imports", "high"))
+                self.assertIn("os.system", hit["detail"])
+
     def test_corrupt_or_unparseable_files_are_unverified_never_safe(self):
         files = {"models/truncated.pkl": fx.TRUNCATED_PICKLE, "models/garbage.joblib": b"\x00\x01not a pickle at all",
                  "models/empty.pkl": b"", "models/broken.pt": b"PK\x03\x04broken zip",
