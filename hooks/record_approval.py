@@ -8,11 +8,13 @@ approve its own gates.
 
 Recognized, case-insensitive, unless negated ("don't approve gate B", "not yet"):
   - explicit:  "approve gate B", "gate B approved", "go ahead with gate C", "sign off on gate A"
-  - overrides: "override gate B", "override red flag random-split-temporal", "override final test"
+  - overrides: "override gate B", "override red flag random-split-temporal", "override final test",
+               "override pilot", "override partial data"
   - a bare yes ("yes", "approved", "go ahead") as the whole message, when Claude's last question
     asked for that gate's approval (or that override) - "Do you approve Gate B?" -> "yes".
 Questions ("is gate B ok?") and passing mentions ("then we'll talk about gate B") never count.
-Stdlib only; fails open (never blocks the user's message).
+Each approval is tagged with the newest ``## Run:`` heading in PIPELINE.md, so an approval given in
+one run never counts for the next. Stdlib only; fails open (never blocks the user's message).
 """
 from __future__ import annotations
 
@@ -24,7 +26,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from guard_training import APPROVALS_FILE, find_pipeline  # noqa: E402
+from guard_training import APPROVALS_FILE, find_pipeline, run_label  # noqa: E402
 
 # An approval names its gate next to an approving verb: "approve gate B", "gate B approved", "go ahead
 # with gate C", "sign off on gate A". A question ("is gate B ok?") or a passing mention never counts.
@@ -35,7 +37,8 @@ APPROVE_GATE = re.compile(
 )
 GATE_APPROVED = re.compile(
     r"\bgate\s*([abcd])\s*(?:is\s+|:\s*)?(?:approved|accepted|signed\s+off|lgtm|good\s+to\s+go|ok(?:ay)?)\b", re.I)
-OVERRIDE = re.compile(r"\boverride\b\s+(?:the\s+)?(gate\s*[abcd]|red\s*flag\s+[a-z][a-z-]*[a-z]|final\s*test)\b", re.I)
+_WHAT = r"(gate\s*[abcd]|red\s*flag\s+[a-z][a-z-]*[a-z]|final\s*test|pilot|partial\s+data)\b"
+OVERRIDE = re.compile(r"\boverride\b\s+(?:the\s+)?" + _WHAT, re.I)
 NEGATION = re.compile(r"\b(?:not|don'?t|do not|no|never|wait|hold off|hold on|stop|reject(?:ed)?|deny|denied|won'?t|unless|"
                       r"before|until|if)\b", re.I)
 QUESTION = re.compile(r"^\s*(?:(?:yes|ok(?:ay)?|so|and|but|then)[,\s]+)?(?:is|are|was|were|what|why|how|when|where|which|who|"
@@ -44,7 +47,7 @@ _YES_WORD = (r"(?:yes|yep|yeah|y|approved?|ok(?:ay)?|go(?:\s+ahead)?|proceed|con
              r"confirm(?:ed)?|do it|agreed?|override(?:\s+it)?|please|sure|thanks?|thank you)")
 BARE_YES = re.compile(rf"^\s*{_YES_WORD}(?:[\s,!.]+{_YES_WORD})*\s*[.!]*\s*$", re.I)
 ASK_GATE = re.compile(r"\bapprov\w*\b[^?]{0,60}?\bgate\s*([abcd])\b|\bgate\s*([abcd])\b[^?]{0,60}?\bapprov\w*", re.I)
-ASK_OVERRIDE = re.compile(r"\boverrid(?:e|ing)\b[^?]{0,80}?\b(gate\s*[abcd]|red\s*flag\s+[a-z][a-z-]*[a-z]|final\s*test)\b", re.I)
+ASK_OVERRIDE = re.compile(r"\boverrid(?:e|ing)\b[^?]{0,80}?\b" + _WHAT, re.I)
 ASK_NEGATED = re.compile(r"\b(?:won'?t|will not|unless|not|don'?t|never|instead of)\b", re.I)
 
 
@@ -127,7 +130,8 @@ def parse(prompt: str, assistant_text: str = "") -> tuple[list[str], list[str]]:
     return sorted(set(gates)), overrides
 
 
-def record(state_dir: Path, gates: list[str], overrides: list[str], prompt: str, session: str | None) -> dict:
+def record(state_dir: Path, gates: list[str], overrides: list[str], prompt: str, session: str | None,
+           run: str = "") -> dict:
     path = state_dir / APPROVALS_FILE
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -139,9 +143,11 @@ def record(state_dir: Path, gates: list[str], overrides: list[str], prompt: str,
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     excerpt = " ".join(prompt.split())[:160]
     for gate in gates:
-        data["gates"].setdefault(gate, {"at": now, "excerpt": excerpt, "session": session})
+        earlier = data["gates"].get(gate)
+        if not isinstance(earlier, dict) or str(earlier.get("run") or "") != run:  # the first approval in this run
+            data["gates"][gate] = {"at": now, "excerpt": excerpt, "session": session, "run": run}
     for what in overrides:
-        data["overrides"].append({"what": what, "at": now, "excerpt": excerpt, "session": session})
+        data["overrides"].append({"what": what, "at": now, "excerpt": excerpt, "session": session, "run": run})
     state_dir.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, indent=2))
     return data
@@ -164,7 +170,9 @@ def main() -> int:
         if pipeline is None and not state_dir.is_dir() and not re.search(r"\bgate\b|\boverride\b", prompt, re.I):
             print("{}")  # a bare "yes" in a project that never started the pipeline
             return 0
-        record(state_dir, gates, overrides, prompt, payload.get("session_id"))
+        ledger = state_dir / "PIPELINE.md"
+        run = run_label(ledger.read_text(encoding="utf-8", errors="replace")) if ledger.is_file() else ""
+        record(state_dir, gates, overrides, prompt, payload.get("session_id"), run)
         today = datetime.now().date().isoformat()
         notes = [f"- Gate {g}: approved {today}" for g in gates] + [f"- Override: {o} - user approved {today} - reason: <why>" for o in overrides]
         context = ("ml-pipeline: recorded the user's approval from their message. Add to ml_pipeline/PIPELINE.md: "

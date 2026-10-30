@@ -15,7 +15,9 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "hooks"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import guard_training as hook  # noqa: E402
+import v05_fixtures as fx  # noqa: E402
 
 GATE_A = "# Pipeline\n- Gate A: approved 2026-09-16\n"
 GATE_AB = GATE_A + "- Gate B: approved 2026-09-17\n"
@@ -37,8 +39,9 @@ def _stdin(text: str):
 
 def approvals_for(md: str) -> dict:
     """The record the UserPromptSubmit hook would have written had the user approved everything in ``md``."""
-    return {"gates": {g: {"at": "2026-09-16"} for g in hook.approved_gates_in(md)},
-            "overrides": [{"what": w} for w in hook.override_targets(md)]}
+    run_tag = hook.run_label(md)
+    return {"gates": {g: {"at": "2026-09-16", "run": run_tag} for g in hook.approved_gates_in(md)},
+            "overrides": [{"what": w, "run": run_tag} for w in hook.override_targets(hook.current_run(md))]}
 
 
 def run(tool_input, pipeline_md=None, tool="Bash", env=None, cwd_sub="", files=None, approvals="auto"):
@@ -289,10 +292,12 @@ class ExecutedScripts(unittest.TestCase):
         files = {"train.py": "from sklearn.ensemble import RandomForestClassifier\nRandomForestClassifier().fit(X, y)\n"}
         self.assertEqual(run({"command": "python train.py"}, GATE_A, files=files)[0], "deny")
 
-    def test_code_hidden_in_a_txt_file_is_scanned_when_run(self):
+    def test_code_hidden_in_a_txt_file_is_scanned_when_written_and_when_run(self):
+        # v0.5-combined: a .txt file is scanned at write time too (python runs any file name), and still when run.
         files = {"notes.txt": "clf.fit(X_train, y_train)\n"}
-        self.assertEqual(run({"file_path": "./notes.txt", "content": "clf.fit(X_train, y_train)"}, GATE_A, tool="Write")[0], "allow")
+        self.assertEqual(run({"file_path": "./notes.txt", "content": "clf.fit(X_train, y_train)"}, GATE_A, tool="Write")[0], "deny")
         self.assertEqual(run({"command": "python3 notes.txt"}, GATE_A, files=files)[0], "deny")
+        self.assertEqual(run({"command": "python3 notes.txt"}, GATE_AB, files=files)[0], "allow")
 
     def test_exec_open_is_scanned(self):
         files = {"step.py": "clf.fit(X_train, y_train)\n"}
@@ -382,15 +387,15 @@ class TamperProtection(unittest.TestCase):
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"\0" * 2000          # > 1,024 bytes, fine for the hook's size check
 TINY = b"\x89PNG\r\n\x1a\n" + b"\0" * 50
-LEDGER_A = ("- Figure 01_missingness.png: none missing.\n"
-            "- Figure 02_target_balance.png: 51% vs 49%.\n"
-            "- Figure 02_distributions.png: two skewed.\n")
+# Gate A needs the per-column records too (gate_records.py); v05_fixtures builds a complete set.
+LEDGER_A = fx.LEDGER_A
 CONTRACT = ("Prediction contract:\n- target: y = 1 if churned within 30 days\n- unit: one row per customer\n"
             "- horizon: 30 days after the snapshot date\n- available: features known on the snapshot date\n"
             "- metric: PR-AUC\n")
 STEPS_A = "- Step 1 done: 2,000 x 6\n- Step 2 done: figures\n- Step 3 done: contract\n"
-ARTIFACTS_A = {"ml_pipeline/data_profile.json": "{}", "ml_pipeline/figures/01_missingness.png": PNG,
-               "ml_pipeline/figures/02_target_balance.png": PNG, "ml_pipeline/figures/02_distributions.png": PNG}
+ARTIFACTS_A = fx.records("A")
+ARTIFACTS_B = {k: v for k, v in fx.records("B").items() if k != fx.STATE}  # the frozen split is added by each test
+ARTIFACTS_C = fx.records("C")
 RATIONALE = ("Model rationale:\n- traits: binary, 1,000 rows (small)\n- baseline: dummy + logistic\n"
              "- candidates: boosting\n- ruled out: neural nets (small data)\n- metric: PR-AUC\n")
 STEPS_B = "".join(f"- Step {s} done: ok\n" for s in range(4, 9))
@@ -454,26 +459,27 @@ class GateRecording(unittest.TestCase):
 
     def test_gate_b_needs_steps_rationale_figure_and_split(self):
         base = LEDGER_A + STEPS_A + CONTRACT + "- Gate A: approved 2026-09-16\n"
-        files = {**ARTIFACTS_A, "ml_pipeline/figures/04_cleaning.png": PNG}
-        ledger = base + "- Figure 04_cleaning.png: 312 rows dropped.\n"
+        files = dict(ARTIFACTS_B)
+        ledger = base + fx.LEDGER_B
         decision, reason = run(write_md(ledger + "- Gate B: approved 2026-09-17\n"), pipeline_md=base, tool="Write",
                                files=files, approvals=ALL_GATES)
         self.assertEqual(decision, "deny")
         self.assertIn("Model rationale block missing lines: traits, baseline, candidates, ruled out, metric", reason)
         self.assertIn("step 4 not recorded", reason)
         self.assertIn("no frozen split", reason)
-        files["ml_pipeline/.guard_state.json"] = "{}"
-        decision, _ = run(write_md(ledger + STEPS_B + RATIONALE + "- Gate B: approved 2026-09-17\n"), pipeline_md=base + STEPS_B,
-                          tool="Write", files=files, approvals=ALL_GATES)
-        self.assertEqual(decision, "allow")
+        files[fx.STATE] = json.dumps(fx.STATE_JSON)
+        decision, reason = run(write_md(ledger + STEPS_B + RATIONALE + "- Gate B: approved 2026-09-17\n"),
+                               pipeline_md=base + STEPS_B, tool="Write", files=files, approvals=ALL_GATES)
+        self.assertEqual((decision, reason), ("allow", ""))
 
     def test_gate_c_and_d(self):
-        base = LEDGER_A + STEPS_A + CONTRACT + GATE_AB + STEPS_B
-        files = {**ARTIFACTS_A, "ml_pipeline/figures/12_roc.png": PNG, "ml_pipeline/figures/13_errors.png": PNG,
-                 "ml_pipeline/runs.jsonl": RUN_BOTH, "ml_pipeline/.guard_state.json": "{}"}
-        ledger = base + STEPS_C + "- Figure 12_roc.png: AUC 0.8.\n- Figure 13_errors.png: worst slice.\n"
+        base = LEDGER_A + fx.LEDGER_B + RATIONALE + fx.LEDGER_C + STEPS_A + CONTRACT + GATE_AB + STEPS_B
+        files = {**ARTIFACTS_C, "ml_pipeline/figures/12_roc.png": PNG, "ml_pipeline/figures/13_errors.png": PNG,
+                 "ml_pipeline/runs.jsonl": RUN_BOTH}
+        ledger = base + STEPS_C + ("- Figure 12_roc.png: validation ROC AUC is 0.80 for the tuned model.\n"
+                                   "- Figure 13_errors.png: the worst slice is new customers, 31% error on 52 rows.\n")
         self.assertEqual(run(write_md(ledger + "- Gate C: approved 2026-09-18\n"), pipeline_md=ledger, tool="Write",
-                             files=files, approvals=ALL_GATES)[0], "allow")
+                             files=files, approvals=ALL_GATES), ("allow", ""))
         ledger_c = ledger + "- Gate C: approved 2026-09-18\n- Step 13 done: worst slice is new customers\n"
         decision, reason = run(write_md(ledger_c + "- Gate D: approved 2026-09-19\n"), pipeline_md=ledger_c, tool="Write",
                                files=files, approvals=ALL_GATES)
@@ -686,6 +692,49 @@ class ReviewFixes(unittest.TestCase):
     def test_scaling_for_an_eda_embedding(self):
         self.assertEqual(run({"command": "Xs = StandardScaler().fit_transform(X)\nemb = TSNE(2).fit_transform(Xs)"}, "# P\n")[0], "allow")
         self.assertEqual(run({"command": "StandardScaler().fit(X)"}, "# P\n")[0], "deny")
+
+class CombinedRules(unittest.TestCase):
+    """Rules that exist only where the two v0.5 lines meet: user approvals per run, overrides need records."""
+
+    def test_an_approval_from_an_older_run_does_not_count(self):
+        md = GATE_AB + "## Run: retrain (2026-10-01)\n- Gate A: approved 2026-10-01\n- Gate B: approved 2026-10-01\n"
+        old = {"gates": {g: {"run": ""} for g in "AB"}, "overrides": []}
+        decision, reason = run({"command": "LogisticRegression().fit(X_train, y_train)"}, md, approvals=old)
+        self.assertEqual(decision, "deny")
+        self.assertIn("the user has not approved it in chat", reason)
+        self.assertEqual(run({"command": "LogisticRegression().fit(X_train, y_train)"}, md)[0], "allow")
+
+    def test_recording_an_override_needs_the_records_and_the_users_word(self):
+        md = fx.process("B") + fx.ledger("A")
+        line = "- Override: Gate B - user approved skipping 2026-09-17 - reason: deadline\n"
+        decision, reason = run(write_md(md + line), pipeline_md=md, tool="Write", files=fx.records("A"),
+                               approvals={"gates": {"A": {}}, "overrides": [{"what": "gate b"}]})
+        self.assertEqual(decision, "deny")
+        self.assertIn("Gate B can't be recorded", reason)
+        self.assertIn("associations.json missing", reason)
+        ledger_b = fx.process("B") + fx.ledger("B")
+        decision, reason = run(write_md(ledger_b + line), pipeline_md=ledger_b, tool="Write", files=fx.records("B"),
+                               approvals={"gates": {"A": {}}, "overrides": []})
+        self.assertEqual(decision, "deny")
+        self.assertIn("the user has not asked to override Gate B", reason)
+        self.assertEqual(run(write_md(ledger_b + line), pipeline_md=ledger_b, tool="Write", files=fx.records("B"),
+                             approvals={"gates": {"A": {}}, "overrides": [{"what": "gate b"}]}), ("allow", ""))
+
+    def test_pilot_override_needs_the_users_word(self):
+        md = GATE_AB + STEP_9 + "- Override: pilot - 5,000 rows - user approved 2026-09-24 - reason: smoke test\n"
+        cmd = {"command": "LogisticRegression().fit(X_train[:5000], y_train[:5000])"}
+        self.assertEqual(run(cmd, md, approvals={"gates": {"A": {}, "B": {}}, "overrides": []})[0], "deny")
+        self.assertEqual(run(cmd, md)[0], "allow")
+
+    def test_the_agent_cannot_switch_the_approval_rule_off(self):
+        for cmd in ("ML_PIPELINE_REQUIRE_USER_APPROVAL=0 python train.py",
+                    "os.environ['ML_PIPELINE_REQUIRE_USER_APPROVAL'] = '0'"):
+            with self.subTest(cmd=cmd):
+                self.assertIn("the user's decision", run({"command": cmd}, GATE_A)[1])
+        settings = {"file_path": "./.claude/settings.local.json",
+                    "content": '{"env": {"ML_PIPELINE_REQUIRE_USER_APPROVAL": "0"}}'}
+        self.assertEqual(run(settings, GATE_A, tool="Write")[0], "deny")
+
 
 class FailOpen(unittest.TestCase):
     def test_garbage_stdin_allows_and_reports(self):

@@ -15,12 +15,17 @@ the user approved that gate in chat (recorded by the UserPromptSubmit hook in
     always            ->  fitting on the test split is denied; the guard's state files are read-only
 
 Recording a step or gate line is checked too: steps go in order, each step's artifacts must
-exist, and a gate needs its steps, its artifacts, and the user's approval.
+exist, and a gate needs its steps, its artifacts, its per-column records (gate_records.py), and the
+user's approval. Only strict ledger lines in the newest run count: ``- Gate X: approved ...`` and
+``- Override: <what> - ...``, after the last ``## Run:`` heading (or anywhere when there is none); for
+each gate the last such line decides.
 
 The hook fails open: an unexpected error allows the call and reports the error, so a bug here can
-never lock anyone out of their own tools. ``ML_PIPELINE_ENFORCE=0`` switches it off for projects
-that are not ML pipelines; ``ML_PIPELINE_REQUIRE_USER_APPROVAL=0`` falls back to ledger-only gates.
-Stdlib only; no subprocesses, no network.
+never lock anyone out of their own tools - except that a crash while checking a gate's records
+denies that one ledger write, so a gate is never recorded unchecked. The user (never the agent)
+sets ``ML_PIPELINE_ENFORCE=0`` to switch it off for projects that are not ML pipelines, or
+``ML_PIPELINE_REQUIRE_USER_APPROVAL=0`` to fall back to ledger-only gates. Stdlib only; no
+subprocesses, no network.
 """
 from __future__ import annotations
 
@@ -31,9 +36,20 @@ import shlex
 import sys
 from pathlib import Path
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import gate_records  # noqa: E402
+
 PIPELINE_REL = Path("ml_pipeline") / "PIPELINE.md"
 SEARCH_UP = 4  # look in cwd and this many parent directories
-DOC_SUFFIXES = {".md", ".markdown", ".rst", ".txt", ".json", ".yaml", ".yml", ".toml", ".cfg", ".ini"}
+# Prose and config are not code; running one is still checked. A .txt file is scanned like code: it can be run.
+DOC_SUFFIXES = {".md", ".markdown", ".rst", ".json", ".yaml", ".yml", ".toml", ".cfg", ".ini"}
+PROSE_SUFFIXES = {".md", ".markdown", ".rst"}
+# The plugin runs in every project; a fit/step/train call in these languages is not model training.
+OTHER_LANGUAGE_SUFFIXES = {
+    ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".vue", ".svelte", ".html", ".htm", ".css", ".scss",
+    ".java", ".kt", ".scala", ".go", ".rs", ".c", ".h", ".cc", ".cpp", ".hpp", ".cs", ".swift", ".rb",
+    ".php", ".dart", ".lua", ".sql",
+}
 SKIP_KEYS = {"old_string", "file_path", "path", "notebook_path", "description", "url", "pattern", "glob", "cwd"}
 SNIPPET = 80
 APPROVALS_FILE = ".approvals.json"
@@ -48,12 +64,27 @@ FIT_REF = re.compile(r"\b([A-Za-z_]\w*)\s*\.\s*(?:partial_)?fit(?:_transform|_pr
 GETATTR_FIT = re.compile(r"getattr\s*\(\s*([A-Za-z_]\w*)\s*,\s*[\"'](?:partial_)?fit(?:_transform|_predict)?[\"']")
 # APIs that only ever train models.
 TRAIN_API = re.compile(
-    r"\b(?:xgb|xgboost|lgb|lightgbm|catboost)\.(?:train|cv)\s*\(|\btrainer\.train\s*\(|\bTrainer\s*\(|"
+    r"\b(?:xgb|xgboost|lgb|lightgbm|catboost)\s*\.\s*(?:train|cv)\s*\(|\btrainer\s*\.\s*train\s*\(|"
+    r"(?<!class )\b\w*Trainer\s*\(|"
     r"\.fit_generator\s*\(|\.fit_one_cycle\s*\(|\bloss\.backward\s*\(|\boptimizer\.step\s*\("
 )
+# A gradient step under any names: a backward pass plus an optimizer step in the same code.
+BACKWARD = re.compile(r"\.\s*backward\s*\(")
+OPT_STEP = re.compile(r"\.\s*step\s*\(")
 # Helpers that fit a model inside them (cross-validation, learning curves).
 TRAIN_HELPER = re.compile(r"\b(?:cross_val_score|cross_validate|cross_val_predict|learning_curve|validation_curve|"
-                          r"permutation_test_score)\s*\(")
+                          r"permutation_test_score|permutation_importance)\s*\(")
+# A slice of the rows inside a model-training call, or nrows= in a reader in code that trains: a pilot.
+# Row slices with a positive stop or a negative start (`[:5000]`, `.iloc[:500]`, `[-5000:]`), head() and sample().
+SLICE = re.compile(r"\[\s*-?\d*\s*:\s*\d+\s*\]|\[\s*-\d+\s*:\s*\]|\.\s*i?loc\s*\[\s*-?\d*\s*:\s*\d+|"
+                   r"\.\s*(?:head|sample)\s*\(")
+FULL_SHUFFLE = re.compile(r"\bfrac\s*=\s*1(?:\.0*)?\b")
+READER = re.compile(r"\bread_(?:csv|table|excel|json|fwf|parquet|feather|sas|stata|spss|sql)\s*\(")
+NROWS = re.compile(r"\bnrows\s*=\s*(?!0\s*(?:[,)]|$))")
+SELECTOR_NAMES = r"SelectKBest|SelectPercentile|GenericUnivariateSelect|SelectFpr|SelectFdr|SelectFwe"
+SELECTOR = re.compile(r"\b(?:" + SELECTOR_NAMES + r")\b")
+SELECTION_SCORE = re.compile(
+    r"\b(?:mutual_info_classif|mutual_info_regression|f_classif|f_regression|chi2|r_regression)\s*\(")
 # The guard library's step 14 call scores the frozen test set.
 FINAL_TEST_CALL = re.compile(r"\bfinal_test\s*\(")
 # Hyperparameter search: step 11, after the candidates of step 10.
@@ -117,11 +148,14 @@ def _test_split_pattern() -> re.Pattern:
 
 
 # ------------------------------------------------------------------ gate state
-GATE_LINE = re.compile(r"^.*\bgate\s*[\[(]?([abcd])\b.*$", re.I | re.M)
-APPROVED = re.compile(r"\b(?:approved|approved-gate)\b", re.I)
-NEGATED = re.compile(r"\b(?:not|pending|awaiting|waiting|todo|unapproved|blocked|in progress)\b", re.I)
-OVERRIDE_ANY = re.compile(r"^\s*-?\s*override\s*:.*$", re.I | re.M)
-OVERRIDE_TARGET = re.compile(r"override\s*:\s*(gate\s*[abcd]|red\s*flag\s+[a-z][a-z-]*|final\s*test)\b", re.I)
+RUN_HEAD = re.compile(r"^[ \t]*##[ \t]+Run[ \t]*:[^\n]*", re.I | re.M)
+# Strict shapes, at a line start or right after a quote (as in `echo '- Gate A: approved ...' >> PIPELINE.md`).
+_LINE_START = r"(?:^|(?<=[\'\"]))[ \t]*-[ \t]*"
+GATE_RECORD = re.compile(_LINE_START + r"Gate[ \t]+([A-D])[ \t]*:[ \t]*(\S*)", re.I | re.M)
+OVERRIDE_WHAT = r"gate[ \t]+[abcd]|red[ \t]+flag[ \t]+[a-z][a-z-]*[a-z]|final[ \t]+test|pilot|partial[ \t]+data"
+OVERRIDE_LINE = re.compile(_LINE_START + r"Override[ \t]*:[ \t]*(" + OVERRIDE_WHAT + r")[ \t]*(?:-|$)", re.I | re.M)
+OVERRIDE_ANY = re.compile(_LINE_START + r"Override[ \t]*:", re.I | re.M)
+GATE_LINE = re.compile(_LINE_START + r"Gate[ \t]+[A-D][ \t]*:", re.I | re.M)
 STEP_LINE = re.compile(r"(?:^|(?<=[\'\"\s]))\s*-\s*Step\s+(\d{1,2})\s+(done|skipped)\b\s*[:\-–—]\s*\S", re.I | re.M)
 FINAL_TEST_LINE = re.compile(r"(?:^|(?<=[\'\"\s]))\s*-\s*Step 14 final test:", re.I | re.M)
 PROTECTED_LINE = re.compile(r"^\s*-\s*(?:Gate\s*[ABCD]\s*:.*\bapproved\b|Override\s*:|Step\s+\d{1,2}\s+(?:done|skipped)\b|"
@@ -132,24 +166,21 @@ def _norm(what: str) -> str:
     return re.sub(r"\s+", " ", what.strip().lower())
 
 
-def _status_part(line: str) -> str:
-    """The part of a ledger line that states its status: up to 'approved', before any free-text reason."""
-    cut = len(line)
-    for marker in (re.search(r"\breason\b", line, re.I), re.search(r"[(\[]", line)):
-        if marker:
-            cut = min(cut, marker.start())
-    approved = APPROVED.search(line[:cut])
-    return line[: approved.end()] if approved else line[:cut]
+def current_run(markdown: str) -> str:
+    """The newest run: everything from the last ``## Run:`` heading on, or the whole file when there is none."""
+    heads = list(RUN_HEAD.finditer(markdown))
+    return markdown[heads[-1].start():] if heads else markdown
+
+
+def run_label(markdown: str) -> str:
+    """The newest ``## Run:`` heading ('' when there is none): approvals belong to the run they were given in."""
+    heads = list(RUN_HEAD.finditer(markdown))
+    return " ".join(heads[-1].group(0).split()) if heads else ""
 
 
 def override_targets(text: str) -> list[str]:
-    """Normalized override targets ('gate b', 'red flag x', 'final test') on non-negated override lines."""
-    out = []
-    for line in OVERRIDE_ANY.finditer(text):
-        m = OVERRIDE_TARGET.search(line.group(0))
-        if m and not NEGATED.search(_status_part(line.group(0))):
-            out.append(_norm(m.group(1)))
-    return out
+    """Normalized targets ('gate b', 'red flag x', 'final test', 'pilot', 'partial data') of strict override lines."""
+    return [_norm(m.group(1)) for m in OVERRIDE_LINE.finditer(text)]
 
 
 # ------------------------------------------------------------------ messages
@@ -157,7 +188,7 @@ NO_PIPELINE_MSG = (
     "ml-pipeline: model training detected ({0!r}) but there is no ml_pipeline/PIPELINE.md. "
     "Training starts at step 1, not step 10 - run the ml-pipeline skill: inspect the data, do EDA, "
     "define the prediction problem, and get the user's approval at Gate A. "
-    "Not an ML project? Set ML_PIPELINE_ENFORCE=0."
+    "Not an ML project? Ask the user to switch enforcement off."
 )
 GATE_A_MSG = (
     "ml-pipeline: nothing is fit before Gate A ({0!r}) except exploratory fits for EDA. Finish steps 1-3 "
@@ -168,11 +199,14 @@ GATE_B_MSG = (
     "ml-pipeline: model training is locked until Gate B ({0!r}). Finish steps 4-8 (cleaning, "
     "engineering, split, features, preprocessing), get the user's explicit approval in chat, and record "
     "`- Gate B: approved YYYY-MM-DD` in ml_pipeline/PIPELINE.md. If the user explicitly chose to skip "
-    "ahead, they say 'override gate B' in chat and you record `- Override: Gate B - ...`."
+    "ahead, they say 'override gate B' in chat and you record `- Override: Gate B - ...`; an override needs the "
+    "same records as an approval."
 )
 GATE_C_MSG = (
     "ml-pipeline: evaluating on the test split is locked until Gate C ({0!r}). The test set is touched "
-    "exactly once, at step 14, after the user approves Gate C - tune and select on validation only."
+    "exactly once, at step 14, after the user approves Gate C - tune and select on validation only. If the user "
+    "explicitly chose otherwise, they say 'override gate C' in chat and you record `- Override: Gate C - ...`; an "
+    "override needs the same records as an approval."
 )
 TEST_MSG = (
     "ml-pipeline: this fits on the test split ({0!r}). The test set is touched exactly once, at "
@@ -198,6 +232,20 @@ PROTECTED_MSG = (
     "Read it with guard.status() instead; never edit, move, or delete it. To bring the guard library into "
     "the project, copy the file with cp rather than writing its contents."
 )
+SELF_DISABLE_MSG = (
+    "ml-pipeline: switching enforcement or the user-approval rule off, or pointing the hook at a different ledger, "
+    "is the user's decision - an agent may not change that setting. If this project is not an ML pipeline, ask the "
+    "user to switch enforcement off themselves."
+)
+PILOT_MSG = (
+    "ml-pipeline: this trains on a slice of the data ({0!r}). Train on the full training split. If the user "
+    "explicitly agreed to a quick pilot, they say 'override pilot' in chat and you record "
+    "`- Override: pilot - <size> - user approved YYYY-MM-DD - reason: ...`; Gate C still needs a full-data training run."
+)
+TARGET_STATS_WHY = ("target-based feature selection must use the training split only ({0}) - select features inside "
+                    "the training data or a CV fold")
+GATE_CHECK_FAILED_MSG = ("ml-pipeline: could not check the Gate {0} records ({1}); fix the file it names, re-run the "
+                         "guard helper that writes it, and retry.")
 LEDGER_MSG = (
     "ml-pipeline: this would remove recorded lines from PIPELINE.md ({0}). Gate approvals, overrides, step "
     "lines, and final-test lines are an append-only record: add new lines, never delete or rewrite these."
@@ -230,7 +278,7 @@ RATIONALE_HEAD = re.compile(r"^\s*Model rationale:\s*$", re.I | re.M)
 RATIONALE_BULLETS = ("traits", "baseline", "candidates", "ruled out", "metric")
 CONTRACT_HEAD = re.compile(r"^\s*Prediction contract:\s*$", re.I | re.M)
 CONTRACT_BULLETS = ("target", "unit", "horizon", "available", "metric")
-LEDGER = re.compile(r"^\s*-\s*Figure\s+(\S+\.png):\s*\S", re.I | re.M)
+LEDGER = re.compile(r"^\s*-\s*Figure\s+(\S+\.png):[ \t]*(\S[^\n]*)$", re.I | re.M)
 GATE_RECORD_MSG = "ml-pipeline: Gate {0} can't be recorded: {1}."
 STEP_RECORD_MSG = "ml-pipeline: Step {0} can't be recorded yet: {1}."
 
@@ -251,28 +299,55 @@ def load_approvals(state_dir: Path | None) -> dict:
         return {"gates": {}, "overrides": []}
 
 
-def user_approved(approvals: dict, gate: str) -> bool:
-    return not require_proof() or gate.upper() in approvals.get("gates", {})
+def _in_run(entry, run: str) -> bool:
+    return isinstance(entry, dict) and str(entry.get("run") or "") == run
 
 
-def user_overrode(approvals: dict, what: str) -> bool:
-    return not require_proof() or any(_norm(str(o.get("what", ""))) == _norm(what) for o in approvals.get("overrides", []))
+def user_approved(approvals: dict, gate: str, run: str = "") -> bool:
+    """The user approved ``gate`` in chat during the run labelled ``run`` (see run_label)."""
+    return not require_proof() or _in_run(approvals.get("gates", {}).get(gate.upper()), run)
+
+
+def granted_overrides(approvals: dict, what: str, run: str = "") -> int:
+    return sum(1 for o in approvals.get("overrides", []) if _in_run(o, run) and _norm(str(o.get("what", ""))) == _norm(what))
+
+
+def user_overrode(approvals: dict, what: str, run: str = "") -> bool:
+    return not require_proof() or granted_overrides(approvals, what, run) > 0
+
+
+def _gate_lines(text: str) -> list[tuple[str, str, str]]:
+    """(gate, 'approved' | 'override' | 'other', whole stripped line) for each strict gate line, in order."""
+    found = [(m.start(), m.group(1).upper(), "approved" if m.group(2).lower().startswith("approved") and
+              re.fullmatch(r"approved[.,;:]?", m.group(2), re.I) else "other") for m in GATE_RECORD.finditer(text)]
+    found += [(m.start(), m.group(1)[-1].upper(), "override") for m in OVERRIDE_LINE.finditer(text)
+              if m.group(1).lower().startswith("gate")]
+    out = []
+    for start, gate, status in sorted(found):
+        line_start = text.rfind("\n", 0, start) + 1
+        end = text.find("\n", start)
+        out.append((gate, status, text[line_start: end if end != -1 else len(text)].strip()))
+    return out
+
+
+def _last_status(text: str) -> dict[str, str]:
+    """For each gate, the status its last strict line in the newest run gives."""
+    last: dict[str, str] = {}
+    for gate, status, _ in _gate_lines(current_run(text)):
+        last[gate] = status
+    return last
 
 
 def approved_gates_in(text: str) -> list[str]:
-    """Gate letters that ``text`` records as approved (non-negated lines only)."""
-    gates = []
-    for match in GATE_LINE.finditer(text):
-        line = match.group(0)
-        if APPROVED.search(line) and not NEGATED.search(_status_part(line)) and not OVERRIDE_ANY.match(line):
-            gates.append(match.group(1).upper())
-    return gates
+    """Gate letters the newest run in ``text`` records as approved: the last strict line is `- Gate X: approved`."""
+    return [g for g, status in sorted(_last_status(text).items()) if status == "approved"]
 
 
 def steps_in(text: str) -> dict[int, str]:
-    """{step number: 'done' | 'skipped'} recorded in ``text``; the final-test line counts as step 14 done."""
-    steps = {int(m.group(1)): m.group(2).lower() for m in STEP_LINE.finditer(text)}
-    if FINAL_TEST_LINE.search(text):
+    """{step: 'done' | 'skipped'} recorded in the newest run of ``text``; the final-test line counts as step 14 done."""
+    run = current_run(text)
+    steps = {int(m.group(1)): m.group(2).lower() for m in STEP_LINE.finditer(run)}
+    if FINAL_TEST_LINE.search(run):
         steps.setdefault(14, "done")
     return steps
 
@@ -320,13 +395,17 @@ def artifact_problems(required: dict, state_dir: Path, ledger_text: str, check_a
         if len(have) < need:
             problems.append(f"{FIGURES_DIR}/{prefix}_*.png {len(have)} found (need {need})")
     if check_all_figures:
-        ledgered = {m.group(1) for m in LEDGER.finditer(ledger_text)}
+        explained = {m.group(1): m.group(2) for m in LEDGER.finditer(ledger_text)}
         for png in figures:
             size = png.stat().st_size
             if size < MIN_PNG_BYTES:
                 problems.append(f"{FIGURES_DIR}/{png.name} is {size} bytes (empty?)")
-            if png.name not in ledgered:
+            if png.name not in explained:
                 problems.append(f"{png.name} has no '- Figure {png.name}:' line")
+            else:
+                why = gate_records.note_problem(explained[png.name])
+                if why:
+                    problems.append(f"{png.name}: explanation {why}")
     if required.get("contract"):
         missing = contract_missing(ledger_text)
         if missing:
@@ -346,13 +425,23 @@ def artifact_problems(required: dict, state_dir: Path, ledger_text: str, check_a
     return problems
 
 
-def gate_problems(gate: str, state_dir: Path, ledger_text: str, approvals: dict | None = None) -> list[str]:
-    """Everything still missing before ``gate`` may be recorded."""
+RECORD_CHECKS = {"A": gate_records.gate_a_problems, "B": gate_records.gate_b_problems, "C": gate_records.gate_c_problems}
+
+
+def gate_problems(gate: str, state_dir: Path, ledger_text: str, approvals: dict | None = None,
+                  override: bool = False) -> list[str]:
+    """Everything still missing before ``gate`` may be recorded (approved, or overridden: same records either way)."""
     required = GATE_REQUIREMENTS.get(gate, {})
     steps = steps_in(ledger_text)
     problems = [f"step {s} not recorded ('- Step {s} done: <result>')" for s in required.get("steps", ()) if s not in steps]
     problems += artifact_problems(required, state_dir, ledger_text)
-    if approvals is not None and not user_approved(approvals, gate):
+    if gate in RECORD_CHECKS:
+        problems += RECORD_CHECKS[gate](state_dir, current_run(ledger_text))
+    run = run_label(ledger_text)
+    if approvals is not None and override and not user_overrode(approvals, f"gate {gate.lower()}", run):
+        problems.append(f"the user has not asked to override Gate {gate} in chat - explain the risk and ask "
+                        f"(their reply, e.g. 'override gate {gate}', is recorded automatically)")
+    elif approvals is not None and not override and not user_approved(approvals, gate, run):
         problems.append(f"the user has not approved Gate {gate} in chat - show them the gate report and ask "
                         f"(their reply, e.g. 'approve gate {gate}', is recorded automatically)")
     return problems
@@ -363,7 +452,7 @@ def step_problems(step: int, status: str, state_dir: Path, ledger_text: str, gat
     steps = steps_in(ledger_text)
     problems = [f"step {s} comes first" for s in range(1, step) if s not in steps]
     gate = STEP_GATE.get(step)
-    if gate and not (gates.get(gate) or (gate == "B" and gates.get("override_b"))):
+    if gate and not (gates.get(gate) or gates.get(f"override_{gate.lower()}")):
         problems.append(f"Gate {gate} is not approved by the user yet")
     if status == "skipped" and step in MANDATORY_STEPS:
         problems.append(f"step {step} can't be skipped")
@@ -399,7 +488,6 @@ RED_FLAGS = [
      "the minority class is {minority_pct} of rows, so accuracy rewards ignoring it - select on average_precision, f1, or balanced_accuracy"),
 ]
 RESAMPLE = re.compile(r"fit_resample\s*\(([^)]*)\)")
-OVERRIDE_FLAG = re.compile(r"^.*\boverrid(?:e|den)\b.*\bred flag\s+([a-z-]+)\b.*$", re.I | re.M)
 RED_FLAG_MSG = ("ml-pipeline: red flag {0}: {1}. Override only after the user agrees (they say 'override red flag {0}' "
                 "in chat) with '- Override: red flag {0} - ...' in ml_pipeline/PIPELINE.md.")
 
@@ -415,10 +503,33 @@ def _load_profile(state_dir: Path) -> dict | None:
 
 
 def overridden_flags(markdown: str, approvals: dict | None = None) -> set[str]:
-    flags = {m.group(1).lower() for m in OVERRIDE_FLAG.finditer(markdown) if not NEGATED.search(_status_part(m.group(0)))}
+    """Red flags the newest run overrides with a strict ``- Override: red flag <name> - ...`` line (and, with
+    ``approvals``, that the user asked for in chat during this run)."""
+    run = run_label(markdown)
+    flags = {t[len("red flag "):] for t in override_targets(current_run(markdown)) if t.startswith("red flag ")}
     if approvals is not None:
-        flags = {f for f in flags if user_overrode(approvals, f"red flag {f}")}
+        flags = {f for f in flags if user_overrode(approvals, f"red flag {f}", run)}
     return flags
+
+
+def _target_stats_outside_train(code: str) -> str | None:
+    """The first feature-selection call whose target statistics are not computed on the training split."""
+    for match in SELECTION_SCORE.finditer(code):
+        args = _args(code, match.end())
+        if "train" not in args.lower():
+            return code[match.start(): match.end() + len(args) + 1][:60]
+    for match in FIT_CALL.finditer(code):
+        receiver = match.group(1) or ""
+        args = _args(code, match.end())
+        assigned = bool(receiver) and re.search(
+            r"\b" + re.escape(receiver) + r"\s*=\s*[\w.]*\b(?:" + SELECTOR_NAMES + r")\s*\(", code)
+        if (SELECTOR.search(receiver) or assigned) and "train" not in args.lower():
+            return code[match.start(): match.end() + len(args) + 1].strip()[:60]
+    for match in re.finditer(r"\b(?:" + SELECTOR_NAMES + r")\s*\([^()]*\)\s*\.\s*fit\w*\s*\(", code):
+        args = _args(code, match.end())
+        if "train" not in args.lower():
+            return code[match.start(): match.end() + len(args) + 1].strip()[:60]
+    return None
 
 
 def red_flag(code: str, traits: dict, overrides: set[str]) -> str | None:
@@ -426,7 +537,7 @@ def red_flag(code: str, traits: dict, overrides: set[str]) -> str | None:
     values = {"n_rows": int(traits.get("n_rows") or 0),
               "minority_pct": f"{float(traits.get('minority_frac') or 0):.1%}",
               "groups": ", ".join(traits.get("group_candidates") or []) or "group_col"}
-    trains = ".fit" in code or bool(TRAIN_API.search(code))
+    trains = ".fit" in code or bool(TRAIN_API.search(code)) or bool(BACKWARD.search(code) and OPT_STEP.search(code))
     for name, applies, pattern, why in RED_FLAGS:
         if name in overrides or not applies(traits) or not pattern.search(code):
             continue
@@ -438,6 +549,10 @@ def red_flag(code: str, traits: dict, overrides: set[str]) -> str | None:
             if not re.search(r"train|\btr_|_tr\b|\btrn\b|_trn\b", match.group(1), re.I):
                 return RED_FLAG_MSG.format("resample-before-split",
                                            f"resampling must fit on the training split only ({match.group(0)[:60]}) - split first, then fit_resample(X_train, y_train)")
+    if "target-stats-outside-train" not in overrides:
+        snippet = _target_stats_outside_train(code)
+        if snippet:
+            return RED_FLAG_MSG.format("target-stats-outside-train", TARGET_STATS_WHY.format(snippet))
     return None
 
 
@@ -471,7 +586,7 @@ def _all_strings(obj, out: list[str] | None = None) -> list[str]:
 
 # ------------------------------------------------------------------ scripts a shell command runs
 RUNNER = re.compile(
-    r"(?:^|[\s;&|(`$])(?:python[\d.]*|py|ipython|uv|poetry|pipenv|conda|pixi|hatch|marimo|jupyter|papermill|"
+    r"(?:^|[\s;&|(`$/])(?:python[\d.]*|py|ipython|uv|poetry|pipenv|conda|pixi|hatch|marimo|jupyter|papermill|"
     r"torchrun|accelerate|deepspeed|bash|sh|zsh|source|Rscript|julia|make|nohup|exec)\b|"
     r"(?:^|[\s;&|])\.{1,2}/\S+|%run\b|runpy\.|exec\s*\(|open\s*\("
 )
@@ -484,6 +599,8 @@ IMPORT_LINE = re.compile(r"^[ \t]*(?:from[ \t]+([\w.]+)[ \t]+import[ \t]+(?:\(([
 MODULE_FLAG = re.compile(r"(?:^|\s)-m\s+([\w.]+)")
 CD = re.compile(r"^\s*(?:pushd|cd)\s+([\"']?)([^\"';&|]+)\1\s*$")
 SEGMENT = re.compile(r"&&|\|\||;|\n")
+# Converting a notebook without executing it runs nothing.
+NOT_A_RUN = re.compile(r"^\s*jupyter\s+nbconvert\b(?!.*--execute)")
 MAX_FILES, MAX_BYTES = 40, 5_000_000
 
 
@@ -560,23 +677,30 @@ def executed_sources(command: str, cwd: str, depth: int = 2, seen: set | None = 
     base = Path(cwd or ".")
     sources: list[str] = []
     for segment in SEGMENT.split(command):
-        cd = CD.match(segment)
-        if cd:
-            target = Path(os.path.expanduser(cd.group(2).strip()))
-            base = target if target.is_absolute() else base / target
-            continue
-        if not RUNNER.search(segment):
-            continue
-        paths = [Path(t) if Path(t).is_absolute() else base / t for t in _candidate_paths(segment)]
-        for name in MODULE_FLAG.findall(segment):
-            paths += _module_files(name, [base, Path(cwd or ".")])
-        for path in paths:
-            text = _take(path, seen, sources)
-            if text is None:
+        try:
+            cd = CD.match(segment)
+            if cd:
+                target = Path(os.path.expanduser(cd.group(2).strip()))
+                base = target if target.is_absolute() else base / target
                 continue
-            here = path.resolve().parent
-            sources += _imported_sources(text, here, base, seen)
-            sources += executed_sources(text, str(here), depth - 1, seen)
+            if not RUNNER.search(segment) or NOT_A_RUN.search(segment):
+                continue
+            for code in re.findall(r"(?:^|\s)-\w*c\s+(?:'([^']*)'|\"([^\"]*)\")", segment):
+                inner = code[0] or code[1]  # sh -c '...', bash -lc "...": the string is a command line
+                sources.append(inner)
+                sources += executed_sources(inner, str(base), depth - 1, seen)
+            paths = [Path(t) if Path(t).is_absolute() else base / t for t in _candidate_paths(segment)]
+            for name in MODULE_FLAG.findall(segment):
+                paths += _module_files(name, [base, Path(cwd or ".")])
+            for path in paths:
+                text = _take(path, seen, sources)
+                if text is None:
+                    continue
+                here = path.resolve().parent
+                sources += _imported_sources(text, here, base, seen)
+                sources += executed_sources(text, str(here), depth - 1, seen)
+        except Exception:  # noqa: BLE001 - one unreadable path must not fail the whole hook open
+            continue
     return sources
 
 
@@ -653,6 +777,18 @@ def _classify(receiver: str, code_before: str = "") -> str:
     return "model"
 
 
+def _slices_rows(args: str) -> bool:
+    """True when a fit call's arguments take a slice of the rows (not columns, not a shift, not a shuffle)."""
+    for match in SLICE.finditer(args):
+        before = args[:match.start()]
+        if before.count("[") > before.count("]") or before.rstrip().endswith(".columns"):
+            continue  # inside another subscript, or a slice of column names: column selection
+        if "sample" in match.group(0) and FULL_SHUFFLE.search(_args(args, match.end())):
+            continue  # sample(frac=1) shuffles every row
+        return True
+    return False
+
+
 def _code(text: str) -> str:
     """Code to scan: comments removed, and literal \\n / \\t (one-line `python -c "a\\nb"`) turned into real ones."""
     return COMMENT.sub("", text.replace("\\n", "\n").replace("\\t", "\t"))
@@ -663,16 +799,22 @@ def analyse(text: str) -> dict[str, str | None]:
     code = _code(text)
     test_split = _test_split_pattern()
     found: dict[str, str | None] = {"model": None, "transformer": None, "explore": None, "fit_on_test": None,
-                                    "eval_on_test": None, "tuning": None, "non_baseline": None}
+                                    "eval_on_test": None, "tuning": None, "non_baseline": None, "pilot": None}
     api = TRAIN_API.search(code)
     if api:
         found["model"] = found["non_baseline"] = api.group(0)
+    backward = BACKWARD.search(code)
+    if found["model"] is None and backward and OPT_STEP.search(code):
+        line_start = code.rfind("\n", 0, backward.start()) + 1
+        found["model"] = found["non_baseline"] = code[line_start: backward.end() + 1].strip()[:SNIPPET]
     for match in FIT_CALL.finditer(code):
         args = _args(code, match.end())
         snippet = code[match.start(): match.end() + len(args) + 1][:SNIPPET]
         if test_split.search(STRING.sub('""', args)) and found["fit_on_test"] is None:
             found["fit_on_test"] = snippet
         kind = _classify(match.group(1) or "", code[: match.start()])
+        if kind == "model" and found["pilot"] is None and _slices_rows(args):
+            found["pilot"] = snippet.strip()
         if found[kind] is None:
             found[kind] = snippet
     for pattern in (GETATTR_FIT, FIT_REF):
@@ -699,6 +841,12 @@ def analyse(text: str) -> dict[str, str | None]:
     final = FINAL_TEST_CALL.search(code)
     if final and found["eval_on_test"] is None:
         found["eval_on_test"] = code[final.start(): final.end() + 60][:SNIPPET]
+    if found["model"] and found["pilot"] is None:
+        for match in READER.finditer(code):
+            args = _args(code, match.end())
+            if NROWS.search(args):
+                found["pilot"] = code[match.start(): match.end() + len(args) + 1][:SNIPPET]
+                break
     return found
 
 
@@ -708,14 +856,15 @@ def gate_state(markdown: str, approvals: dict | None = None) -> dict[str, bool]:
     ``ledger_*`` keys say what the ledger alone claims, so a denial can explain a missing chat approval.
     """
     approvals = approvals if approvals is not None else {"gates": {}, "overrides": []}
+    run = run_label(markdown)
     state = {"A": False, "B": False, "C": False, "D": False, "override_b": False, "override_c": False}
-    for gate in approved_gates_in(markdown):
-        state[f"ledger_{gate}"] = True
-        if user_approved(approvals, gate):
-            state[gate] = True
-    targets = override_targets(markdown)
-    state["override_b"] = "gate b" in targets and user_overrode(approvals, "gate b")
-    state["override_c"] = "gate c" in targets and user_overrode(approvals, "gate c")
+    for gate, status in _last_status(markdown).items():
+        if status == "approved":
+            state[f"ledger_{gate}"] = True
+            state[gate] = user_approved(approvals, gate, run)
+        elif status == "override" and gate in "BC":
+            state[f"override_{gate.lower()}"] = user_overrode(approvals, f"gate {gate.lower()}", run)
+    state["pilot"] = "pilot" in override_targets(current_run(markdown)) and user_overrode(approvals, "pilot", run)
     # backwards-compatible alias used by older callers
     state["override"] = state["override_b"]
     return state
@@ -756,6 +905,8 @@ def decide(found: dict[str, str | None], gates: dict[str, bool] | None, steps: d
         return NO_PIPELINE_MSG.format(found["model"]) if found["model"] else None
     if gates["B"] or gates["override_b"]:
         if found["model"]:
+            if found.get("pilot") and not gates.get("pilot"):
+                return PILOT_MSG.format(found["pilot"])
             if found.get("tuning") and 10 not in steps and "tune-before-train" not in overrides:
                 return TUNING_MSG.format(found["tuning"])
             if found.get("non_baseline") and 9 not in steps and "baseline-first" not in overrides:
@@ -767,6 +918,14 @@ def decide(found: dict[str, str | None], gates: dict[str, bool] | None, steps: d
         return None  # scaling only to feed an EDA embedding/clustering (e.g. StandardScaler -> t-SNE) is exploration
     return GATE_A_MSG.format(found["model"] or found["transformer"]) + _proof_hint(gates, "A")
 
+
+# ------------------------------------------------------------------ self-disable
+SWITCH = r"ML_PIPELINE_(?:ENFORCE|FILE|REQUIRE_USER_APPROVAL)"
+# Assigning a switch (`X=0`, `"X": "0"`, `environ["X"] = ...`, `setenv X`), never reading it
+# (`$X`, `${X:-1}`, `"$X" == "0"`, `os.environ.get("X")`).
+SELF_DISABLE = re.compile(
+    SWITCH + r"[\"']?\]?\s*(?:=(?!=)|:(?!-))|\b(?:setenv|setdefault|putenv)\b\W*[\"']?" + SWITCH
+)
 
 # ------------------------------------------------------------------ tamper protection
 # The state files by name, by the library's constants and writers, and by common string-splitting.
@@ -848,6 +1007,24 @@ def _after_text(tool_input: dict, existing: str, text: str) -> str:
     return after if edited else existing + "\n" + text
 
 
+def _new_gate_lines(existing: str, after: str) -> list[tuple[str, str]]:
+    """(gate, status) for each strict gate line that ``after`` adds to the newest run.
+
+    A line counts as new when it occurs more often in the newest run after the call than before it, so
+    rewriting the whole ledger, or anchoring an edit on a recorded gate line, does not re-check that gate,
+    while the same line under a new ``## Run:`` heading is a new recording.
+    """
+    same_run = run_label(existing) == run_label(after)
+    before = [line for _, _, line in _gate_lines(current_run(existing))] if same_run else []
+    found = _gate_lines(current_run(after))
+    lines = [line for _, _, line in found]
+    out: list[tuple[str, str]] = []
+    for gate, status, line in found:
+        if lines.count(line) > before.count(line) and (gate, status) not in out:
+            out.append((gate, status))
+    return out
+
+
 def recording_problem(tool_input: dict, text: str, cwd: str) -> str | None:
     """Recording a gate, override, or step line in PIPELINE.md: the prerequisites must already hold."""
     target = str(tool_input.get("file_path") or tool_input.get("notebook_path") or "")
@@ -860,22 +1037,30 @@ def recording_problem(tool_input: dict, text: str, cwd: str) -> str | None:
     existing = pipeline_md.read_text(encoding="utf-8", errors="replace") if pipeline_md.is_file() else ""
     after = _after_text(tool_input, existing, text)
     approvals = load_approvals(state_dir)
-    before_steps, after_steps = steps_in(existing), steps_in(after)
-    gates_now = gate_state(existing, approvals)
+    same_run = run_label(existing) == run_label(after)
+    before_steps, after_steps = (steps_in(existing) if same_run else {}), steps_in(after)
+    gates_now = gate_state(existing if same_run else "", approvals)
     for step, status in sorted(after_steps.items()):
         if step in before_steps:
             continue
         problems = step_problems(step, status, state_dir, after, gates_now)
         if problems:
             return STEP_RECORD_MSG.format(step, "; ".join(problems))
-    for gate in sorted(set(approved_gates_in(after)) - set(approved_gates_in(existing))):
-        problems = gate_problems(gate, state_dir, after, approvals)
+    for gate, status in _new_gate_lines(existing, after):
+        if status == "other":
+            continue
+        try:
+            problems = gate_problems(gate, state_dir, after, approvals, override=status == "override")
+        except Exception as exc:  # noqa: BLE001 - a gate is never recorded unchecked; only this ledger write is denied
+            return GATE_CHECK_FAILED_MSG.format(gate, exc)
         if problems:
             return GATE_RECORD_MSG.format(gate, "; ".join(problems))
-    wanted = override_targets(after)
+    run = run_label(after)
+    wanted = override_targets(current_run(after))
+    had = override_targets(current_run(existing)) if same_run else []
     for what in sorted(set(wanted)):
-        granted = sum(1 for o in approvals.get("overrides", []) if _norm(str(o.get("what", ""))) == what)
-        if require_proof() and wanted.count(what) > granted and wanted.count(what) > override_targets(existing).count(what):
+        granted = granted_overrides(approvals, what, run)
+        if require_proof() and wanted.count(what) > granted and wanted.count(what) > had.count(what):
             return (f"ml-pipeline: '- Override: {what}' can't be recorded: the user has not asked for it in chat. "
                     f"Explain the risk in 2-3 sentences and ask; if they reply 'override {what}', it is recorded "
                     "automatically and this line is then accepted.")
@@ -907,12 +1092,17 @@ def main() -> int:
         cwd = payload.get("cwd") or os.getcwd()
         text = "\n".join(_strings(tool_input))
         command = tool_input.get("command") if isinstance(tool_input.get("command"), str) else None
+        target = str(tool_input.get("file_path") or tool_input.get("notebook_path") or "")
+        suffix = Path(target).suffix.lower() if target else ""
         # Reading (cat, grep, jq, ...) changes nothing and runs nothing.
         if command is not None and read_only_command(command):
             return _emit(None)
         # Shell commands are judged with the local scripts, notebooks and modules they run.
         executed = executed_sources(command, cwd) if command is not None else []
-        # 0. The guard's own state and the ledger's recorded lines are not editable.
+        # 0. Only the user switches enforcement or the approval rule off; settings files included.
+        if suffix not in PROSE_SUFFIXES and any(SELF_DISABLE.search(t) for t in [text, *executed]):
+            return _emit(SELF_DISABLE_MSG)
+        # 0b. The guard's own state and the ledger's recorded lines are not editable.
         reason = protected_violation(tool_name, tool_input, cwd, executed)
         if reason:
             return _emit(reason)
@@ -920,9 +1110,8 @@ def main() -> int:
         reason = recording_problem(tool_input, "\n".join([text, *executed]), cwd)
         if reason:
             return _emit(reason)
-        # 2. Prose files are not code (running one is checked when a command executes it).
-        target = str(tool_input.get("file_path") or tool_input.get("notebook_path") or "")
-        if target and Path(target).suffix.lower() in DOC_SUFFIXES:
+        # 2. Prose, config, and other languages are not Python (running a file is checked when a command runs it).
+        if suffix in DOC_SUFFIXES or suffix in OTHER_LANGUAGE_SUFFIXES:
             return _emit(None)
         text = "\n".join([text, *executed])
         # 2b. Red flags: wrong applications the data profile can prove.
@@ -941,7 +1130,7 @@ def main() -> int:
         # 3. Fast path: nothing to look at.
         if (not re.search(r"\.fit\b|fit\w*\s*\(|fit[\"']", text) and not TRAIN_API.search(text)
                 and not EVAL_CALL.search(text) and not TUNING.search(text) and not TRAIN_HELPER.search(text)
-                and not FINAL_TEST_CALL.search(text)):
+                and not FINAL_TEST_CALL.search(text) and not (BACKWARD.search(text) and OPT_STEP.search(text))):
             return _emit(None)
         found = analyse(text)
         if not any(found.values()):

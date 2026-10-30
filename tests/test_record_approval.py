@@ -59,11 +59,14 @@ class Parse(unittest.TestCase):
         self.assertEqual(hook.parse("yes", ASK_OVERRIDE), ([], ["gate b"]))
 
 
-def run(prompt: str, transcript: list[dict] | None = None, pipeline: bool = True) -> tuple[dict, dict | None]:
+def run(prompt: str, transcript: list[dict] | None = None, pipeline: bool = True, ledger: str = "# Pipeline\n",
+        record: dict | None = None) -> tuple[dict, dict | None]:
     with tempfile.TemporaryDirectory() as tmp:
         if pipeline:
             (Path(tmp) / "ml_pipeline").mkdir()
-            (Path(tmp) / "ml_pipeline" / "PIPELINE.md").write_text("# Pipeline\n")
+            (Path(tmp) / "ml_pipeline" / "PIPELINE.md").write_text(ledger)
+            if record is not None:
+                (Path(tmp) / "ml_pipeline" / ".approvals.json").write_text(json.dumps(record))
         tpath = Path(tmp) / "t.jsonl"
         tpath.write_text("\n".join(json.dumps(e) for e in (transcript or [])))
         payload = json.dumps({"prompt": prompt, "cwd": tmp, "transcript_path": str(tpath), "session_id": "s1"})
@@ -101,6 +104,20 @@ class Main(unittest.TestCase):
     def test_override_is_appended(self):
         _, record = run("override final test")
         self.assertEqual([o["what"] for o in record["overrides"]], ["final test"])
+
+    def test_pilot_and_partial_data_overrides(self):
+        self.assertEqual(hook.parse("override pilot, 5,000 rows is fine")[1], ["pilot"])
+        self.assertEqual(hook.parse("ok, override partial data for this demo")[1], ["partial data"])
+        self.assertEqual(hook.parse("don't override pilot")[1], [])
+
+    def test_approvals_belong_to_the_run_they_were_given_in(self):
+        _, record = run("approve gate A")
+        self.assertEqual(record["gates"]["A"]["run"], "")
+        ledger = "# Pipeline\n- Gate A: approved 2026-09-16\n## Run: retrain on new data (2026-10-01)\n"
+        _, record = run("approve gate A", ledger=ledger, record=record)
+        self.assertEqual(record["gates"]["A"]["run"], "## Run: retrain on new data (2026-10-01)")
+        _, again = run("approve gate A", ledger=ledger, record=record)
+        self.assertEqual(again["gates"]["A"]["at"], record["gates"]["A"]["at"])  # the first approval in a run is kept
 
     def test_bare_yes_outside_a_pipeline_is_ignored(self):
         transcript = [{"type": "assistant", "message": {"content": [{"type": "text", "text": ASK_B}]}}]
