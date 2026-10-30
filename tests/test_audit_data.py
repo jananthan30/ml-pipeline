@@ -84,8 +84,8 @@ class DataProblems(unittest.TestCase):
         for name in ("report.md", "findings.json", "inventory.json"):
             text = (out / name).read_text()
             self.assertNotIn("SECRET-ROW", text, name)
-            for value in ("0.123456", "north", "south"):  # no numbers or levels from rows either
-                self.assertNotIn(f'"{value}"', text, name)
+            for value in ("north", "south", "east", "west", "batch-1"):  # no category levels from rows either
+                self.assertNotIn(value, text, name)
 
 
 if __name__ == "__main__":

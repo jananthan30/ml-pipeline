@@ -1634,7 +1634,13 @@ def check_subgroups(audit: "Audit", pf: dict, frame, how: str, task: str) -> Non
         name, worse = "mean absolute error", 1.0
     from statistics import NormalDist
     columns = _group_columns(audit, frame, pf)
-    groups = [(col, level, idx) for col in columns for level, idx in frame.groupby(col, dropna=True).indices.items()]
+    groups, ranks = [], {}
+    for col in columns:
+        indices = frame.groupby(col, dropna=True).indices
+        order = sorted(indices, key=lambda lv: (-len(indices[lv]), str(lv)))  # rank 1 = most frequent level
+        ranks[col] = {lv: i + 1 for i, lv in enumerate(order)}
+        groups += [(col, level, indices[level]) for level in order]
+    named: dict[str, dict[str, str]] = {}
     judged = sum(1 for _, _, idx in groups if len(idx) >= MIN_GROUP_SIZE and len(frame) - len(idx) >= MIN_GROUP_SIZE)
     # Bonferroni: the interval holds for all judged groups at once, so testing many groups does not manufacture a finding
     z = NormalDist().inv_cdf(1 - 0.025 / max(judged, 1))
@@ -1655,16 +1661,25 @@ def check_subgroups(audit: "Audit", pf: dict, frame, how: str, task: str) -> Non
         low, high = gap - z * se, gap + z * se
         needed = SUBGROUP_GAP if task == "classification" else SUBGROUP_GAP * r_vals.mean()
         if gap >= needed and low > 0:
+            rank = ranks[col][level]
+            named.setdefault(str(col), {})[str(rank)] = str(level)
             audit.add("weak-subgroup", "weak-spots", "medium", "proven",
-                      f"The model is weaker where {col} = {level}",
-                      f"{name} {g_vals.mean():.3f} on {n_g:,} rows where {col} = {level}, against {r_vals.mean():.3f} "
+                      f"The model is weaker in level #{rank} of '{col}'",
+                      f"{name} {g_vals.mean():.3f} on {n_g:,} rows where '{col}' takes its level #{rank} by frequency "
+                      f"(named in local_only/subgroup_levels.json), against {r_vals.mean():.3f} "
                       f"on the other {len(r_vals):,} rows; gap {gap:.3f}, 95% interval {low:.3f} to {high:.3f} "
                       f"(Bonferroni-corrected over {judged} groups) "
                       f"(predictions {how}). Groups under {MIN_GROUP_SIZE} rows are never reported.",
-                      counts={"group_rows": n_g, "group_metric": round(float(g_vals.mean()), 6),
+                      counts={"level_rank": rank, "group_rows": n_g, "group_metric": round(float(g_vals.mean()), 6),
                               "rest_metric": round(float(r_vals.mean()), 6), "gap": round(float(gap), 6),
                               "gap_interval_95": [round(float(low), 6), round(float(high), 6)]},
                       files=[pf["path"]], columns=[col])
+    if named:
+        local = audit.out / "local_only"
+        local.mkdir(exist_ok=True)
+        (local / "subgroup_levels.json").write_text(json.dumps(named, indent=2), encoding="utf-8")
+        audit.notes.append("local_only/subgroup_levels.json names the levels behind the weak-subgroup findings. It holds "
+                           "values from the data: keep it, and trusted_predictions/, out of anything you share.")
     note = f"{tested} subgroup(s) of {len(columns)} column(s) compared ({how})"
     if small:
         note += f"; {small} group(s) with fewer than {MIN_GROUP_SIZE} rows not judged"

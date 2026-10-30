@@ -22,7 +22,7 @@ class WeakSpots(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_a_planted_weak_subgroup_is_found_with_its_size_and_interval(self):
-        _, _, f = fx.run_audit(fx.weak_subgroup(self.root / "p"))
+        _, out, f = fx.run_audit(fx.weak_subgroup(self.root / "p"))
         hits = fx.find(f, "weak-subgroup")
         self.assertEqual(len(hits), 1)
         hit = hits[0]
@@ -31,7 +31,12 @@ class WeakSpots(unittest.TestCase):
         low, high = hit["counts"]["gap_interval_95"]
         self.assertGreater(low, 0)
         self.assertGreater(high, low)
-        self.assertIn("west", hit["detail"])
+        # the level is named by its frequency rank; its value is only in a local-only file
+        for name in ("report.md", "findings.json"):
+            self.assertNotIn("west", (out / name).read_text())
+        levels = __import__("json").loads((out / "local_only" / "subgroup_levels.json").read_text())
+        self.assertEqual(levels["region"][str(hit["counts"]["level_rank"])], "west")
+        self.assertIn("local_only", (out / "report.md").read_text())
         self.assertEqual(f["verdict"], "trustworthy")  # a weak spot is reported, it does not make the score false
 
     def test_groups_under_the_minimum_size_are_not_reported(self):
