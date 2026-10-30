@@ -34,7 +34,7 @@ def load(path, map_location=None, weights_only=None):
 class TrustedScoring(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.root = Path(self.tmp.name)
+        self.root = Path(self.tmp.name).resolve()  # the tool reports resolved paths; macOS temp is a symlink
 
     def tearDown(self):
         self.tmp.cleanup()

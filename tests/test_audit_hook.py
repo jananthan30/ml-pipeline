@@ -44,7 +44,7 @@ def decide(command: str | None = None, files: dict | None = None, ledger: str | 
            tool_input: dict | None = None, setup=None) -> tuple[str, str]:
     """Run the real hook on ``command`` in a temp project ({proj} in the command is that folder)."""
     with tempfile.TemporaryDirectory() as tmp:
-        proj = Path(tmp) / "proj"
+        proj = Path(tmp).resolve() / "proj"  # relpath to the tool must not cross the macOS temp symlink
         proj.mkdir()
         if ledger is not None:
             (proj / "ml_pipeline").mkdir()
