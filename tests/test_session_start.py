@@ -36,6 +36,9 @@ class SessionStart(unittest.TestCase):
         self.assertIn("/plug/skills/ml-pipeline/lib/mlpipeline_canary.py", context)
         self.assertIn("ml_pipeline/guard.py", context)
         self.assertIn("/plug/skills/ml-pipeline/references/model-selection.md", context)
+        for helper in ("guard.load()", "guard.data_dictionary()", "guard.missingness()", "guard.label_audit()",
+                       "guard.variable_figures()", "guard.train_associations()", "guard.fit()", "guard.importance()"):
+            self.assertIn(helper, context)
 
     def test_silent_without_plugin_root(self):
         self.assertEqual(run({}), {})

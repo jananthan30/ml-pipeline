@@ -28,8 +28,9 @@ written reason in the `Model rationale:` block.
 - Avoid: anything O(n²); exact k-NN; kernel SVMs; loading the whole file with pandas "to look at it".
 
 ## Wide (`wide_data`: more than 200 columns)
-- Read `data_profile_summary.md`; the ranked `feature_signal` and `02_feature_overview` cover every
-  column. Drop constant and near-duplicate columns at step 7 using train statistics only.
+- Read `data_profile_summary.md`; `02_feature_overview` and the variable pages cover every column. Rank
+  features by target strength only on the training split (`guard.train_associations` at step 7). Drop
+  constant and near-duplicate columns at step 7 using train statistics only.
 - Strong default: regularized linear (L1 / elastic net) and gradient boosting with column subsampling.
 - Avoid: feature selection on all rows (fit selectors on train only — the hook treats them as fits).
 

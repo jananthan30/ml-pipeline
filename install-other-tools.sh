@@ -28,7 +28,10 @@ Work in marimo notebooks (\`marimo edit <file>\`) and produce matplotlib figures
 data-facing step; save figures to \`ml_pipeline/figures/\`. Track progress in the append-only
 \`ml_pipeline/PIPELINE.md\` ledger (\`- Step N done: <result>\`, one step at a time) and resume from
 it across sessions. For large files, pass paths to the guard library (it streams) instead of
-loading them whole.
+loading them whole. Before Gate A every column has a data-dictionary row with a note that cites
+its own numbers, missing values have a likely cause, and the label is audited; statistics that
+relate a feature to the target are computed on the training split only; train on the full
+training split (a slice is a pilot that needs the user's override).
 EOF
 }
 

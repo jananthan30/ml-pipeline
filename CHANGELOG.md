@@ -1,8 +1,69 @@
 # Changelog
 
-## 0.5.0 — big data, real approvals, one step at a time
+## 0.5.0 — big data, real approvals, one step at a time, rigorous data work
 
-### Fixed
+This release combines two independently built 0.5 lines: big data and hardening (user-only approvals,
+step order, tamper protection) and rigorous data work before training (per-column records, full-data
+proof, the pilot rule). Where both solved the same problem the stricter behaviour was kept.
+
+### Added — rigorous data work
+- **Full-data proof.** `guard.load()` refuses `nrows`, `usecols`, `skiprows`, chunks, `columns=` and
+  `filters=`, and records each file's SHA-256, rows and columns in `source.json`; a file profiled by path
+  is recorded the same way; `guard.derive()` registers joined frames. Gate A needs a profile that covers
+  the full data, unless the user said "override partial data".
+- **Profile schema 2.** Every column gets the describe/info statistics (dtype, non-null, missing,
+  memory, percentiles, mean/std/skew/kurtosis, zeros, negatives, outliers, top levels with counts, rare
+  levels, date span, text lengths) and the target its exact class counts. On big data every count and
+  moment is exact over every row; only percentiles come from the uniform sample.
+- **Per-column records the gates check** (new stdlib module `hooks/gate_records.py`):
+  `data_dictionary.csv` (meaning, unit, allowed, source, available at prediction, role, and a figure note
+  per column), `missingness.csv` (cause and evidence at Gate A, decision and reason at Gate B) with a
+  missing-pattern figure, `label_audit.md` (computed class counts and label conflicts plus five written
+  sections), every column on `02_variables_pNN.png` pages with `pages.json`, `cleaning_log.csv`,
+  `categorical_plan.csv`, `associations.json` and two `07_*_train.png` figures from the training split,
+  `training_runs.jsonl` receipts (`guard.fit`, `guard.record_training`), and `importance.json` with
+  `12_permutation_importance.png` from the validation split plus one `12_attribution_*.png` at Gate C.
+- **The real-explanation rule.** Every figure explanation has at least 40 characters and a number;
+  every column note cites one of that column's own figures; no two columns share a note. `guard.fig()`
+  and the hook apply the same rule (shared test vectors).
+- **Pilot rule.** After Gate B, a slice of the rows inside a training call (`X_train[:5000]`, `.iloc`,
+  `.head()`, `.sample()`, `nrows=`) is denied unless the user said "override pilot"; Gate C still needs a
+  full-data training run.
+- **Red flag `target-stats-outside-train`.** Target-based feature selection must use the training split.
+- **Runs.** A `## Run: <name> (date)` heading starts a new experiment: only its lines count, and the
+  user's chat approvals are tagged with the run they were given in, so nothing carries over.
+- Records saved by Excel or Numbers (byte-order mark, cp1252, `;` or tab) parse; a record the guard can't
+  read is never overwritten.
+- `tests/probe_hook_audit.py` feeds 23 crafted tool calls to the real hook (0 of 23 wrong); an end-to-end
+  test walks one project through big data and every record via the real hooks; the canary's honest final
+  test score is checked against its ceiling.
+
+### Changed — where the two lines met
+- **Ledger lines are strict and run-scoped.** Only `- Gate X: approved ...` and `- Override: <what> - ...`
+  count, the last line per gate decides, and only in the newest run; "to be approved", "needs an approved
+  rationale" and "never approved" no longer count even when the user approved in chat.
+- **Overrides need the same records as approvals**, and the user's word in chat.
+- **No target statistics before the split.** The profile no longer publishes a ranked `feature_signal`
+  (the target is still used to look for leaks); step-2 figures leave the target out (no
+  feature-vs-target pages, no target drift; correlations between features only; the overview plots
+  missingness against distinctness); feature-target strength comes from `guard.train_associations` on
+  the training split.
+- **Every column is drawn.** The paged numeric distributions with a page cap are replaced by variable
+  pages for every column of every kind.
+- **The test set stays used.** A used test set can't be re-split; every further touch needs one more
+  user-approved `final test` override, and one in the newest run.
+- **Wider detection:** any `*Trainer(...)`, a backward pass plus an optimizer step under any names,
+  `permutation_importance`; `.txt` files are scanned when written as well as when run; `sh -c '...'`,
+  `bash -lc "..."` and `.venv/bin/python` are followed; `.ts`/`.js` and other languages are never scanned
+  for Python fits; `jupyter nbconvert` without `--execute` is not a run.
+- **The agent can't switch enforcement off.** Assigning `ML_PIPELINE_ENFORCE`, `ML_PIPELINE_FILE` or
+  `ML_PIPELINE_REQUIRE_USER_APPROVAL` (shell, Python, or a settings file) is denied; messages say "ask
+  the user" instead of naming the switch.
+- A crash while checking a gate's records denies that ledger write instead of failing open.
+
+### From the big-data and hardening line
+
+#### Fixed
 - **Overrides unlocked training by accident.** Any `Override:` line mentioning "model" or "training"
   (a red-flag override, a final-test override) unlocked Gate B, and a final-test override unlocked
   Gate C. Overrides now unlock only what they name: `Override: Gate B`, `Override: Gate C`,
@@ -24,7 +85,7 @@
 - Leakage checks no longer flag every category on a highly imbalanced target; unique integer amounts
   are no longer mistaken for ids; stratified splits work on frames with a non-default index.
 
-### Added
+#### Added
 - **User-only gate approvals.** A `UserPromptSubmit` hook records approvals and overrides from the
   user's own messages; gate and override lines without that record don't count.
 - **Step-by-step enforcement.** `- Step N done: <result>` lines are accepted only in order, after the

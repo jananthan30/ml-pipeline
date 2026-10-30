@@ -19,7 +19,9 @@ jobs:
         with:
           python-version: "3.10"
       - name: Hook and canary tests (stdlib only)
-        run: python -m unittest tests.test_guard_training tests.test_record_approval tests.test_post_tool_warn tests.test_session_start tests.test_mlpipeline_canary -v
+        run: python -m unittest tests.test_guard_training tests.test_hook_data_work tests.test_gate_records tests.test_record_approval tests.test_post_tool_warn tests.test_session_start tests.test_mlpipeline_canary -v
+      - name: Hook audit probe (must report 0 wrong)
+        run: python tests/probe_hook_audit.py | tee probe.txt && grep -q "^0 of " probe.txt
 
   full:
     runs-on: ubuntu-latest
@@ -34,7 +36,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: Install dev requirements
         run: python -m pip install -r tests/requirements-dev.txt
-      - name: Run the full suite
+      - name: Run the full suite (includes the end-to-end and canary tests)
         run: python -m pytest tests -q
       - name: Installer smoke test
         run: |
