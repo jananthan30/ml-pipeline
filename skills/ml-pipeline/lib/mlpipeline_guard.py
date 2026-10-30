@@ -1043,6 +1043,8 @@ def profile(
             if col in full["dates"]:
                 start, end = full["dates"][col]
                 info.update(start=str(start)[:10], end=str(end)[:10], span_days=int((end - start).days))
+        if info["non_null"]:  # values exist, but the sample may have missed them all: say so instead of omitting keys
+            info.update({k: None for k in _KIND_STATS.get(kinds[col], ()) if k not in info})
         columns[str(col)] = info
 
     target_info = _target_info(sample[target], full["levels"].get(target))
