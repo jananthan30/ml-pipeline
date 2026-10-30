@@ -4,9 +4,9 @@
 
 **Blocked by:** 01
 
-**Status:** ready-for-agent
+**Status:** done (v0.6-audit)
 
-- [ ] One planted-defect fixture per problem produces exactly that finding
-- [ ] A clean control produces no critical or high finding
-- [ ] A file larger than the sampling limit is handled by streaming, and any sampled check states its sample size
-- [ ] The report contains column names and counts, and a test confirms no raw row values appear
+- [x] One planted-defect fixture per problem produces exactly that finding
+- [x] A clean control produces no critical or high finding
+- [x] A file larger than the sampling limit is handled by streaming, and any sampled check states its sample size
+- [x] The report contains column names and counts, and a test confirms no raw row values appear

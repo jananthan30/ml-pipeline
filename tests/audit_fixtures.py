@@ -190,3 +190,66 @@ def exact_accuracy_project(root: Path, correct: int, total: int, claim: str) -> 
     path = root / "outputs" / "metrics.json"
     path.write_text('{"test": {"accuracy": ' + claim + "}}\n")
     return root
+
+
+# ------------------------------------------------------------------ ticket 03: data problems (one defect each)
+def _edit_train(root: Path, edit) -> Path:
+    clean_project(root)
+    train = pd.read_csv(root / "data" / "train.csv")
+    _write(root / "data" / "train.csv", edit(train))
+    return root
+
+
+def missing_values(root: Path, frac: float = 0.3) -> Path:
+    def edit(t):
+        t = t.copy()
+        t.loc[t.sample(frac=frac, random_state=1).index, "x2"] = np.nan
+        return t
+    return _edit_train(root, edit)
+
+
+def duplicate_rows(root: Path) -> Path:
+    return _edit_train(root, lambda t: pd.concat([t, t.iloc[:60]], ignore_index=True))
+
+
+def constant_column(root: Path) -> Path:
+    def edit(t):
+        t = t.copy()
+        t.insert(5, "source_batch", "batch-1")
+        return t
+    return _edit_train(root, edit)
+
+
+def conflicting_labels(root: Path, twins_n: int = 20) -> Path:
+    def edit(t):
+        twins = t.iloc[:twins_n].copy()
+        twins["y"] = 1 - twins["y"]
+        return pd.concat([t, twins], ignore_index=True)
+    return _edit_train(root, edit)
+
+
+def invalid_labels(root: Path) -> Path:
+    def edit(t):
+        t = t.copy().astype({"y": "float"})
+        t.loc[t.index[:25], "y"] = np.nan
+        return t
+    return _edit_train(root, edit)
+
+
+def unique_secrets(root: Path) -> Path:
+    """Every row carries a unique marker string; none of them may appear in the audit's output."""
+    def edit(t):
+        t = t.copy()
+        t["note"] = [f"SECRET-ROW-{i:06d}" for i in range(len(t))]
+        t.loc[t.index[:30], "x1"] = np.nan
+        return pd.concat([t, t.iloc[:5]], ignore_index=True)
+    return _edit_train(root, edit)
+
+
+def large_file(root: Path, n: int = 6000, missing: int = 1234) -> Path:
+    """A training file several times the sampling limit used by the test, with an exact number of gaps."""
+    clean_project(root)
+    train = classification_frame(n, 5)
+    train.loc[train.index[:missing], "x3"] = np.nan
+    _write(root / "data" / "train.csv", train.drop(columns="_prob"))
+    return root

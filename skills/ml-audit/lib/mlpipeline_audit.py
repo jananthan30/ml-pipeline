@@ -788,6 +788,147 @@ def check_honest_scores(audit: "Audit") -> None:
         audit.could_not("baseline-comparison", "no predictions file with true and predicted values")
 
 
+# ------------------------------------------------------------------ check family: data problems
+MISSING_MEDIUM_FRAC = 0.20        # a column missing in at least this share of rows is a medium finding (info below)
+LABEL_CONFLICT_HIGH_FRAC = 0.05   # identical features with different labels in this share of rows is high (medium below)
+LABEL_SET_CAP = 1000              # distinct labels remembered per file for the unseen-class comparison
+ID_COLUMN = re.compile(r"(^|_)(id|uuid|guid|key|index|idx)$|^id", re.I)
+
+
+def feature_columns(columns, inv: dict) -> list[str]:
+    """Columns that describe a row (not its label, not its identifier)."""
+    skip = {inv.get("target"), inv.get("entity_column")}
+    return [c for c in columns if c not in skip and not ID_COLUMN.search(str(c))]
+
+
+def _label_key(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return str(v)
+
+
+def _conflicts(feature_hashes, label_hashes) -> tuple[int, int]:
+    """(groups, rows) of identical feature rows that carry more than one label."""
+    import numpy as np
+    if not len(feature_hashes):
+        return 0, 0
+    order = np.lexsort((label_hashes, feature_hashes))
+    f, y = feature_hashes[order], label_hashes[order]
+    new_group = np.concatenate([[True], f[1:] != f[:-1]])
+    group = np.cumsum(new_group) - 1
+    changed = np.concatenate([[False], (y[1:] != y[:-1]) & ~new_group[1:]])
+    bad = np.unique(group[changed])
+    sizes = np.bincount(group)
+    return int(len(bad)), int(sizes[bad].sum())
+
+
+@check_function
+def check_data_problems(audit: "Audit") -> None:
+    if not audit.wants("data-problems"):
+        return
+    audit.check("data-problems", "data-problems", "Missing values, duplicates, constant columns, label problems")
+    files = audit.files("data")
+    if not files:
+        audit.could_not("data-problems", "no data files in the inventory")
+        return
+    try:
+        g = guard()
+    except NeedsPandas as exc:
+        audit.could_not("data-problems", str(exc))
+        return
+    import numpy as np
+    target, allowed = audit.inv.get("target"), audit.inv.get("allowed_labels")
+    allowed_keys = {_label_key(v) for v in allowed} if allowed else None
+    batch = audit.args.sample_rows or g.BATCH_ROWS
+    total, batches, label_sets = 0, 0, {}
+    for f in files:
+        n, missing, distinct, seen = 0, {}, g._Distinct(), {}
+        pairs, label_missing, label_inf, outside, labels, exact_pairs = [], 0, 0, 0, set(), True
+        try:
+            for chunk in g.scan(str(audit.root / f["path"]), batch_rows=batch):
+                batches += 1
+                n += len(chunk)
+                for col, count in chunk.isna().sum().items():
+                    if count:
+                        missing[col] = missing.get(col, 0) + int(count)
+                distinct.add(g._row_hashes(chunk))
+                for col in chunk.columns:
+                    known = seen.setdefault(col, set())
+                    if len(known) < 2:
+                        known.update(_label_key(v) for v in chunk[col].dropna().unique()[:2].tolist())
+                if target and target in chunk.columns:
+                    y = chunk[target]
+                    has = y.notna().to_numpy()
+                    label_missing += int((~has).sum())
+                    if y.dtype.kind == "f":
+                        label_inf += int(np.isinf(y.to_numpy()).sum())
+                    values = [_label_key(v) for v in y[has].unique()[:LABEL_SET_CAP].tolist()]
+                    if allowed_keys is not None:
+                        outside += int((~y[has].map(_label_key).isin(allowed_keys)).sum())
+                    if len(labels) < LABEL_SET_CAP:
+                        labels.update(values)
+                    feats = feature_columns(chunk.columns, audit.inv)
+                    if exact_pairs and n <= g.EXACT_ROWS and feats:
+                        pairs.append((g._row_hashes(chunk.loc[has, feats]),
+                                      g._row_hashes(chunk.loc[has, [target]])))
+                    else:
+                        exact_pairs = False
+        except Exception as exc:  # noqa: BLE001 - one unreadable file is reported, the rest still run
+            audit.notes.append(f"{f['path']}: could not be read for the data checks ({type(exc).__name__})")
+            continue
+        total += n
+        label_sets[f.get("role")] = labels | label_sets.get(f.get("role"), set())
+        gaps = {c: v for c, v in missing.items() if c != target}
+        if gaps:
+            worst = max(v / n for v in gaps.values())
+            audit.add("missing-values", "data-problems", "medium" if worst >= MISSING_MEDIUM_FRAC else "info", "proven",
+                      f"Missing values in {len(gaps)} column(s) of {f['path']}",
+                      f"{n:,} rows; the most-affected column is missing in {worst:.1%} of rows (medium from "
+                      f"{MISSING_MEDIUM_FRAC:.0%}).", counts={c: gaps[c] for c in sorted(gaps)},
+                      files=[f["path"]], columns=gaps)
+        unique, exact = distinct.count()
+        if n - unique > 0:
+            audit.add("duplicate-rows", "data-problems", "medium", "proven", f"Duplicate rows in {f['path']}",
+                      f"{n - unique:,} of {n:,} rows repeat an earlier row exactly" +
+                      ("" if exact else " (estimated: the file is beyond the exact-count limit)") + ".",
+                      counts={"duplicate_rows": n - unique, "rows": n}, files=[f["path"]])
+        constant = sorted(c for c, values in seen.items() if len(values) <= 1)
+        if constant:
+            audit.add("constant-column", "data-problems", "info", "proven", f"Constant columns in {f['path']}",
+                      f"{len(constant)} column(s) hold one value (or none) in all {n:,} rows; they carry no information.",
+                      counts={"constant_columns": len(constant)}, files=[f["path"]], columns=constant)
+        if pairs:
+            groups, rows = _conflicts(np.concatenate([p[0] for p in pairs]), np.concatenate([p[1] for p in pairs]))
+            if groups:
+                frac = rows / n
+                audit.add("conflicting-labels", "data-problems", "high" if frac >= LABEL_CONFLICT_HIGH_FRAC else "medium",
+                          "proven", f"Identical features with different labels in {f['path']}",
+                          f"{groups:,} groups of rows have the same feature values but different '{target}' labels "
+                          f"({rows:,} rows, {frac:.1%}); identifier columns are left out of the comparison.",
+                          counts={"conflicting_groups": groups, "conflicting_rows": rows}, files=[f["path"]],
+                          columns=[target])
+        elif target in seen and not exact_pairs:
+            audit.notes.append(f"{f['path']}: label conflicts not checked above {g.EXACT_ROWS:,} rows")
+        bad = {k: v for k, v in (("missing_label", label_missing), ("non_finite_label", label_inf),
+                                 ("outside_allowed_labels", outside)) if v}
+        if bad:
+            audit.add("invalid-labels", "data-problems", "high", "proven", f"Invalid labels in {f['path']}",
+                      f"{sum(bad.values()):,} of {n:,} rows have a missing, non-finite, or disallowed '{target}' value; "
+                      "they can be neither trained on nor scored.", counts=bad, files=[f["path"]], columns=[target])
+    train_labels = label_sets.get("train")
+    if train_labels and len(train_labels) <= MAX_CLASSES:
+        for role in ("val", "test"):
+            unseen = label_sets.get(role, set()) - train_labels
+            if unseen:
+                audit.add("invalid-labels", "data-problems", "medium", "proven",
+                          f"Classes in the {role} split never seen in training",
+                          f"{len(unseen)} class(es) of '{target}' occur in the {role} split but not in the training "
+                          "split; no model trained on it can predict them.", counts={"unseen_in_train": len(unseen)},
+                          files=[x["path"] for x in audit.files("data", role)], columns=[target])
+    audit.ran("data-problems", f"every row streamed: {total:,} rows in {batches} batches of up to {batch:,}")
+
+
 # ------------------------------------------------------------------ output
 def new_audit_folder(root: Path) -> Path:
     base = root / AUDIT_DIR
