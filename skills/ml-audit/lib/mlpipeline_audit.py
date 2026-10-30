@@ -70,6 +70,7 @@ Y_TRUE_NAMES = ("y_true", "true", "actual", "label", "target", "y")
 Y_PRED_NAMES = ("y_pred", "pred", "prediction", "predicted", "yhat", "y_hat", "preds")
 Y_PROB_NAMES = ("y_prob", "prob", "proba", "probability", "y_score", "pred_proba", "p1", "prob_1", "score")
 DATE_NAME = re.compile(r"(date|time|timestamp|datetime|epoch|_at$|_ts$|^ts$|_dt$|^dt$)", re.I)
+ROW_NUMBER = re.compile(r"^(row_?(id|num|number)?|id|index|idx|record_?id)$", re.I)  # numbers rows, names no entity
 ENTITY_NAME = re.compile(r"(^|_)(id|key|uuid|guid|patient|user|customer|client|account|device|session|subject|"
                          r"member|site|store|hospital|household)(_|$)", re.I)
 
@@ -193,7 +194,8 @@ def guess_columns(files: list[dict]) -> dict:
                 target = pred["y_true"]
                 break
     time_col = next((c for c in common if c != target and DATE_NAME.search(c)), None)
-    entity = next((c for c in common if c not in (target, time_col) and ENTITY_NAME.search(c)), None)
+    entity = next((c for c in common if c not in (target, time_col) and ENTITY_NAME.search(c)
+                   and not ROW_NUMBER.match(c)), None)
     return {"target": target, "time_column": time_col, "entity_column": entity}
 
 
@@ -773,7 +775,7 @@ def check_honest_scores(audit: "Audit") -> None:
             base, how = baseline_score(metric, y, train_y, positive)
             if model is None or base is None:
                 continue
-            audit.ran("baseline-comparison")
+            audit.ran("baseline-comparison", "claimed metrics (or accuracy / RMSE) against a predictor that ignores the features")
             margin = BASELINE_MARGIN if metric in BOUNDED else BASELINE_REL_MARGIN * base
             beats = model > base + margin if metric in BOUNDED else model < base - margin
             if not beats:
@@ -929,6 +931,180 @@ def check_data_problems(audit: "Audit") -> None:
     audit.ran("data-problems", f"every row streamed: {total:,} rows in {batches} batches of up to {batch:,}")
 
 
+# ------------------------------------------------------------------ check family: leakage
+OVERLAP_CRITICAL_FRAC = 0.01   # identical rows shared with training in at least 1% of the later split: critical (high below)
+LEAK_ASSOCIATION = 0.95        # one feature alone removes this share of the label error (or explains this share of variance)
+SPLIT_PAIRS = (("train", "test"), ("train", "val"), ("val", "test"))
+
+
+def _file_hashes(audit: "Audit", files: list[dict], columns: list[str]):
+    """Sorted distinct row hashes over ``columns`` of every file in ``files`` (streamed), and the row count."""
+    import numpy as np
+    g = guard()
+    parts, n = [], 0
+    for f in files:
+        for chunk in g.scan(str(audit.root / f["path"]), columns=columns, batch_rows=audit.args.sample_rows or None):
+            n += len(chunk)
+            parts.append(g._row_hashes(chunk[columns]))
+    return (g._sorted_unique(np.concatenate(parts)) if parts else np.empty(0, dtype=np.uint64)), n
+
+
+def _hashes_per_row(audit: "Audit", files: list[dict], columns: list[str]):
+    import numpy as np
+    g = guard()
+    parts = [g._row_hashes(chunk[columns]) for f in files
+             for chunk in g.scan(str(audit.root / f["path"]), columns=columns, batch_rows=audit.args.sample_rows or None)]
+    return np.concatenate(parts) if parts else np.empty(0, dtype=np.uint64)
+
+
+def _common(files_a: list[dict], files_b: list[dict]) -> list[str]:
+    cols = [c for c in (files_a[0].get("columns") or [])]
+    return [c for c in cols if all(c in (f.get("columns") or []) for f in files_a + files_b)]
+
+
+def check_overlap(audit: "Audit") -> None:
+    import numpy as np
+    roles = {r: audit.files("data", r) for r in ("train", "val", "test")}
+    if not roles["train"] or not roles["test"]:
+        audit.could_not("train-test-overlap", "needs separate training and test data files (correct the inventory "
+                                              "if they are there under other names)")
+        return
+    entity = audit.inv.get("entity_column")
+    audit.check("entity-overlap", "leakage", "Entities shared across splits")
+    entity_ran = False
+    for early, late in SPLIT_PAIRS:
+        if not roles[early] or not roles[late]:
+            continue
+        cols = [c for c in _common(roles[early], roles[late]) if not ID_COLUMN.search(c) and c != entity]
+        if not cols:
+            continue
+        a, _ = _file_hashes(audit, roles[early], cols)
+        later = _hashes_per_row(audit, roles[late], cols)
+        shared = int(np.isin(later, a).sum())
+        if shared:
+            frac = shared / len(later)
+            files = [f["path"] for f in roles[early] + roles[late]]
+            audit.add("split-overlap", "leakage", "critical" if frac >= OVERLAP_CRITICAL_FRAC else "high", "proven",
+                      f"Rows of the {late} split also appear in the {early} split",
+                      f"{shared:,} of {len(later):,} {late} rows ({frac:.2%}) are identical to a {early} row on the "
+                      f"{len(cols)} shared columns (identifier columns left out). A model scores those rows from memory, "
+                      f"so the {late} score is inflated. Critical from {OVERLAP_CRITICAL_FRAC:.0%}.",
+                      counts={"shared_rows": shared, f"{late}_rows": len(later)}, files=files)
+        if entity and all(entity in (f.get("columns") or []) for f in roles[early] + roles[late]):
+            entity_ran = True
+            ea, _ = _file_hashes(audit, roles[early], [entity])
+            eb, _ = _file_hashes(audit, roles[late], [entity])
+            shared_e = int(np.isin(eb, ea).sum())
+            if shared_e:
+                audit.add("entity-overlap", "leakage", "high", "proven",
+                          f"The same {entity} values occur in the {early} and {late} splits",
+                          f"{shared_e:,} of {len(eb):,} distinct '{entity}' values in the {late} split also occur in the "
+                          f"{early} split. Rows of one entity are alike, so the {late} score overstates performance on "
+                          "new entities. If the split is by time on purpose, set entity_column to null in the inventory.",
+                          counts={"shared_entities": shared_e, f"{late}_entities": len(eb)},
+                          files=[f["path"] for f in roles[early] + roles[late]], columns=[entity])
+    audit.ran("train-test-overlap", "every row of every split compared (identifier columns left out)")
+    if entity_ran:
+        audit.ran("entity-overlap", f"entity column '{entity}'")
+    else:
+        audit.could_not("entity-overlap", "no entity column identified (set entity_column in the inventory)")
+
+
+def check_target_association(audit: "Audit") -> None:
+    import pandas as pd
+    g = guard()
+    target = audit.inv.get("target")
+    files = [f for f in audit.files("data", "train") or audit.files("data", "all") if target in (f.get("columns") or [])]
+    if not target or not files:
+        audit.could_not("feature-target-leakage", "needs a training (or full) data file with a known target column")
+        return
+    limit = audit.args.sample_rows or g.SAMPLE_ROWS
+    data, total = g.load_sample(str(audit.root / files[0]["path"]), limit)
+    data = data[data[target].notna()]
+    sampled = len(data) if total > limit else None
+    task = infer_task(data[target].to_numpy(), audit.inv.get("task"))
+    y = data[target]
+    if task == "classification":
+        majority = float(y.astype(str).value_counts(normalize=True).iloc[0]) if len(y) else 1.0
+    skip = {target, audit.inv.get("time_column"), audit.inv.get("entity_column")}
+    for col in data.columns:
+        if col in skip or ID_COLUMN.search(str(col)):
+            continue
+        kind = g._column_kind(data[col])
+        if kind not in ("numeric", "categorical", "bool"):
+            continue
+        codes = g._codes(data[col], "numeric" if kind == "numeric" else "categorical")
+        if task == "classification":
+            if majority >= 1.0:
+                continue
+            table = pd.crosstab(codes, y.astype(str).to_numpy())
+            purity = float(table.max(axis=1).sum() / len(y))
+            strength = (purity - majority) / (1 - majority)
+        else:
+            strength = g._eta2(codes, y.astype(float).to_numpy()[:, None])
+        if strength >= LEAK_ASSOCIATION:
+            what = "removes" if task == "classification" else "explains"
+            share = "of the label error left by guessing the majority class" if task == "classification" else \
+                "of the target's variance"
+            audit.add("target-leak-feature", "leakage", "critical", "proven",
+                      f"Column '{col}' alone nearly determines the target",
+                      f"on its own, '{col}' {what} {strength:.1%} {share} in the training data" +
+                      (f" (a sample of {sampled:,} of {total:,} rows)" if sampled else f" ({total:,} rows)") +
+                      f". Near-perfect single-feature association (from {LEAK_ASSOCIATION:.0%}) means the column "
+                      "carries the answer: recorded after the outcome, derived from the label, or a copy of it.",
+                      counts={"association": round(strength, 4), "rows": len(y)}, files=[files[0]["path"]],
+                      columns=[col], sampled=sampled)
+    audit.ran("feature-target-leakage", f"{task} target '{target}'; single-feature association on the training data" +
+              (f"; on a uniform sample of {sampled:,} of {total:,} rows" if sampled else ""), sampled=sampled)
+
+
+def check_time_order(audit: "Audit") -> None:
+    g = guard()
+    time_col = audit.inv.get("time_column")
+    audit.check("time-order", "leakage", "Training data earlier than test data")
+    train, test = audit.files("data", "train"), audit.files("data", "test")
+    if not time_col:
+        audit.could_not("time-order", "no time column (set time_column in the inventory if there is one)")
+        return
+    if not train or not test or not all(time_col in (f.get("columns") or []) for f in train + test):
+        audit.could_not("time-order", f"time column '{time_col}' is not in both the training and test files")
+        return
+    def times(files):
+        import pandas as pd
+        series = pd.concat([read_columns(audit, f["path"], [time_col])[time_col] for f in files], ignore_index=True)
+        return g.as_datetime(series).dropna()
+    t_train, t_test = times(train), times(test)
+    if not len(t_train) or not len(t_test):
+        audit.could_not("time-order", f"'{time_col}' could not be read as dates")
+        return
+    later = int((t_train > t_test.min()).sum())
+    if later:
+        audit.add("time-order", "leakage", "high", "proven", "Training data is later than test data",
+                  f"{later:,} of {len(t_train):,} training rows are dated after the earliest test row (column "
+                  f"'{time_col}'). A model that will predict the future was trained on it; for forecasting this is a "
+                  "leak. If time order does not matter for this problem, set time_column to null in the inventory.",
+                  counts={"training_rows_after_test_start": later, "training_rows": len(t_train)},
+                  files=[f["path"] for f in train + test], columns=[time_col])
+    audit.ran("time-order", f"time column '{time_col}'")
+
+
+@check_function
+def check_leakage(audit: "Audit") -> None:
+    if not audit.wants("leakage"):
+        return
+    try:
+        guard()
+    except NeedsPandas as exc:
+        for check_id in ("train-test-overlap", "feature-target-leakage"):
+            audit.could_not(check_id, str(exc))
+        return
+    for step in (check_overlap, check_target_association, check_time_order):
+        try:
+            step(audit)
+        except Exception as exc:  # noqa: BLE001 - a failed check is reported as such, the rest still run
+            audit.notes.append(f"{step.__name__}: {type(exc).__name__}: {exc}")
+
+
 # ------------------------------------------------------------------ output
 def new_audit_folder(root: Path) -> Path:
     base = root / AUDIT_DIR
@@ -962,7 +1138,7 @@ def report_markdown(audit: Audit, result: str, why: str) -> str:
         lines.append(f"| {c['title']} | {'yes' if c['required'] else 'no'} | {c['status']} | {note} |")
     lines += ["", "## Findings", ""]
     if not audit.findings:
-        lines.append("No findings.")
+        lines += ["No findings.", ""]
     for f in _sorted_findings(audit.findings):
         label = "agent review (not proven by the tool)" if f["evidence"] == "review" else f["evidence"]
         lines += [f"### {f['severity'].upper()} - {f['title']}", "",

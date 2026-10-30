@@ -253,3 +253,85 @@ def large_file(root: Path, n: int = 6000, missing: int = 1234) -> Path:
     train.loc[train.index[:missing], "x3"] = np.nan
     _write(root / "data" / "train.csv", train.drop(columns="_prob"))
     return root
+
+
+# ------------------------------------------------------------------ ticket 04: leakage
+def _both(root: Path, edit_train, edit_test) -> Path:
+    clean_project(root)
+    for name, edit in (("train", edit_train), ("test", edit_test)):
+        frame = pd.read_csv(root / "data" / f"{name}.csv")
+        _write(root / "data" / f"{name}.csv", edit(frame))
+    return root
+
+
+def split_overlap(root: Path, copies: int = 30) -> Path:
+    """``copies`` training rows reappear in the test file under fresh row ids."""
+    clean_project(root)
+    train = pd.read_csv(root / "data" / "train.csv")
+    test = pd.read_csv(root / "data" / "test.csv")
+    copied = train.iloc[:copies].copy()
+    copied["row_id"] = np.arange(copies) + 90_000
+    test = pd.concat([test.iloc[: len(test) - copies], copied], ignore_index=True)
+    _write(root / "data" / "test.csv", test)
+    preds = predictions_for(test.assign(_prob=1 / (1 + np.exp(-(1.5 * test.x0 - test.x1 + 0.6 * (test.cat == "a"))))), 2)
+    _write(root / "outputs" / "test_predictions.csv", preds)
+    _json(root / "outputs" / "metrics.json", {"test": {"accuracy": round(_accuracy(preds.y_true, preds.y_pred), 3)}})
+    return root
+
+
+def shared_entities(root: Path) -> Path:
+    """Rows of the same patients land in both splits (a row-level split of repeated entities)."""
+    rng = np.random.default_rng(9)
+    def add(frame):
+        frame = frame.copy()
+        frame.insert(1, "patient_id", rng.integers(0, 150, len(frame)))
+        return frame
+    return _both(root, add, add)
+
+
+def target_leak(root: Path) -> Path:
+    """A column that is the label plus a little noise: it gives the answer away."""
+    rng = np.random.default_rng(4)
+    def add(frame):
+        frame = frame.copy()
+        frame["post_visit_score"] = (frame["y"] + rng.normal(0, 0.05, len(frame))).round(4)
+        return frame
+    return _both(root, add, add)
+
+
+def flipped_copy_feature(root: Path, reduction: float) -> Path:
+    """A binary column equal to the label with exactly enough flips for a chosen single-feature error reduction."""
+    clean_project(root)
+    train = pd.read_csv(root / "data" / "train.csv")
+    m = float(train["y"].value_counts(normalize=True).iloc[0])
+    flips = int(round((1 - reduction) * (1 - m) * len(train)))
+    flag = train["y"].to_numpy().copy()
+    flag[:flips] = 1 - flag[:flips]
+    train["flag"] = flag
+    _write(root / "data" / "train.csv", train)
+    test = pd.read_csv(root / "data" / "test.csv")
+    test["flag"] = np.random.default_rng(1).integers(0, 2, len(test))
+    _write(root / "data" / "test.csv", test)
+    return root
+
+
+def time_order(root: Path, violate: bool = True) -> Path:
+    """Dated rows; with ``violate`` the training dates run past the start of the test dates."""
+    rng = np.random.default_rng(12)
+    start_train = pd.Timestamp("2024-01-01")
+    start_test = pd.Timestamp("2024-07-01") if violate else pd.Timestamp("2025-02-01")
+    def dates(frame, start, days):
+        frame = frame.copy()
+        frame.insert(1, "event_date", (start + pd.to_timedelta(np.sort(rng.integers(0, days, len(frame))), unit="D")).strftime("%Y-%m-%d"))
+        return frame
+    return _both(root, lambda t: dates(t, start_train, 365), lambda t: dates(t, start_test, 180))
+
+
+def large_leak(root: Path) -> Path:
+    large_file(root, missing=0)
+    rng = np.random.default_rng(4)
+    for name in ("train", "test"):
+        frame = pd.read_csv(root / "data" / f"{name}.csv")
+        frame["post_visit_score"] = (frame["y"] + rng.normal(0, 0.05, len(frame))).round(4)
+        _write(root / "data" / f"{name}.csv", frame)
+    return root
