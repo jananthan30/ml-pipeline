@@ -594,3 +594,20 @@ def test_in_tuning(root: Path) -> Path:
     clean_project(root)
     (root / "tune.py").write_text(TUNING_CODE)
     return root
+
+
+# ------------------------------------------------------------------ ticket 10: approved retrain
+def near_copies(root: Path, frac: float = 0.4) -> Path:
+    """A share of the test rows are training rows with a tiny jitter: not identical, so the exact check misses them."""
+    clean_project(root)
+    train = pd.read_csv(root / "data" / "train.csv")
+    test = pd.read_csv(root / "data" / "test.csv")
+    k = int(len(test) * frac)
+    rng = np.random.default_rng(8)
+    copies = train.iloc[:k].copy()
+    for c in ("x0", "x1", "x2", "x3"):
+        copies[c] = (copies[c] + rng.normal(0, 1e-4, k)).round(6)
+    copies["row_id"] = np.arange(k) + 70_000
+    test = pd.concat([test.iloc[k:], copies], ignore_index=True)
+    _write(root / "data" / "test.csv", test)
+    return root

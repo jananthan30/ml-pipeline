@@ -163,7 +163,15 @@ def main() -> None:
         ("audit: environment prefix", "DENY", "Bash", {"command": f"PYTHONPATH=. python3 {tool} {aud}"}, aud),
         ("audit: --trust without the user's approval", "DENY", "Bash",
          {"command": f"python3 {tool} {aud} --trust audit"}, aud),
+        ("audit: --retrain without the user's approval", "DENY", "Bash",
+         {"command": f"python3 {tool} {aud} --retrain audit"}, aud),
+        ("audit: agent writes the audit approval file", "DENY", "Write",
+         write(aud / "ml_audit" / ".audit_approvals.json", '{"trust": [{"project": "audit"}]}'), aud),
     ]
+    trusted = project("trusted", ledger=["# Pipeline"])
+    user_says("I trust the models in trusted.", trusted)
+    cases.append(("audit: --trust after the user's own message", "ALLOW", "Bash",
+                  {"command": f"python3 {tool} {trusted} --trust trusted"}, trusted))
 
     wrong = 0
     print(f"{'case':46} {'should':7} {'does':6} {'':3}")

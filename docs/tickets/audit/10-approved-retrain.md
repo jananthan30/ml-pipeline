@@ -4,10 +4,10 @@
 
 **Blocked by:** 09
 
-**Status:** ready-for-agent
+**Status:** done (v0.6-audit; adapted to frozen data, see the report)
 
-- [ ] Without approval the check is listed with its reason and does not run
-- [ ] Approval can come only from the user's own message, using the same mechanism as gate approvals
-- [ ] An agent writing the approval itself is denied
-- [ ] The project's own files, gates and test-touch count are unchanged afterward
-- [ ] A planted leak gives a shuffled-label score well above chance, and a clean control does not
+- [x] Without approval the check is listed with its reason and does not run
+- [x] Approval can come only from the user's own message, using the same mechanism as gate approvals
+- [x] An agent writing the approval itself is denied
+- [x] The project's own files, gates and test-touch count are unchanged afterward
+- [x] A planted leak gives a shuffled-label score well above chance, and a clean control does not

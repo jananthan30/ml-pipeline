@@ -269,6 +269,9 @@ class Audit:
         if entry["status"] != "ran":
             entry["status"], entry["reason"] = "could not check", reason
 
+    def needs_approval(self, check_id: str, reason: str) -> None:
+        self.checks[check_id]["status"], self.checks[check_id]["reason"] = "needs approval", reason
+
     def not_applicable(self, check_id: str, reason: str) -> None:
         self.checks[check_id]["status"], self.checks[check_id]["reason"] = "not applicable", reason
 
@@ -1754,6 +1757,107 @@ def check_test_misuse(audit: "Audit") -> None:
                       counts={"lines": len(lines)}, files=[f["path"]],
                       source=", ".join(f"{f['path']}:{n}" for n in lines[:10]))
     audit.ran("test-in-tuning-code", f"{len(code)} code file(s) read as text (never run)")
+
+
+# ------------------------------------------------------------------ check family: approved retrain
+# The shuffled-label check, adapted to a frozen project (the audit never runs project code): every near-identical row
+# (features rounded to NEAR_DECIMALS standard deviations) gets one random label, so the labels carry no signal
+# except a row's identity. A 1-nearest-neighbour model is trained on the training copy and scored on the test copy.
+# An honest split scores at chance; test rows that copy training rows (even with a small jitter that the exact
+# overlap check misses) score above it, in proportion to how many there are. This is the tool's only training, and it
+# runs only with the user's approval, on copies inside the audit folder that are removed afterwards.
+RETRAIN_MAX_ROWS = 20_000      # rows per split used by the retrain check (uniform sample above this; stated)
+NEAR_DECIMALS = 2              # rounding, in training standard deviations, that makes two rows 'the same row'
+SHUFFLE_MARGIN = 0.05          # accuracy above chance (0.5) from which the result is a finding ...
+SHUFFLE_Z = 3.0                # ... when it is also this many standard errors above chance
+
+
+def _random_labels(z) -> "object":
+    import numpy as np
+    import pandas as pd
+    g = guard()
+    keys = pd.DataFrame(np.round(z, NEAR_DECIMALS) + 0.0)  # + 0.0 turns -0.0 into 0.0
+    return ((g._row_hashes(keys) >> np.uint64(17)) & np.uint64(1)).astype(np.int8)
+
+
+def _nearest_labels(train_z, train_labels, test_z, chunk: int = 512):
+    import numpy as np
+    sq = (train_z ** 2).sum(axis=1)
+    out = np.empty(len(test_z), dtype=train_labels.dtype)
+    for start in range(0, len(test_z), chunk):
+        block = test_z[start:start + chunk]
+        dist = sq[None, :] - 2.0 * block @ train_z.T
+        out[start:start + chunk] = train_labels[np.argmin(dist, axis=1)]
+    return out
+
+
+@check_function
+def check_retrain(audit: "Audit") -> None:
+    import shutil
+    if not audit.wants("retrain"):
+        return
+    audit.check("shuffled-label", "retrain", "Shuffled-label retrain on copies (memorization test)")
+    name = audit.root.name
+    if audit.args.retrain != name:
+        audit.needs_approval("shuffled-label", (f"--retrain names '{audit.args.retrain}', not this project; " if audit.args.retrain else "") +
+                             "trains a small nearest-neighbour model on copies inside the audit folder, with labels "
+                             "randomised per near-identical row; a test score above chance proves the test rows copy "
+                             f"training rows. Runs only after the user says 'approve audit retrain for {name}' "
+                             f"(then rerun with --retrain {name})")
+        return
+    try:
+        g = guard()
+    except NeedsPandas as exc:
+        audit.could_not("shuffled-label", str(exc))
+        return
+    import numpy as np
+    import pandas as pd
+    target = audit.inv.get("target")
+    train, test = audit.files("data", "train"), audit.files("data", "test")
+    if not train or not test:
+        audit.could_not("shuffled-label", "needs separate training and test data files")
+        return
+    skip = {target, audit.inv.get("entity_column"), audit.inv.get("time_column")}
+    folder = audit.out / "retrain"
+    folder.mkdir()
+    try:
+        frames, sampled = {}, None
+        for role, files in (("train", train), ("test", test)):
+            frame, total = g.load_sample(str(audit.root / files[0]["path"]), RETRAIN_MAX_ROWS)
+            if total > RETRAIN_MAX_ROWS:
+                sampled = RETRAIN_MAX_ROWS
+            frame.to_csv(folder / f"{role}_copy.csv", index=False)
+            frames[role] = pd.read_csv(folder / f"{role}_copy.csv")  # everything below works on the copies
+        feats = [c for c in frames["train"].columns if c in frames["test"].columns and c not in skip
+                 and not ID_COLUMN.search(str(c)) and pd.api.types.is_numeric_dtype(frames["train"][c])
+                 and pd.api.types.is_numeric_dtype(frames["test"][c])]
+        if not feats:
+            audit.could_not("shuffled-label", "no numeric feature columns shared by the training and test files")
+            return
+        a = frames["train"][feats].astype(float)
+        b = frames["test"][feats].astype(float)
+        mu, sd = a.mean(), a.std(ddof=0).replace(0, 1.0)
+        za, zb = ((a - mu) / sd).fillna(0).to_numpy(), ((b - mu) / sd).fillna(0).to_numpy()
+        la, lb = _random_labels(za), _random_labels(zb)
+        predicted = _nearest_labels(za, la, zb)
+        n = len(lb)
+        acc, chance = float(np.mean(predicted == lb)), 0.5
+        z = (acc - chance) / float(np.sqrt(chance * (1 - chance) / n))
+        if acc >= chance + SHUFFLE_MARGIN and z >= SHUFFLE_Z:
+            audit.add("shuffled-label-above-chance", "retrain", "critical", "proven",
+                      "With random labels, a retrained model still beats chance on the test rows",
+                      f"labels were randomised per near-identical row (rounded to {NEAR_DECIMALS} decimals of a training "
+                      f"standard deviation on {len(feats)} numeric columns); a nearest-neighbour model trained on the "
+                      f"training copy scored {acc:.3f} on {n:,} test rows against chance {chance:.2f} ({z:.1f} standard "
+                      "errors above). Only rows that repeat training rows can be predicted, so roughly "
+                      f"{max(0.0, 2 * (acc - chance)):.0%} of the test rows are near-copies of training rows." +
+                      (f" (Uniform samples of {sampled:,} rows per split.)" if sampled else ""),
+                      counts={"accuracy": round(acc, 6), "chance": chance, "test_rows": n, "z": round(z, 3)},
+                      files=[train[0]["path"], test[0]["path"]], columns=feats, sampled=sampled)
+        audit.ran("shuffled-label", f"approved by the user; random-label accuracy {acc:.3f} on {n:,} test rows "
+                                    f"(chance {chance:.2f}); copies removed afterwards", sampled=sampled)
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
 
 
 # ------------------------------------------------------------------ trusted scoring (only with the user's trust)
