@@ -420,6 +420,31 @@ class Profile(unittest.TestCase):
 NOTE_CASES = json.loads((Path(__file__).resolve().parent / "note_rule_cases.json").read_text())
 
 
+class NearlyEmptyColumnsOnBigData(unittest.TestCase):
+    """combined: a column the uniform sample misses entirely still gets every profile key, so Gate A can pass."""
+
+    def test_sample_without_values_keeps_the_keys(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "hooks"))
+        import gate_records
+        with tempfile.TemporaryDirectory() as tmp:
+            n = 5000
+            df = pd.DataFrame({"x": np.arange(n) % 7.0, "rare": np.nan, "note": None, "y": np.arange(n) % 2})
+            df.loc[n - 1, "rare"] = 3.5
+            df.loc[n - 1, "note"] = "a free-text remark that is long enough to be text"
+            path = Path(tmp) / "d.csv"
+            df.to_csv(path, index=False)
+            saved = (guard.SAMPLE_ROWS, guard.BATCH_ROWS)
+            guard.SAMPLE_ROWS, guard.BATCH_ROWS = 100, 700
+            try:
+                p = guard.profile(str(path), target="y", state_dir=Path(tmp) / "ml_pipeline")
+            finally:
+                guard.SAMPLE_ROWS, guard.BATCH_ROWS = saved
+            rare = p["columns"]["rare"]
+            self.assertEqual((rare["non_null"], rare["mean"], rare["max"]), (1, 3.5, 3.5))   # exact, every row
+            self.assertIn("p99", rare)
+            self.assertEqual(gate_records._profile_problems(p), [])
+
+
 class NoteRule(unittest.TestCase):
     def test_shared_cases(self):
         for case in NOTE_CASES["cases"]:
