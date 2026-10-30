@@ -24,6 +24,9 @@ build report: `docs/superpowers/plans/v0.6-audit-REPORT.md`.
 - **Approved retrain:** a shuffled-label memorization check on copies inside the audit folder, after the
   user's "approve audit retrain for <project>".
 - **Agent review layer:** `--review` findings, labelled, never proven, never decisive alone.
+- `report.md` and `findings.json` hold column names and counts only. Files that hold values from the data
+  (`trusted_predictions/`, `local_only/subgroup_levels.json`) stay in the audit folder and are marked local-only;
+  inventory corrections are listed one by one (guessed -> corrected).
 - Evals `audit-no-pipeline` and `audit-planted-leak`; a planted-problem / clean-control table
   (`tests/audit_fixture_table.py`).
 
