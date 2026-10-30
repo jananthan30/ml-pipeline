@@ -60,6 +60,10 @@ CODE_SUFFIXES = (".py", ".ipynb", ".r")
 DOC_SUFFIXES = (".md", ".markdown", ".rst", ".txt")
 CLAIM_NAME = re.compile(r"metric|result|score|eval|perf|report", re.I)
 RUN_LOG_NAMES = {"runs.jsonl"}
+# Records the guard library writes next to the ledger (its *_FILE constants and other outputs): never data or claims.
+GUARD_RECORD_FILES = {"data_profile.json", "data_profile_summary.md", "source.json", "correlations.csv", "pages.json",
+                      "data_dictionary.csv", "missingness.csv", "categorical_plan.csv", "label_audit.md",
+                      "cleaning_log.csv", "associations.json", "training_runs.jsonl", "importance.json", "manifest.csv"}
 LEDGER_NAME = "PIPELINE.md"
 ROLE_WORDS = {"train": "train", "training": "train", "trn": "train",
               "val": "val", "valid": "val", "validation": "val", "dev": "val",
@@ -151,7 +155,9 @@ def classify(path: Path, root: Path) -> dict:
     suffix = _suffix(path.name)
     words = _tokens(Path(path.name[: len(path.name) - len(suffix)] if suffix else path.name).name)
     role = next((ROLE_WORDS[w] for w in sorted(words) if w in ROLE_WORDS), None)
-    if path.name in RUN_LOG_NAMES:
+    if path.parent.name == "ml_pipeline" and path.name in GUARD_RECORD_FILES:
+        entry["kind"] = "pipeline record"
+    elif path.name in RUN_LOG_NAMES:
         entry.update(kind="claims", source="run log")
     elif path.name == LEDGER_NAME and path.parent.name == "ml_pipeline":
         entry.update(kind="claims", source="ledger")
@@ -1020,13 +1026,14 @@ def check_overlap(audit: "Audit") -> None:
         return
     entity = audit.inv.get("entity_column")
     audit.check("entity-overlap", "leakage", "Entities shared across splits")
-    entity_ran, few = False, []
+    entity_ran, few, compared = False, [], 0
     for early, late in SPLIT_PAIRS:
         if not roles[early] or not roles[late]:
             continue
         cols = [c for c in _common(roles[early], roles[late]) if not ID_COLUMN.search(c) and c != entity]
         if not cols:
             continue
+        compared += 1
         a, _ = _file_hashes(audit, roles[early], cols)
         later = _hashes_per_row(audit, roles[late], cols)
         shared = int(np.isin(later, a).sum())
@@ -1055,7 +1062,12 @@ def check_overlap(audit: "Audit") -> None:
                           "new entities. If the split is by time on purpose, set entity_column to null in the inventory.",
                           counts={"shared_entities": shared_e, f"{late}_entities": len(eb)},
                           files=[f["path"] for f in roles[early] + roles[late]], columns=[entity])
-    audit.ran("train-test-overlap", "every row of every split compared (identifier columns left out)")
+    if compared:
+        audit.ran("train-test-overlap", "every row of every split compared (identifier columns left out)")
+    else:
+        audit.could_not("train-test-overlap", "the training and test files share no columns to compare (features and "
+                                              "labels in separate files?); correct the inventory so each split is one "
+                                              "file with its features, or exclude the others")
     if entity_ran and few:
         audit.not_applicable("entity-overlap", "; ".join(few))
     elif entity_ran:
@@ -1081,12 +1093,14 @@ def check_target_association(audit: "Audit") -> None:
     if task == "classification":
         majority = float(y.astype(str).value_counts(normalize=True).iloc[0]) if len(y) else 1.0
     skip = {target, audit.inv.get("time_column"), audit.inv.get("entity_column")}
+    assessed = 0
     for col in data.columns:
         if col in skip or ID_COLUMN.search(str(col)):
             continue
         kind = g._column_kind(data[col])
         if kind not in ("numeric", "categorical", "bool"):
             continue
+        assessed += 1
         codes = g._codes(data[col], "numeric" if kind == "numeric" else "categorical")
         if task == "classification":
             if majority >= 1.0:
@@ -1108,7 +1122,11 @@ def check_target_association(audit: "Audit") -> None:
                       "carries the answer: recorded after the outcome, derived from the label, or a copy of it.",
                       counts={"association": round(strength, 4), "rows": len(y)}, files=[files[0]["path"]],
                       columns=[col], sampled=sampled)
-    audit.ran("feature-target-leakage", f"{task} target '{target}'; single-feature association on the training data" +
+    if not assessed:
+        audit.could_not("feature-target-leakage", f"{files[0]['path']} holds no feature column next to '{target}' "
+                                                  "(features and labels in separate files?); correct the inventory")
+        return
+    audit.ran("feature-target-leakage", f"{task} target '{target}'; {assessed} feature(s) assessed on the training data" +
               (f"; on a uniform sample of {sampled:,} of {total:,} rows" if sampled else ""), sampled=sampled)
 
 

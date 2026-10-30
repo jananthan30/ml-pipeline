@@ -631,3 +631,38 @@ def near_baseline(root: Path, margin: float) -> Path:
     _json(root / "outputs" / "metrics.json", {"test": {"accuracy": round(_accuracy(y, pred), 4)}})
     assert abs(_accuracy(y, pred) - base - fix / len(y)) < 1e-12
     return root
+
+
+# ------------------------------------------------------------------ layouts the checks must not mistake for evidence
+GUARD_RECORDS = {"training_runs.jsonl": json.dumps({"name": "logreg", "rows": 1200}) + "\n",
+                 "data_dictionary.csv": "column,kind,meaning\nx0,numeric,first measurement\n",
+                 "missingness.csv": "column,n_missing,pct_missing\nx0,0,0.0\n",
+                 "categorical_plan.csv": "column,n_levels,encoding\ncat,3,one-hot\n",
+                 "cleaning_log.csv": "step,rule,rows\n1,none,0\n", "correlations.csv": ",x0\nx0,1.0\n",
+                 "manifest.csv": "path,label\n", "source.json": "{}", "associations.json": "{}",
+                 "importance.json": "{}", "pages.json": "{}", "data_profile.json": "{}"}
+
+
+def pipeline_project(root: Path) -> Path:
+    """A clean project with the guard library's own record files next to the ledger (a v0.5 pipeline project)."""
+    clean_project(root)
+    (root / "ml_pipeline").mkdir(exist_ok=True)
+    for name, body in GUARD_RECORDS.items():
+        (root / "ml_pipeline" / name).write_text(body)
+    return root
+
+
+def xy_split_files(root: Path, *, set_target: bool = True) -> Path:
+    """Features and labels in separate files (X_train/y_train/X_test/y_test); the target set in the inventory."""
+    root.mkdir(parents=True, exist_ok=True)
+    train = classification_frame(800, 1).drop(columns="_prob")
+    test = classification_frame(300, 2, id_start=800).drop(columns="_prob")
+    for name, frame in (("train", train), ("test", test)):
+        _write(root / f"X_{name}.csv", frame.drop(columns="y"))
+        _write(root / f"y_{name}.csv", frame[["y"]])
+    preds = predictions_for(classification_frame(300, 2, id_start=800), 3)
+    _write(root / "test_predictions.csv", preds)
+    _json(root / "metrics.json", {"test": {"accuracy": round(_accuracy(preds.y_true, preds.y_pred), 3)}})
+    if set_target:
+        _json(root / "ml_audit" / "inventory.json", {"target": "y"})
+    return root

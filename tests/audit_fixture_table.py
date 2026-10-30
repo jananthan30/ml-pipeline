@@ -82,6 +82,10 @@ PLANTED = [
      "claim-mismatch", "critical", "proven", NT, True),
     ("trusted model whose class is gone", fx.missing_class_project, ["--trust", "{name}"],
      "trusted-scoring-failed", "info", "could-not-check", TW, False),
+    ("X/y files: required checks cannot run", fx.xy_split_files, [], "could-not-check:train-test-overlap", None, None,
+     NEE, False),
+    ("X/y files: no feature next to the label", fx.xy_split_files, [], "could-not-check:feature-target-leakage", None,
+     None, NEE, False),
     ("review critical only (agent)", fx.clean_project, ["--review", "family=leakage,severity=critical,text=scaler fit before split"],
      "agent-review", "critical", "review", NEE, False),
 ]
@@ -99,6 +103,7 @@ CLEAN = [
     ("borderline: feature at 94% association", lambda r: fx.flipped_copy_feature(r, 0.94), [], TW, False),
     ("borderline: weak group of 29 rows", lambda r: fx.small_weak_group(r, 29), [], TW, False),
     ("borderline: calibration error 0.09", lambda r: fx.constant_probability(r, 0.09), [], TW, False),
+    ("v0.5 pipeline project (guard records)", fx.pipeline_project, [], TW, False),
     ("clean, approved retrain", fx.clean_project, ["--retrain", "{name}"], TW, False),
     ("ordinary sklearn/joblib/torch files", _sklearn_clean, [], TW, True),
     ("trusted sklearn model, honest claim", fx.trusted_project, ["--trust", "{name}"], TW, True),

@@ -141,6 +141,37 @@ class Skeleton(unittest.TestCase):
         fx.run_audit(proj)
         self.assertEqual((proj / "ml_pipeline" / "PIPELINE.md").read_text(), ledger)
 
+    def test_the_guards_record_files_are_pipeline_records_not_data(self):
+        proj = fx.pipeline_project(self.root / "p")
+        _, out, f = fx.run_audit(proj)
+        inv = json.loads((out / "inventory.json").read_text())
+        kinds = {x["path"]: x["kind"] for x in inv["files"]}
+        for name in fx.GUARD_RECORDS:
+            self.assertEqual(kinds["ml_pipeline/" + name], "pipeline record", name)
+        self.assertEqual(inv["target"], "y")
+        self.assertEqual(f["verdict"], "trustworthy", f["verdict_reason"])
+
+    def test_every_record_file_the_guard_library_names_is_known_to_the_tool(self):
+        import importlib.util
+        import re
+        spec = importlib.util.spec_from_file_location("audit_tool", fx.TOOL)
+        tool = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(tool)
+        guard_src = (fx.ROOT / "skills" / "ml-pipeline" / "lib" / "mlpipeline_guard.py").read_text()
+        names = set(re.findall(r'^\w+_FILE = "([^"]+)"', guard_src, re.M))
+        names |= set(re.findall(r'state_dir / "(\w+\.\w+)"', guard_src))
+        names -= {".guard_state.json", ".approvals.json", "runs.jsonl", "PIPELINE.md"}  # never opened / claims
+        self.assertTrue(names)
+        self.assertEqual(names - set(tool.GUARD_RECORD_FILES), set())
+
+    def test_required_checks_never_say_ran_without_comparing_anything(self):
+        _, _, f = fx.run_audit(fx.xy_split_files(self.root / "xy"))
+        status = {c["id"]: (c["status"], c["reason"]) for c in f["checks"]}
+        self.assertEqual(status["train-test-overlap"][0], "could not check")
+        self.assertIn("inventory", status["train-test-overlap"][1])
+        self.assertEqual(status["feature-target-leakage"][0], "could not check")
+        self.assertNotEqual(f["verdict"], "trustworthy")
+
     def test_a_folder_with_nothing_to_check_is_not_enough_evidence(self):
         proj = self.root / "empty"
         proj.mkdir()
