@@ -1105,6 +1105,373 @@ def check_leakage(audit: "Audit") -> None:
             audit.notes.append(f"{step.__name__}: {type(exc).__name__}: {exc}")
 
 
+# ------------------------------------------------------------------ check family: model safety (static scan)
+# A pickle is a small program: GLOBAL / STACK_GLOBAL / INST import a callable and REDUCE / OBJ / NEWOBJ call it. The scan
+# walks the opcodes with pickletools.genops (which only decodes them) and a stack of inert placeholders, so it learns
+# every name the file would import without importing or calling anything.
+SAFE_GLOBALS = re.compile(
+    r"^(?:numpy(?:\.(?!load$|lib\.npyio|f2py|distutils|testing|ctypeslib)[\w.]+)?|"
+    r"sklearn\.[\w.]+|scipy\.(?:sparse|stats|special|interpolate|spatial|linalg|optimize)[\w.]*|"
+    r"pandas\.(?:core|_libs|arrays)[\w.]*|pandas\.(?:DataFrame|Series|Index|Categorical|Timestamp|Timedelta)|"
+    r"xgboost\.[\w.]+|lightgbm\.[\w.]+|catboost\.[\w.]+|joblib\.numpy_pickle\.NumpyArrayWrapper|"
+    r"collections\.(?:OrderedDict|defaultdict|Counter|deque)|copyreg\._reconstructor|_codecs\.encode|"
+    r"builtins\.(?:set|frozenset|slice|range|complex|bytearray|bytes|dict|list|tuple|int|float|str|bool|object)|"
+    r"datetime\.(?:datetime|date|time|timedelta|timezone)|decimal\.Decimal|"
+    r"torch\._utils\._rebuild_(?:tensor|tensor_v2|parameter|parameter_with_state)|torch\._tensor\._rebuild_from_type_v2|"
+    r"torch\.\w*Storage|torch\.storage\.(?:UntypedStorage|TypedStorage)|torch\.(?:Size|device|dtype)|"
+    r"torch\.(?:float|int|uint|bool|bfloat|complex|half|double|long|short|cfloat|cdouble)\w*|"
+    r"torch\.nn\.(?:modules\.[\w.]+|parameter\.Parameter))$")
+DANGEROUS_MODULES = {"os", "posix", "nt", "subprocess", "sys", "socket", "shutil", "runpy", "importlib", "pickle",
+                     "_pickle", "marshal", "ctypes", "pty", "webbrowser", "code", "codeop", "http", "urllib", "requests",
+                     "multiprocessing", "asyncio", "pathlib", "io", "tempfile", "glob", "signal", "commands", "platform",
+                     # the C modules behind them, which is how some callables pickle (open -> _io.open)
+                     "_io", "_posixsubprocess", "_socket", "_thread", "_winapi", "_ctypes", "_signal", "posixpath",
+                     "ntpath", "_osx_support"}
+DANGEROUS_BUILTINS = {"eval", "exec", "compile", "open", "getattr", "setattr", "delattr", "__import__", "globals",
+                      "locals", "vars", "input", "breakpoint", "help", "exit", "quit", "memoryview", "super"}
+MAX_DECOMPRESSED = 1 << 30
+CODE_FREE = {".safetensors": "safetensors holds tensors and a JSON header only",
+             ".onnx": "ONNX is a protobuf graph of standard operators (custom-operator libraries aside)",
+             ".cbm": "CatBoost's binary format holds trees, not code", ".ubj": "XGBoost's UBJSON format holds trees, not code"}
+ZIP_MAGIC = b"PK\x03\x04"
+
+
+class Unverified(Exception):
+    pass
+
+
+class _Mark:
+    pass
+
+
+class _Global:
+    def __init__(self, name: str):
+        self.name = name
+
+
+class _Call:
+    def __init__(self, func, args=None):
+        self.func, self.args, self.state = func, args, None
+
+
+def _pop_mark(stack: list) -> list:
+    for i in range(len(stack) - 1, -1, -1):
+        if isinstance(stack[i], _Mark):
+            items = stack[i + 1:]
+            del stack[i:]
+            return items
+    raise Unverified("MARK missing")
+
+
+_PUSH_ARG = {"INT", "BININT", "BININT1", "BININT2", "LONG", "LONG1", "LONG4", "STRING", "BINSTRING", "SHORT_BINSTRING",
+             "BINBYTES", "SHORT_BINBYTES", "BINBYTES8", "BYTEARRAY8", "UNICODE", "SHORT_BINUNICODE", "BINUNICODE",
+             "BINUNICODE8", "FLOAT", "BINFLOAT"}
+_CONST = {"NONE": None, "NEWTRUE": True, "NEWFALSE": False}
+_ITEMSIZE = re.compile(r"^[<>|=]?([a-zA-Z])(\d*)$")
+
+
+def _joblib_array_bytes(state) -> tuple[int | None, bool, bool]:
+    """(raw byte count, object dtype?, padded?) of the array joblib writes after a NumpyArrayWrapper."""
+    if not isinstance(state, dict):
+        raise Unverified("joblib array header unreadable")
+    shape, dtype = state.get("shape"), state.get("dtype")
+    if not isinstance(shape, tuple) or not all(isinstance(n, int) for n in shape):
+        raise Unverified("joblib array shape unreadable")
+    if not (isinstance(dtype, _Call) and isinstance(dtype.args, tuple) and dtype.args and isinstance(dtype.args[0], str)):
+        raise Unverified("joblib array dtype unreadable")
+    m = _ITEMSIZE.match(dtype.args[0])
+    if not m:
+        raise Unverified(f"joblib array dtype {dtype.args[0]!r} not understood")
+    kind, size = m.group(1), m.group(2)
+    if kind == "O":
+        return None, True, False
+    if not size:
+        size = {"b": "1", "?": "1", "B": "1", "e": "2", "f": "4", "d": "8", "g": "16"}.get(kind) or ""
+        if not size:
+            raise Unverified(f"joblib array dtype {dtype.args[0]!r} not understood")
+    itemsize = int(size) * (4 if kind == "U" else 1)
+    count = 1
+    for n in shape:
+        count *= n
+    return count * itemsize, False, "numpy_array_alignment_bytes" in state
+
+
+def scan_pickle(stream, found: set, depth: int = 0) -> None:
+    """Walk one pickle from ``stream`` to its STOP, adding every imported name to ``found``. Raises Unverified."""
+    import pickletools
+    if depth > 3:
+        raise Unverified("nested pickles too deep")
+    stack, memo = [], {}
+    while True:
+        restart = False
+        try:
+            for op, arg, _ in pickletools.genops(stream):
+                name = op.name
+                if name in _PUSH_ARG:
+                    stack.append(arg)
+                elif name in _CONST:
+                    stack.append(_CONST[name])
+                elif name in ("PROTO", "FRAME"):
+                    continue
+                elif name == "STOP":
+                    return
+                elif name == "EMPTY_TUPLE":
+                    stack.append(())
+                elif name == "EMPTY_LIST":
+                    stack.append([])
+                elif name == "EMPTY_DICT":
+                    stack.append({})
+                elif name == "EMPTY_SET":
+                    stack.append(set())
+                elif name in ("TUPLE1", "TUPLE2", "TUPLE3"):
+                    n = int(name[-1])
+                    items = stack[-n:]
+                    del stack[-n:]
+                    stack.append(tuple(items))
+                elif name == "TUPLE":
+                    stack.append(tuple(_pop_mark(stack)))
+                elif name == "LIST":
+                    stack.append(list(_pop_mark(stack)))
+                elif name == "DICT":
+                    items = _pop_mark(stack)
+                    stack.append({_key(items[i]): items[i + 1] for i in range(0, len(items) - 1, 2)})
+                elif name in ("FROZENSET",):
+                    _pop_mark(stack)
+                    stack.append(frozenset())
+                elif name == "MARK":
+                    stack.append(_Mark())
+                elif name == "POP":
+                    stack.pop()
+                elif name == "POP_MARK":
+                    _pop_mark(stack)
+                elif name == "DUP":
+                    stack.append(stack[-1])
+                elif name in ("APPEND",):
+                    value = stack.pop()
+                    if isinstance(stack[-1], list):
+                        stack[-1].append(value)
+                elif name == "APPENDS":
+                    items = _pop_mark(stack)
+                    if isinstance(stack[-1], list):
+                        stack[-1].extend(items)
+                elif name == "SETITEM":
+                    value, key = stack.pop(), stack.pop()
+                    if isinstance(stack[-1], dict):
+                        stack[-1][_key(key)] = value
+                elif name == "SETITEMS":
+                    items = _pop_mark(stack)
+                    if isinstance(stack[-1], dict):
+                        for i in range(0, len(items) - 1, 2):
+                            stack[-1][_key(items[i])] = items[i + 1]
+                elif name == "ADDITEMS":
+                    _pop_mark(stack)
+                elif name in ("GET", "BINGET", "LONG_BINGET"):
+                    if arg not in memo:
+                        raise Unverified("memo reference to nothing")
+                    stack.append(memo[arg])
+                elif name in ("PUT", "BINPUT", "LONG_BINPUT"):
+                    memo[arg] = stack[-1]
+                elif name == "MEMOIZE":
+                    memo[len(memo)] = stack[-1]
+                elif name in ("GLOBAL", "INST"):
+                    module, _, attr = str(arg).partition(" ")
+                    found.add(f"{module}.{attr}")
+                    if name == "INST":
+                        stack.append(_Call(_Global(f"{module}.{attr}"), tuple(_pop_mark(stack))))
+                    else:
+                        stack.append(_Global(f"{module}.{attr}"))
+                elif name == "STACK_GLOBAL":
+                    attr, module = stack.pop(), stack.pop()
+                    if not isinstance(module, str) or not isinstance(attr, str):
+                        raise Unverified("an import whose name is built at load time")
+                    found.add(f"{module}.{attr}")
+                    stack.append(_Global(f"{module}.{attr}"))
+                elif name in ("EXT1", "EXT2", "EXT4"):
+                    raise Unverified("an import through the copyreg extension registry")
+                elif name == "REDUCE":
+                    args, func = stack.pop(), stack.pop()
+                    stack.append(_Call(func, args))
+                elif name == "NEWOBJ":
+                    args, cls = stack.pop(), stack.pop()
+                    stack.append(_Call(cls, args))
+                elif name == "NEWOBJ_EX":
+                    stack.pop()
+                    args, cls = stack.pop(), stack.pop()
+                    stack.append(_Call(cls, args))
+                elif name == "OBJ":
+                    items = _pop_mark(stack)
+                    stack.append(_Call(items[0] if items else None, tuple(items[1:])))
+                elif name == "BUILD":
+                    state = stack.pop()
+                    obj = stack[-1]
+                    if isinstance(obj, _Call):
+                        obj.state = state
+                        func = obj.func
+                        if isinstance(func, _Global) and func.name == "joblib.numpy_pickle.NumpyArrayWrapper":
+                            nbytes, objects, padded = _joblib_array_bytes(state)
+                            if objects:
+                                scan_pickle(stream, found, depth + 1)  # joblib pickles object arrays as a nested pickle
+                            else:
+                                if padded:
+                                    pad = stream.read(1)
+                                    if len(pad) != 1:
+                                        raise Unverified("file ends inside a joblib array")
+                                    stream.read(pad[0])
+                                skipped = stream.read(nbytes)
+                                if len(skipped) != nbytes:
+                                    raise Unverified("file ends inside a joblib array")
+                            restart = True
+                            break
+                elif name == "PERSID":
+                    stack.append(_Call(None, arg))
+                elif name == "BINPERSID":
+                    stack.append(_Call(None, stack.pop()))
+                elif name in ("NEXT_BUFFER",):
+                    stack.append(None)
+                elif name in ("READONLY_BUFFER",):
+                    continue
+                else:
+                    raise Unverified(f"opcode {name} not understood")
+        except Unverified:
+            raise
+        except (ValueError, IndexError, KeyError, TypeError, EOFError) as exc:
+            raise Unverified(f"not a readable pickle ({type(exc).__name__}: {str(exc)[:80]})") from None
+        if not restart:
+            raise Unverified("the pickle has no end (truncated)")
+
+
+def _key(value):
+    try:
+        hash(value)
+        return value
+    except TypeError:
+        return id(value)
+
+
+def _decompressed(head: bytes, path: Path) -> bytes | None:
+    """The decompressed bytes of a compressed joblib file, or None when the file is not compressed."""
+    import bz2
+    import lzma
+    import zlib
+    data = None
+    if head.startswith(b"\x1f\x8b"):
+        with gzip.open(path, "rb") as fh:
+            data = fh.read(MAX_DECOMPRESSED + 1)
+    elif head.startswith(b"BZh"):
+        with bz2.open(path, "rb") as fh:
+            data = fh.read(MAX_DECOMPRESSED + 1)
+    elif head.startswith(b"\xfd7zXZ\x00") or head.startswith(b"]\x00\x00"):
+        with lzma.open(path, "rb") as fh:
+            data = fh.read(MAX_DECOMPRESSED + 1)
+    elif head[:1] == b"x" and len(head) > 1 and head[1] in (0x01, 0x5E, 0x9C, 0xDA):
+        d = zlib.decompressobj()
+        data = d.decompress(path.read_bytes(), MAX_DECOMPRESSED + 1)
+    elif head.startswith(b'\x04"M\x18'):
+        raise Unverified("lz4-compressed (no decompressor in the standard library)")
+    elif head.startswith(b"ZF"):
+        raise Unverified("an old joblib format")
+    if data is not None and len(data) > MAX_DECOMPRESSED:
+        raise Unverified("decompressed size over the scan limit")
+    return data
+
+
+def scan_model(path: Path) -> dict:
+    """{'status': 'clean'|'risky'|'unverified'|'code-free', 'imports': [...], 'dangerous': [...], 'unlisted': [...], 'why'}"""
+    suffix = path.suffix.lower()
+    if suffix in CODE_FREE:
+        return {"status": "code-free", "imports": [], "why": CODE_FREE[suffix]}
+    found: set = set()
+    try:
+        with path.open("rb") as fh:
+            head = fh.read(8)
+        if not head:
+            raise Unverified("the file is empty")
+        if head.startswith(ZIP_MAGIC):
+            import zipfile
+            try:
+                with zipfile.ZipFile(path) as zf:
+                    members = [m for m in zf.namelist() if m.endswith(".pkl")]
+                    config = [m for m in zf.namelist() if m.endswith("config.json")]
+                    if not members and not config:
+                        raise Unverified("a zip file with no pickle or model config inside")
+                    for member in members:
+                        with zf.open(member) as fh:
+                            scan_pickle(io.BytesIO(fh.read()), found)
+                    for member in config:
+                        text = zf.read(member).decode("utf-8", "replace")
+                        if re.search(r'"class_name"\s*:\s*"(?:Lambda|TFOpLambda)"|"function_type"', text):
+                            found.add("keras.layers.Lambda (code stored in the model config)")
+            except zipfile.BadZipFile as exc:
+                raise Unverified(f"a damaged zip file ({exc})") from None
+        elif suffix in (".h5", ".hdf5", ".keras"):
+            raise Unverified("HDF5/Keras files are not scanned (Lambda layers can hold code)")
+        else:
+            data = _decompressed(head, path)
+            stream = io.BytesIO(data) if data is not None else path.open("rb")
+            try:
+                if (data[:1] if data is not None else head[:1]) != b"\x80" and head[:1] not in (b"(", b"c", b"]", b"}"):
+                    raise Unverified("not a pickle (unknown format)")
+                scan_pickle(stream, found)
+                while True:  # further pickles after the first STOP (legacy torch files) must parse too
+                    rest = stream.read(1)
+                    if not rest:
+                        break
+                    stream.seek(-1, 1)
+                    scan_pickle(stream, found)
+            finally:
+                stream.close()
+    except Unverified as exc:
+        return {"status": "unverified", "imports": sorted(found), "why": str(exc)}
+    except OSError as exc:
+        return {"status": "unverified", "imports": sorted(found), "why": f"could not be read ({exc.strerror})"}
+    found = {"builtins." + n.split(".", 1)[1] if n.startswith("__builtin__.") else n for n in found}  # Python 2 name
+    dangerous = sorted(n for n in found if n.split(".")[0] in DANGEROUS_MODULES or
+                       (n.startswith("builtins.") and n.split(".", 1)[1] in DANGEROUS_BUILTINS) or "Lambda" in n)
+    unlisted = sorted(n for n in found if n not in dangerous and not SAFE_GLOBALS.match(n))
+    status = "risky" if dangerous or unlisted else "clean"
+    return {"status": status, "imports": sorted(found), "dangerous": dangerous, "unlisted": unlisted, "why": ""}
+
+
+NOT_PROOF = "A clean scan lowers the risk; it does not prove the file is safe to load."
+
+
+@check_function
+def check_model_safety(audit: "Audit") -> None:
+    if not audit.wants("model-safety"):
+        return
+    audit.check("model-scan", "model-safety", "Model files scanned without loading them")
+    models = audit.files("model")
+    if not models:
+        audit.could_not("model-scan", "no model files in the inventory")
+        return
+    audit.scans = {}
+    for f in models:
+        result = scan_model(audit.root / f["path"])
+        audit.scans[f["path"]] = result
+        if result["status"] == "code-free":
+            audit.add("code-free-format", "model-safety", "info", "proven", f"{f['path']} is a code-free format",
+                      f"{result['why']}; loading it runs no stored code.", files=[f["path"]])
+        elif result["status"] == "unverified":
+            audit.add("unverified-model", "model-safety", "medium", "could-not-check", f"{f['path']} could not be verified",
+                      f"the scan could not read it: {result['why']}. Unverified is not safe: treat it as able to run code.",
+                      files=[f["path"]])
+        elif result["status"] == "risky":
+            d, u = result["dangerous"], result["unlisted"]
+            audit.add("risky-imports", "model-safety", "high" if d else "medium", "proven",
+                      f"{f['path']} imports {'dangerous names' if d else 'names outside the safe list'}",
+                      (f"loading it would import {', '.join(d)} - these can run commands or touch files. " if d else "") +
+                      (f"It also imports names outside the safe list: {', '.join(u[:12])}" +
+                       (f" and {len(u) - 12} more" if len(u) > 12 else "") +
+                       " (often the project's own classes; they run code on load)." if u else "") +
+                      " The file was not loaded.",
+                      counts={"dangerous_imports": len(d), "unlisted_imports": len(u)}, files=[f["path"]])
+        else:
+            audit.add("scan-clean", "model-safety", "info", "proven", f"{f['path']}: no risky imports found",
+                      f"every one of its {len(result['imports'])} imports is on the safe list. {NOT_PROOF} "
+                      "The file was not loaded.", counts={"imports": len(result["imports"])}, files=[f["path"]])
+    audit.ran("model-scan", f"{len(models)} file(s) scanned statically and not loaded. {NOT_PROOF}")
+
+
 # ------------------------------------------------------------------ output
 def new_audit_folder(root: Path) -> Path:
     base = root / AUDIT_DIR

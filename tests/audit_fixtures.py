@@ -335,3 +335,75 @@ def large_leak(root: Path) -> Path:
         frame["post_visit_score"] = (frame["y"] + rng.normal(0, 0.05, len(frame))).round(4)
         _write(root / "data" / f"{name}.csv", frame)
     return root
+
+
+# ------------------------------------------------------------------ ticket 05: model files
+# Pickles are written as raw opcodes where the content matters, so the test suite never imports what they name.
+def _binunicode(text: str) -> bytes:
+    raw = text.encode()
+    return b"X" + len(raw).to_bytes(4, "little") + raw
+
+
+def marker_pickle(marker: Path) -> bytes:
+    """Loading this pickle calls builtins.open(marker, 'w'): a harmless stand-in for code execution."""
+    return b"\x80\x02cbuiltins\nopen\n" + _binunicode(str(marker)) + _binunicode("w") + b"\x86R."
+
+
+DANGEROUS_PICKLE = b"\x80\x02cos\nsystem\n" + _binunicode("true") + b"\x85R."   # never loaded by any test
+STACK_GLOBAL_DANGEROUS = (b"\x80\x04" + b"\x8c\x0asubprocess\x94" + b"\x8c\x05Popen\x94" + b"\x93\x94" +
+                          b"\x8c\x04true\x94\x85\x94R\x94.")                    # never loaded by any test
+MEMO_STACK_GLOBAL = (b"\x80\x04" + b"\x8c\x02os\x940" + b"\x8c\x06system\x940" + b"h\x00h\x01\x93" +
+                     b"\x8c\x04true\x85R.")                                     # operands fetched from the memo
+TRUNCATED_PICKLE = b"\x80\x04\x95\x10\x00\x00\x00\x00\x00\x00\x00\x8c\x07collect"
+
+
+def torch_zip_bytes() -> bytes:
+    """A zip-format torch state dict, assembled by hand (no torch needed): one 4-float tensor in an OrderedDict."""
+    import io
+    import zipfile
+    tensor = (b"ctorch._utils\n_rebuild_tensor_v2\n(" + b"(" + _binunicode("storage") + b"ctorch\nFloatStorage\n" +
+              _binunicode("0") + _binunicode("cpu") + b"K\x04tQ" + b"K\x00" + b"K\x04\x85" + b"K\x01\x85" + b"\x89" +
+              b"ccollections\nOrderedDict\n)R" + b"tR")
+    data_pkl = b"\x80\x02ccollections\nOrderedDict\n)R" + _binunicode("weight") + tensor + b"s."
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("archive/data.pkl", data_pkl)
+        zf.writestr("archive/data/0", np.arange(4, dtype=np.float32).tobytes())
+        zf.writestr("archive/version", "3\n")
+    return buf.getvalue()
+
+
+def model_project(root: Path, files: dict[str, bytes]) -> Path:
+    clean_project(root)
+    for rel, data in files.items():
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+    return root
+
+
+def sklearn_models(folder: Path) -> list[Path]:
+    """Ordinary scikit-learn models saved with joblib (plain, compressed, object arrays) and pickle."""
+    import pickle
+
+    import joblib
+    from sklearn.ensemble import RandomForestClassifier
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.pipeline import make_pipeline
+    from sklearn.preprocessing import OneHotEncoder, StandardScaler
+    rng = np.random.default_rng(0)
+    X = rng.normal(size=(200, 3))
+    y = (X[:, 0] > 0).astype(int)
+    folder.mkdir(parents=True, exist_ok=True)
+    lr = make_pipeline(StandardScaler(), LogisticRegression()).fit(X, y)
+    rf = RandomForestClassifier(n_estimators=3, random_state=0).fit(X, y)
+    enc = OneHotEncoder().fit(np.array([["a"], ["b"], [None]], dtype=object))
+    out = []
+    for name, obj, kw in (("lr.joblib", lr, {}), ("rf_z3.joblib", rf, {"compress": 3}),
+                          ("rf_gz.joblib", rf, {"compress": ("gzip", 3)}), ("rf_xz.joblib", rf, {"compress": ("xz", 3)}),
+                          ("enc_objects.joblib", enc, {})):
+        joblib.dump(obj, folder / name, **kw)
+        out.append(folder / name)
+    (folder / "lr.pkl").write_bytes(pickle.dumps(lr))
+    out.append(folder / "lr.pkl")
+    return out
