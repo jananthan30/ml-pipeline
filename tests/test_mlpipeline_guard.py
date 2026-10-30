@@ -235,9 +235,11 @@ class Figures(unittest.TestCase):
     def test_eda_figures_writes_required_set_with_ledger(self):
         paths = guard.eda_figures(frame(dates=True), target="y", time_col="date", state_dir=self.state)
         names = sorted(p.name for p in paths)
-        self.assertEqual(names, ["01_missingness.png", "02_correlations.png", "02_distributions.png",
-                                 "02_feature_overview.png", "02_feature_vs_target.png", "02_outliers.png",
-                                 "02_target_balance.png", "02_temporal_coverage.png"])
+        # combined: distributions are drawn by the variable pages (every column, every kind); no feature-vs-target
+        # figure before the split (target statistics are training-split only)
+        self.assertEqual(names, ["01_missingness.png", "02_correlations.png", "02_feature_overview.png",
+                                 "02_outliers.png", "02_target_balance.png", "02_temporal_coverage.png",
+                                 "02_variables_p01.png"])
         for p in paths:
             self.assertGreater(p.stat().st_size, 1024, p.name)
             self.assertIn(f"- Figure {p.name}: ", self.md.read_text())
@@ -252,7 +254,8 @@ class Figures(unittest.TestCase):
         import matplotlib.pyplot as plt
         f, ax = plt.subplots()
         ax.plot([0, 1], [0, 1])
-        path = guard.fig(12, "ROC curve", f, "AUC 0.81 on validation, baseline 0.50.", state_dir=self.state)
+        # combined: explanations follow the real-explanation rule (>= 40 characters, a number)
+        path = guard.fig(12, "ROC curve", f, "AUC 0.81 on validation, against a baseline of 0.50.", state_dir=self.state)
         self.assertEqual(path.name, "12_roc_curve.png")
         self.assertGreater(path.stat().st_size, 1024)
         self.assertIn("- Figure 12_roc_curve.png: AUC 0.81", self.md.read_text())
@@ -310,7 +313,12 @@ class BigData(Tmp):
         self.assertTrue(p["shape"]["sampled"])
         self.assertEqual(p["columns"]["cat"]["n_unique"], 6)  # exact distinct count over every row
         self.assertEqual(p["duplicates"]["exact_row_frac"], 0.0)
-        self.assertIn("f7", list(p["feature_signal"])[:3])    # the real signal ranks first
+        # combined: no target-signal ranking before the split; every count and moment is exact over every row
+        self.assertNotIn("feature_signal", p)
+        self.assertEqual(p["columns"]["f7"]["mean"], round(float(df["f7"].mean()), 4))
+        self.assertEqual(p["columns"]["f7"]["negatives"], int((df["f7"] < 0).sum()))
+        self.assertEqual(p["target"]["class_counts"], {str(k): int(v) for k, v in df["y"].value_counts().items()})
+        self.assertTrue(p["source"]["full_data"])
         self.assertTrue((self.state / guard.SUMMARY_FILE).is_file())
 
     def test_profile_from_csv_matches_frame(self):
@@ -342,27 +350,34 @@ class BigData(Tmp):
         guard.profile(wide(500, cols=400), target="y", state_dir=self.state)
         summary = guard.summary(self.state)
         self.assertLess(len(summary.splitlines()), 120)
-        self.assertIn("Strongest target signal", summary)
+        # combined: the summary names where target strength comes from instead of ranking it before the split
+        self.assertNotIn("Strongest target signal", summary)
+        self.assertIn("computed on the training split at step 7", summary)
 
-    def test_eda_covers_every_column_in_ranked_pages(self):
+    def test_eda_covers_every_column_on_pages(self):
+        # combined: every column (not only numeric, no page cap) is on a variable page, in column order
         guard.profile(wide(800, cols=60), target="y", state_dir=self.state)
         paths = guard.eda_figures(wide(800, cols=60), target="y", state_dir=self.state)
         names = {p.name for p in paths}
         self.assertIn("02_feature_overview.png", names)
-        self.assertEqual(len([n for n in names if n.startswith("02_distributions_p")]), 4)   # 60 numeric / 16 per page
-        self.assertIn("02_categorical_vs_target.png", names)
+        self.assertEqual(len([n for n in names if n.startswith("02_variables_p")]), 6)   # 62 columns / 12 per page
+        self.assertNotIn("02_categorical_vs_target.png", names)
         self.assertIn("02_outliers.png", names)
         ledger = (self.state / "PIPELINE.md").read_text()
-        self.assertIn("Every one of the 61 columns", ledger)
-        self.assertIn("ranked by target signal", ledger)
+        self.assertIn("Every one of the 61 feature columns", ledger)
+        self.assertNotIn("ranked by target signal", ledger)
         self.assertTrue((self.state / "correlations.csv").is_file())
-        first_page = ledger.split("- Figure 02_distributions_p1.png:")[1].splitlines()[0]
-        self.assertIn("columns 1-16 of 60 numeric", first_page)
+        pages = json.loads((self.state / "figures" / "pages.json").read_text())
+        self.assertEqual(sorted(c for cols in pages.values() for c in cols), sorted(wide(10, cols=60).columns))
+        first_page = ledger.split("- Figure 02_variables_p01.png:")[1].splitlines()[0]
+        self.assertIn("Page 1 of 6: 12 columns (f0 to f11)", first_page)
 
-    def test_eda_page_cap_is_explained(self):
+    def test_many_columns_get_more_pages_not_a_cap(self):
+        # combined (replaces test_eda_page_cap_is_explained): there is no page cap to explain any more
         df = wide(300, cols=40)
-        guard.eda_figures(df, target="y", state_dir=self.state, per_page=4, max_pages=2)
-        self.assertIn("remaining 32 are summarized in data_profile.json", (self.state / "PIPELINE.md").read_text())
+        guard.eda_figures(df, target="y", state_dir=self.state, per_page=4)
+        pages = json.loads((self.state / "figures" / "pages.json").read_text())
+        self.assertEqual(len(pages), 11)   # 42 columns / 4 per page
 
     def test_split_to_files_and_final_test_from_file(self):
         df = wide(4000, cols=4)
