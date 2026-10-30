@@ -22,6 +22,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "hooks"))
 import guard_training as hook  # noqa: E402
+import record_approval  # noqa: E402
 
 TOOL = ROOT / "skills" / "ml-audit" / "lib" / "mlpipeline_audit.py"
 F = "." + "fit"
@@ -200,6 +201,75 @@ class Tampering(unittest.TestCase):
         ti = {"file_path": "{proj}/ml_audit/.audit_approvals.json", "content": "{}"}
         self.assertEqual(decide(tool="Write", tool_input=ti)[0], "deny")
         self.assertEqual(decide("echo '{{}}' > ml_audit/.audit_approvals.json")[0], "deny")
+
+
+def user_says(prompt: str, cwd: Path) -> None:
+    """The user's chat message through the real UserPromptSubmit hook."""
+    payload = json.dumps({"prompt": prompt, "cwd": str(cwd), "session_id": "t"})
+    saved = dict(os.environ)
+    for key in list(os.environ):
+        if key.startswith("ML_PIPELINE_"):
+            os.environ.pop(key)
+    try:
+        with contextlib.redirect_stdout(io.StringIO()), _stdin(payload):
+            record_approval.main()
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+
+
+class TrustAndRetrainApprovals(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.proj = Path(self.tmp.name) / "proj"
+        self.proj.mkdir()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def record(self) -> dict:
+        path = self.proj / "ml_audit" / ".audit_approvals.json"
+        return json.loads(path.read_text()) if path.is_file() else {}
+
+    def test_the_users_message_records_trust_for_a_named_project(self):
+        user_says("I trust the models in proj.", self.proj)
+        self.assertEqual([e["project"] for e in self.record()["trust"]], ["proj"])
+
+    def test_this_project_means_the_current_folder(self):
+        user_says("trust models in this project", self.proj)
+        self.assertEqual([e["project"] for e in self.record()["trust"]], ["proj"])
+
+    def test_negations_and_questions_record_nothing(self):
+        for prompt in ("don't trust models in proj", "should I trust models in proj?", "do not trust the models in proj",
+                       "never approve audit retrain for proj", "what does approve audit retrain for proj do?"):
+            with self.subTest(prompt=prompt):
+                user_says(prompt, self.proj)
+                self.assertEqual(self.record(), {})
+
+    def test_retrain_approval_is_recorded_separately(self):
+        user_says("approve audit retrain for proj", self.proj)
+        record = self.record()
+        self.assertEqual([e["project"] for e in record["retrain"]], ["proj"])
+        self.assertEqual(record.get("trust", []), [])
+
+    def test_trust_needs_the_record_and_the_matching_name(self):
+        ok = {"trust": [{"project": "proj"}]}
+        self.assertEqual(decide(EXACT + " --trust proj", audit_approvals=ok)[0], "allow")
+        self.assertEqual(decide(EXACT + " --trust proj")[0], "deny")
+        self.assertEqual(decide(EXACT + " --trust proj", audit_approvals={"trust": [{"project": "other"}]})[0], "deny")
+        self.assertEqual(decide(EXACT + " --trust other", audit_approvals={"trust": [{"project": "other"}]})[0], "deny")
+        self.assertEqual(decide(EXACT + " --trust proj", audit_approvals={"retrain": [{"project": "proj"}]})[0], "deny")
+
+    def test_retrain_needs_its_own_record(self):
+        self.assertEqual(decide(EXACT + " --retrain proj", audit_approvals={"retrain": [{"project": "proj"}]})[0], "allow")
+        self.assertEqual(decide(EXACT + " --retrain proj", audit_approvals={"trust": [{"project": "proj"}]})[0], "deny")
+
+    def test_the_agent_cannot_write_the_record(self):
+        for ti, tool in (({"file_path": "{proj}/ml_audit/.audit_approvals.json", "content": '{"trust": []}'}, "Write"),
+                         ({"command": "python3 -c \"open('ml_audit/.audit_approvals.json','w').write('{}')\""}, "Bash"),
+                         ({"command": "cp /tmp/x ml_audit/.audit_approvals.json"}, "Bash")):
+            with self.subTest(tool=tool, ti=ti):
+                self.assertEqual(decide(tool=tool, tool_input=ti)[0], "deny")
 
 
 if __name__ == "__main__":

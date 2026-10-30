@@ -249,6 +249,8 @@ class Audit:
         self.findings: list[dict] = []
         self.notes: list[str] = []
         self.viewed_test_labels = False
+        self.out: Path | None = None
+        self.scans: dict[str, dict] = {}
 
     # -- checks
     def check(self, check_id: str, family: str, title: str, *, required: bool = False) -> dict:
@@ -332,6 +334,7 @@ def verdict(audit: Audit) -> tuple[str, str]:
 def run_checks(audit: Audit) -> None:
     for check_id, (family, title) in REQUIRED.items():
         audit.check(check_id, family, title, required=True)
+    trusted_scoring(audit)  # first: its predictions feed the score checks
     for fn in CHECK_FUNCTIONS:
         fn(audit)
     for check_id in REQUIRED:
@@ -1444,9 +1447,8 @@ def check_model_safety(audit: "Audit") -> None:
     if not models:
         audit.could_not("model-scan", "no model files in the inventory")
         return
-    audit.scans = {}
     for f in models:
-        result = scan_model(audit.root / f["path"])
+        result = audit.scans.get(f["path"]) or scan_model(audit.root / f["path"])
         audit.scans[f["path"]] = result
         if result["status"] == "code-free":
             audit.add("code-free-format", "model-safety", "info", "proven", f"{f['path']} is a code-free format",
@@ -1470,6 +1472,178 @@ def check_model_safety(audit: "Audit") -> None:
                       f"every one of its {len(result['imports'])} imports is on the safe list. {NOT_PROOF} "
                       "The file was not loaded.", counts={"imports": len(result["imports"])}, files=[f["path"]])
     audit.ran("model-scan", f"{len(models)} file(s) scanned statically and not loaded. {NOT_PROOF}")
+
+
+# ------------------------------------------------------------------ trusted scoring (only with the user's trust)
+DEFAULT_TIMEOUT = 300
+PROJECT_INTERPRETERS = (".venv/bin/python", "venv/bin/python", "env/bin/python", ".venv/Scripts/python.exe",
+                        "venv/Scripts/python.exe")
+# Run in a child process with the project's interpreter. It is the only place a model is ever loaded. Formats with a
+# code-free mode use it first (torch weights_only=True, ONNX Runtime); a pickle has none, so trust is required.
+TRUSTED_RUNNER = r"""
+import csv, json, os, sys
+args = json.loads(sys.argv[1])
+sys.path.insert(0, args["project"])
+def fail(message):
+    print(json.dumps({"ok": False, "error": message}))
+    sys.exit(3)
+try:
+    import pandas as pd
+except ImportError:
+    fail("pandas is not installed in the project's interpreter")
+path = args["model"]
+suffix = os.path.splitext(path)[1].lower()
+mode = ""
+if suffix in (".pt", ".pth", ".ckpt"):
+    import torch
+    try:
+        model = torch.load(path, map_location="cpu", weights_only=True)
+        mode = "weights only (no code run)"
+    except Exception:
+        model = torch.load(path, map_location="cpu", weights_only=False)
+        mode = "full load (runs stored code)"
+elif suffix == ".onnx":
+    import onnxruntime
+    model = onnxruntime.InferenceSession(path, providers=["CPUExecutionProvider"])
+    mode = "ONNX Runtime (no code run)"
+else:
+    try:
+        import joblib
+        model = joblib.load(path)
+    except ImportError:
+        import pickle
+        with open(path, "rb") as fh:
+            model = pickle.load(fh)
+    mode = "pickle (runs stored code)"
+frames = []
+for data in args["data"]:
+    low = data.lower()
+    if low.endswith((".parquet", ".pq")):
+        frames.append(pd.read_parquet(data))
+    elif low.endswith((".feather", ".arrow")):
+        frames.append(pd.read_feather(data))
+    elif low.endswith((".jsonl", ".ndjson")):
+        frames.append(pd.read_json(data, lines=True))
+    else:
+        frames.append(pd.read_csv(data, sep="	" if ".tsv" in low else ","))
+frame = pd.concat(frames, ignore_index=True)
+y = frame[args["target"]]
+X = frame.drop(columns=[c for c in args["drop"] if c in frame.columns])
+names = getattr(model, "feature_names_in_", None)
+if names is not None:
+    X = X[list(names)]
+prob = None
+if suffix == ".onnx":
+    inp = model.get_inputs()[0].name
+    outs = model.run(None, {inp: X.to_numpy(dtype="float32")})
+    pred = outs[0]
+elif hasattr(model, "predict"):
+    pred = model.predict(X)
+    if hasattr(model, "predict_proba"):
+        p = model.predict_proba(X)
+        if getattr(p, "ndim", 0) == 2 and p.shape[1] == 2:
+            prob = p[:, 1]
+elif hasattr(model, "forward") and hasattr(model, "eval"):
+    import torch
+    model.eval()
+    with torch.no_grad():
+        out = model(torch.tensor(X.to_numpy(dtype="float32")))
+    out = out.numpy()
+    pred = out.argmax(axis=1) if out.ndim == 2 and out.shape[1] > 1 else out.reshape(-1)
+else:
+    fail("loaded with " + mode + ", but the object (" + type(model).__name__ + ") has no predict method: "
+         + ("a weights only file holds no model to score" if "weights" in mode else "nothing to score"))
+with open(args["out"], "w", newline="") as fh:
+    w = csv.writer(fh)
+    w.writerow(["y_true", "y_pred"] + (["y_prob"] if prob is not None else []))
+    for i in range(len(y)):
+        w.writerow([y.iloc[i], pred[i]] + ([prob[i]] if prob is not None else []))
+print(json.dumps({"ok": True, "rows": len(y), "mode": mode}))
+"""
+
+
+def project_interpreter(root: Path) -> str:
+    for rel in PROJECT_INTERPRETERS:
+        if (root / rel).is_file():
+            return str(root / rel)
+    return sys.executable
+
+
+def trusted_scoring(audit: "Audit") -> None:
+    """Load each model the user trusts in a child process and predict the test file; failures are findings."""
+    import subprocess
+    if not (audit.wants("honest-scores") or audit.wants("model-safety")):
+        return
+    audit.check("trusted-scoring", "honest-scores", "Trusted models scored on the test data")
+    models = audit.files("model")
+    if not models:
+        audit.could_not("trusted-scoring", "no model files in the inventory")
+        return
+    if not audit.args.trust:
+        audit.could_not("trusted-scoring", "models are not loaded without the user's trust: ask them, and on their "
+                                           f"'trust models in {audit.root.name}' rerun with --trust {audit.root.name}")
+        return
+    if audit.args.trust != audit.root.name:
+        audit.could_not("trusted-scoring", f"--trust names '{audit.args.trust}', but this project is "
+                                           f"'{audit.root.name}'; trust is granted per project")
+        return
+    target = audit.inv.get("target")
+    tests = [f for f in audit.files("data", "test") if target and target in (f.get("columns") or [])]
+    if not tests:
+        audit.could_not("trusted-scoring", "needs a test data file with the target column")
+        return
+    python = project_interpreter(audit.root)
+    drop = sorted({target, audit.inv.get("entity_column"), audit.inv.get("time_column")} - {None} |
+                  {c for c in tests[0].get("columns") or [] if ID_COLUMN.search(c)})
+    folder = audit.out / "trusted_predictions"
+    scored, skipped = 0, []
+    timeout = audit.args.timeout or DEFAULT_TIMEOUT
+    for f in models:
+        scan = audit.scans.get(f["path"]) or scan_model(audit.root / f["path"])
+        audit.scans[f["path"]] = scan
+        if scan["status"] == "risky" and scan.get("dangerous"):
+            skipped.append(f"{f['path']} not loaded: it imports {', '.join(scan['dangerous'])}")
+            continue
+        if scan["status"] == "code-free" and Path(f["path"]).suffix.lower() != ".onnx":
+            skipped.append(f"{f['path']} holds weights only; nothing to score")
+            continue
+        folder.mkdir(exist_ok=True)
+        out = folder / (re.sub(r"[^\w.-]", "_", f["path"]) + ".csv")
+        payload = {"project": str(audit.root), "model": str(audit.root / f["path"]), "target": target, "drop": drop,
+                   "data": [str(audit.root / t["path"]) for t in tests], "out": str(out)}
+        env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
+        error = None
+        try:
+            proc = subprocess.run([python, "-B", "-c", TRUSTED_RUNNER, json.dumps(payload)], capture_output=True,
+                                  text=True, timeout=timeout, cwd=str(audit.out), env=env)
+            lines = [l for l in proc.stdout.splitlines() if l.startswith("{")]
+            result = json.loads(lines[-1]) if lines else {}
+            if proc.returncode != 0 or not result.get("ok"):
+                tail = (proc.stderr.strip().splitlines() or [""])[-1]
+                error = result.get("error") or tail[:300] or f"exit code {proc.returncode}"
+        except subprocess.TimeoutExpired:
+            error = f"timed out after {timeout} s"
+        if error:
+            audit.add("trusted-scoring-failed", "honest-scores", "info", "could-not-check",
+                      f"{f['path']} could not be scored", f"loading or predicting in a child process failed: {error}.",
+                      files=[f["path"]])
+            continue
+        scored += 1
+        audit.viewed_test_labels = True
+        columns = header(out) or []
+        audit.inv["files"].append({"path": out.relative_to(audit.root).as_posix(), "kind": "predictions",
+                                   "split": "test", "y_true": "y_true", "y_pred": "y_pred",
+                                   "y_prob": "y_prob" if "y_prob" in columns else None, "columns": columns,
+                                   "made_by_audit": f"{f['path']} ({result.get('mode')})"})
+    note = f"{scored} of {len(models)} model(s) scored with {'the project interpreter' if python != sys.executable else 'this interpreter'}"
+    if skipped:
+        note += "; " + "; ".join(skipped)
+    if scored:
+        audit.ran("trusted-scoring", note)
+        audit.notes.append("The audit viewed the test labels to score the trusted models. Its numbers must not be used "
+                           "to choose, tune, or compare models: that would turn the test set into a validation set.")
+    else:
+        audit.could_not("trusted-scoring", note)
 
 
 # ------------------------------------------------------------------ output
@@ -1597,8 +1771,8 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     inventory = build_inventory(root)
     audit = Audit(root, args, inventory)
+    out = audit.out = new_audit_folder(root)
     run_checks(audit)
-    out = new_audit_folder(root)
     result, why = write_outputs(audit, out)
     print(f"audit folder: {out}")
     print(f"verdict: {result} - {why}")

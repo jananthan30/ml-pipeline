@@ -407,3 +407,55 @@ def sklearn_models(folder: Path) -> list[Path]:
     (folder / "lr.pkl").write_bytes(pickle.dumps(lr))
     out.append(folder / "lr.pkl")
     return out
+
+
+# ------------------------------------------------------------------ ticket 06: trusted scoring
+# Every pickle loaded under trust is written by pickle/joblib from an object this code built; none is hand-crafted.
+SLOW_MODULE = "import time\n\nclass Slow:\n    def predict(self, X):\n        time.sleep(60)\n        return [0] * len(X)\n"
+GONE_MODULE = "class Gone:\n    def predict(self, X):\n        return [0] * len(X)\n"
+
+
+def trusted_project(root: Path, claim_offset: float = 0.0) -> Path:
+    """A saved scikit-learn model and a claimed test accuracy, but no saved predictions."""
+    import joblib
+    from sklearn.linear_model import LogisticRegression
+    clean_project(root)
+    (root / "outputs" / "test_predictions.csv").unlink()
+    train = pd.read_csv(root / "data" / "train.csv")
+    test = pd.read_csv(root / "data" / "test.csv")
+    feats = ["x0", "x1", "x2", "x3"]
+    model = LogisticRegression().fit(train[feats], train["y"])
+    (root / "models").mkdir(exist_ok=True)
+    joblib.dump(model, root / "models" / "model.joblib")
+    acc = _accuracy(test["y"], model.predict(test[feats]))
+    _json(root / "outputs" / "metrics.json", {"test": {"accuracy": round(acc + claim_offset, 3)}})
+    return root
+
+
+def _pickle_project_object(root: Path, module: str, source: str, cls: str, rel: str) -> None:
+    """Pickle an instance of a class defined in the project's own module (as a project would)."""
+    import importlib
+    import pickle
+    (root / f"{module}.py").write_text(source)
+    sys.path.insert(0, str(root))
+    try:
+        mod = importlib.import_module(module)
+        (root / rel).parent.mkdir(parents=True, exist_ok=True)
+        (root / rel).write_bytes(pickle.dumps(getattr(mod, cls)()))
+    finally:
+        sys.path.remove(str(root))
+        sys.modules.pop(module, None)
+
+
+def slow_model_project(root: Path) -> Path:
+    clean_project(root)
+    _pickle_project_object(root, "slowmodel", SLOW_MODULE, "Slow", "models/slow.pkl")
+    return root
+
+
+def missing_class_project(root: Path) -> Path:
+    """The model's class lived in a module that is no longer there: loading it fails."""
+    clean_project(root)
+    _pickle_project_object(root, "gonemodel", GONE_MODULE, "Gone", "models/gone.pkl")
+    (root / "gonemodel.py").unlink()
+    return root

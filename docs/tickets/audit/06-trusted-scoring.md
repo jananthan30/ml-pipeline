@@ -4,9 +4,9 @@
 
 **Blocked by:** 02, 05
 
-**Status:** ready-for-agent
+**Status:** done (v0.6-audit)
 
-- [ ] Without the flag, the model is not loaded and its checks are 'could not check'
-- [ ] Code-free loading modes are used first where the format has one
-- [ ] A crash or timeout in the child process becomes a 'could not check' finding, not a failed audit
-- [ ] The report records that the audit viewed test labels and warns against using its numbers to choose a model
+- [x] Without the flag, the model is not loaded and its checks are 'could not check'
+- [x] Code-free loading modes are used first where the format has one
+- [x] A crash or timeout in the child process becomes a 'could not check' finding, not a failed audit
+- [x] The report records that the audit viewed test labels and warns against using its numbers to choose a model

@@ -12,6 +12,9 @@ Recognized, case-insensitive, unless negated ("don't approve gate B", "not yet")
                "override pilot", "override partial data"
   - a bare yes ("yes", "approved", "go ahead") as the whole message, when Claude's last question
     asked for that gate's approval (or that override) - "Do you approve Gate B?" -> "yes".
+Audit approvals (the ml-audit skill), recorded in ``ml_audit/.audit_approvals.json`` under the current folder:
+  - "trust models in <project folder>" / "I trust the models in this project": the audit may load its models
+  - "approve audit retrain for <project folder>": the audit may run its retrain checks on copies
 Questions ("is gate B ok?") and passing mentions ("then we'll talk about gate B") never count.
 Each approval is tagged with the newest ``## Run:`` heading in PIPELINE.md, so an approval given in
 one run never counts for the next. Stdlib only; fails open (never blocks the user's message).
@@ -49,6 +52,13 @@ BARE_YES = re.compile(rf"^\s*{_YES_WORD}(?:[\s,!.]+{_YES_WORD})*\s*[.!]*\s*$", r
 ASK_GATE = re.compile(r"\bapprov\w*\b[^?]{0,60}?\bgate\s*([abcd])\b|\bgate\s*([abcd])\b[^?]{0,60}?\bapprov\w*", re.I)
 ASK_OVERRIDE = re.compile(r"\boverrid(?:e|ing)\b[^?]{0,80}?\b" + _WHAT, re.I)
 ASK_NEGATED = re.compile(r"\b(?:won'?t|will not|unless|not|don'?t|never|instead of)\b", re.I)
+
+
+_PROJECT = r"(?:the\s+)?(?:project\s+|folder\s+)?([\w.-]+)"
+TRUST = re.compile(r"\btrust(?:s|ed)?\s+(?:all\s+)?(?:the\s+)?models?\s+(?:in|of|for|from)\s+" + _PROJECT, re.I)
+RETRAIN = re.compile(r"\b(?:approve[sd]?|allow(?:ed)?|ok(?:ay)?)\s+(?:the\s+)?audit\s+retrain(?:ing)?(?:\s+checks?)?\s+"
+                     r"(?:for|in|on|of)\s+" + _PROJECT, re.I)
+AUDIT_APPROVALS_FILE = ".audit_approvals.json"
 
 
 def _sentences(text: str) -> list[str]:
@@ -130,6 +140,41 @@ def parse(prompt: str, assistant_text: str = "") -> tuple[list[str], list[str]]:
     return sorted(set(gates)), overrides
 
 
+def parse_audit(prompt: str, cwd: str) -> dict[str, list[str]]:
+    """{'trust': [project names], 'retrain': [project names]} granted by this user message."""
+    out: dict[str, list[str]] = {"trust": [], "retrain": []}
+    here = Path(cwd or ".").resolve().name
+    for sentence in _sentences(prompt):
+        if _is_question(sentence):
+            continue
+        for kind, pattern in (("trust", TRUST), ("retrain", RETRAIN)):
+            for m in pattern.finditer(sentence):
+                if _negated_before(sentence, m.start()):
+                    continue
+                name = m.group(1).rstrip(".")
+                name = here if name.lower() in ("this", "here", "current", "my") else name
+                if name and name not in out[kind]:
+                    out[kind].append(name)
+    return out
+
+
+def record_audit(cwd: str, granted: dict[str, list[str]], prompt: str, session: str | None) -> Path:
+    path = Path(cwd or ".").resolve() / "ml_audit" / AUDIT_APPROVALS_FILE
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        data = {}
+    data.setdefault("version", 1)
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    excerpt = " ".join(prompt.split())[:160]
+    for kind, names in granted.items():
+        for name in names:
+            data.setdefault(kind, []).append({"project": name, "at": now, "excerpt": excerpt, "session": session})
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2))
+    return path
+
+
 def record(state_dir: Path, gates: list[str], overrides: list[str], prompt: str, session: str | None,
            run: str = "") -> dict:
     path = state_dir / APPROVALS_FILE
@@ -163,7 +208,17 @@ def main() -> int:
         cwd = payload.get("cwd") or os.getcwd()
         pipeline = find_pipeline(cwd)
         state_dir = pipeline.parent if pipeline else Path(cwd).resolve() / "ml_pipeline"
+        audit = parse_audit(prompt, cwd)
+        audit_note = ""
+        if audit["trust"] or audit["retrain"]:
+            record_audit(cwd, audit, prompt, payload.get("session_id"))
+            audit_note = ("ml-audit: recorded the user's approval: " +
+                          "; ".join([f"load models of '{n}' (--trust {n})" for n in audit["trust"]] +
+                                    [f"run retrain checks on copies for '{n}' (--retrain {n})" for n in audit["retrain"]]) + ".")
         gates, overrides = parse(prompt, last_assistant_text(payload.get("transcript_path")))
+        if audit_note and not gates and not overrides:
+            print(json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": audit_note}}))
+            return 0
         if not gates and not overrides:
             print("{}")
             return 0
