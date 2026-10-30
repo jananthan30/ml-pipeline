@@ -341,6 +341,453 @@ def run_checks(audit: Audit) -> None:
 CHECK_FUNCTIONS: list = []
 
 
+def check_function(fn):
+    CHECK_FUNCTIONS.append(fn)
+    return fn
+
+
+# ------------------------------------------------------------------ data access (pandas through the guard library)
+_GUARD = None
+
+
+class NeedsPandas(RuntimeError):
+    pass
+
+
+def guard():
+    """The plugin's guard library (streaming readers, row hashes, column kinds). Needs pandas and numpy."""
+    global _GUARD
+    if _GUARD is None:
+        if str(GUARD_LIB) not in sys.path:
+            sys.path.insert(0, str(GUARD_LIB))
+        try:
+            import mlpipeline_guard
+        except ImportError as exc:
+            raise NeedsPandas(f"this check needs pandas and numpy ({exc}); run the tool with the project's interpreter")
+        _GUARD = mlpipeline_guard
+    return _GUARD
+
+
+def read_columns(audit: "Audit", rel: str, columns=None):
+    """A data file's columns as one DataFrame, read in batches (only the named columns are kept)."""
+    g = guard()
+    import pandas as pd
+    parts = list(g.scan(str(audit.root / rel), columns=list(columns) if columns else None))
+    return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=list(columns or []))
+
+
+# ------------------------------------------------------------------ metrics (no scikit-learn)
+SCORE_FLOAT_SLACK = 1e-9      # added to the rounding tolerance so float arithmetic never decides a mismatch
+BASELINE_MARGIN = 0.01        # accuracy/F1/AUC: a model must beat the trivial baseline by at least this much
+BASELINE_REL_MARGIN = 0.01    # RMSE/MAE: a model's error must be at least 1% below the trivial baseline's
+MAX_CLASSES = 20              # an integer target with more distinct values than this is treated as regression
+METRIC_ALIASES = {
+    "accuracy": "accuracy", "acc": "accuracy", "accuracy_score": "accuracy", "test_accuracy": "accuracy",
+    "f1": "f1", "f1_score": "f1", "f1score": "f1", "test_f1": "f1",
+    "auc": "auc", "roc_auc": "auc", "roc_auc_score": "auc", "auroc": "auc", "rocauc": "auc", "test_auc": "auc",
+    "rmse": "rmse", "root_mean_squared_error": "rmse", "test_rmse": "rmse",
+    "mae": "mae", "mean_absolute_error": "mae", "test_mae": "mae",
+}
+BOUNDED = {"accuracy", "f1", "auc"}
+METRIC_LABEL = {"accuracy": "accuracy", "f1": "F1", "auc": "AUC", "rmse": "RMSE", "mae": "MAE"}
+
+
+def _labels(a):
+    import numpy as np
+    a = np.asarray(a)
+    if a.dtype.kind in "biuf":
+        return a.astype(float)
+    return a.astype(str)
+
+
+def positive_label(y, configured=None):
+    """The class counted as positive for F1/AUC: the inventory's choice, else 1 / True / 'yes', else the minority class."""
+    import numpy as np
+    y = _labels(y)
+    values = list(np.unique(y))
+    if configured is not None:
+        return float(configured) if y.dtype.kind == "f" else str(configured)
+    for cand in (1.0, "1", "True", "true", "yes", "Yes", "positive", "pos"):
+        if cand in values:
+            return cand
+    counts = {v: int((y == v).sum()) for v in values}
+    return min(counts, key=lambda v: (counts[v], str(v))) if counts else None
+
+
+def _f1(y, p, positive) -> float:
+    tp = float(((y == positive) & (p == positive)).sum())
+    fp = float(((y != positive) & (p == positive)).sum())
+    fn = float(((y == positive) & (p != positive)).sum())
+    return 0.0 if tp == 0 else 2 * tp / (2 * tp + fp + fn)
+
+
+def _average_ranks(s):
+    import numpy as np
+    _, inverse, counts = np.unique(s, return_inverse=True, return_counts=True)
+    ends = np.cumsum(counts)
+    return (ends - (counts - 1) / 2.0)[inverse]
+
+
+def metric_value(metric: str, y, p, *, scores=None, positive=None) -> float | None:
+    """accuracy, f1 (binary on ``positive``, macro over classes otherwise), auc (binary), rmse, mae; None if undefined."""
+    import numpy as np
+    if metric in ("rmse", "mae"):
+        y, p = np.asarray(y, dtype=float), np.asarray(p, dtype=float)
+        err = y - p
+        return float(np.sqrt(np.mean(err ** 2))) if metric == "rmse" else float(np.mean(np.abs(err)))
+    y = _labels(y)
+    if metric == "auc":
+        if scores is None:
+            return None
+        s = np.asarray(scores, dtype=float)
+        classes = np.unique(y)
+        if len(classes) != 2:
+            return None
+        positive = positive if positive is not None else positive_label(y)
+        pos = y == positive
+        n_pos, n_neg = int(pos.sum()), int((~pos).sum())
+        if not n_pos or not n_neg:
+            return None
+        ranks = _average_ranks(s)
+        return float((ranks[pos].sum() - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg))
+    p = _labels(p)
+    if y.dtype != p.dtype:
+        y, p = y.astype(str), p.astype(str)
+    if metric == "accuracy":
+        return float(np.mean(y == p))
+    if metric == "f1":
+        classes = np.unique(np.concatenate([y, p]))
+        if len(classes) <= 2:
+            positive = positive if positive is not None else positive_label(y)
+            return _f1(y, p, type(y[0])(positive) if len(y) else positive)
+        return float(np.mean([_f1(y, p, c) for c in classes]))
+    return None
+
+
+def claim_tolerance(text: str) -> float:
+    """Half a unit in the last stated digit: '0.93' covers 0.925..0.935, '0.930' covers 0.9295..0.9305."""
+    text = text.strip().rstrip("%")
+    mantissa = text.lower().split("e")[0]
+    decimals = len(mantissa.split(".")[1]) if "." in mantissa else 0
+    exponent = int(text.lower().split("e")[1]) if "e" in text.lower() else 0
+    return 0.5 * 10.0 ** (exponent - decimals) + SCORE_FLOAT_SLACK
+
+
+def infer_task(y, configured=None) -> str:
+    import numpy as np
+    if configured in ("classification", "regression"):
+        return configured
+    y = np.asarray(y)
+    if y.dtype.kind not in "biuf":
+        return "classification"
+    values = y[~np.isnan(y.astype(float))] if y.dtype.kind == "f" else y
+    if not len(values):
+        return "classification"
+    whole = bool(np.all(np.mod(values.astype(float), 1) == 0))
+    return "classification" if whole and len(np.unique(values)) <= MAX_CLASSES else "regression"
+
+
+# ------------------------------------------------------------------ claims
+class _Num(float):
+    """A JSON number that remembers how it was written, so its stated precision is known."""
+    text = ""
+
+
+def _num(text: str) -> _Num:
+    n = _Num(float(text))
+    n.text = text
+    return n
+
+
+def _metric_key(key: str) -> str | None:
+    return METRIC_ALIASES.get(re.sub(r"[^a-z0-9_]", "", str(key).lower().replace("-", "_").replace(" ", "_")))
+
+
+def _split_from(words: set[str]) -> str | None:
+    for word in sorted(words):
+        if word in ROLE_WORDS:
+            return ROLE_WORDS[word]
+    return None
+
+
+def _claim(metric, number, split, source, origin) -> dict | None:
+    text = number.text if isinstance(number, _Num) and number.text else repr(float(number))
+    value, tol = float(number), claim_tolerance(text)
+    percent = metric in BOUNDED and 1.0 < value <= 100.0
+    if percent:
+        value, tol = value / 100.0, tol / 100.0
+    return {"metric": metric, "value": value, "text": text + ("%" if percent else ""), "tolerance": tol,
+            "split": split, "source": source, "origin": origin}
+
+
+def _json_claims(obj, path: list[str], file_words: set[str], rel: str, out: list[dict]) -> None:
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            _json_claims(value, path + [str(key)], file_words, rel, out)
+    elif isinstance(obj, list):
+        for i, value in enumerate(obj):
+            _json_claims(value, path + [str(i)], file_words, rel, out)
+    elif isinstance(obj, float) and path:
+        metric = _metric_key(path[-1])
+        if metric:
+            words = set().union(*(_tokens(p) for p in path)) | file_words
+            out.append(_claim(metric, obj, _split_from(words), f"{rel}: {'.'.join(path)}", "metrics file"))
+
+
+FINAL_TEST = re.compile(r"^\s*-\s*Step 14 final test:\s*([\w.]+)\s*=\s*([-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)", re.I | re.M)
+
+
+def collect_claims(audit: "Audit") -> tuple[list[dict], list[str]]:
+    """Every claimed score: metrics files, the run log, the ledger's final-test lines, and claims passed in."""
+    claims, ignored = [], []
+    for f in audit.files("claims"):
+        path = audit.root / f["path"]
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if f.get("source") == "metrics file":
+            try:
+                obj = json.loads(text, parse_float=_num, parse_int=_num)
+            except ValueError:
+                ignored.append(f"{f['path']}: not valid JSON")
+                continue
+            _json_claims(obj, [], _tokens(Path(f["path"]).stem), f["path"], claims)
+        elif f.get("source") == "run log":
+            for n, line in enumerate(text.splitlines(), 1):
+                try:
+                    run = json.loads(line, parse_float=_num, parse_int=_num)
+                except ValueError:
+                    continue
+                for key, value in (run.get("metrics") or {}).items() if isinstance(run, dict) else []:
+                    metric = _metric_key(key)
+                    if metric and isinstance(value, float):
+                        split = "test" if "test" in _tokens(key) else "val"  # log_run records validation metrics
+                        claims.append(_claim(metric, value, split, f"{f['path']}:{n} ({run.get('name', 'run')})", "run log"))
+        elif f.get("source") == "ledger":
+            for m in FINAL_TEST.finditer(text):
+                metric = _metric_key(m.group(1))
+                line = text.count("\n", 0, m.start()) + 1
+                if metric:
+                    claims.append(_claim(metric, _num(m.group(2)), "test", f"{f['path']}:{line}", "ledger"))
+                else:
+                    ignored.append(f"{f['path']}:{line}: metric '{m.group(1)}' is not one the tool recomputes")
+    for raw in audit.args.claim or []:
+        fields = dict(part.split("=", 1) for part in raw.split(",") if "=" in part)
+        metric = _metric_key(fields.get("metric", ""))
+        value = fields.get("value", "").strip()
+        if not metric or not re.fullmatch(r"[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?%?", value):
+            ignored.append(f"--claim '{raw}': needs metric= (accuracy, f1, auc, rmse, mae) and a numeric value=")
+            continue
+        split = fields.get("split", "").strip().lower()
+        split = ROLE_WORDS.get(split, split or None)
+        source = (fields.get("source") or "stated in prose").strip() + " (claim passed in)"
+        claims.append(_claim(metric, _num(value.rstrip("%")) if not value.endswith("%") else _num(value[:-1]),
+                             split, source, "prose"))
+    return claims, ignored
+
+
+# ------------------------------------------------------------------ check family: honest scores
+def _prediction_file_for(claim: dict, preds: list[dict]) -> dict | None:
+    same = [p for p in preds if p.get("split") == claim["split"]]
+    if same:
+        return same[0]
+    if len(preds) == 1 and (claim["split"] is None or preds[0].get("split") is None):
+        return preds[0]
+    return None
+
+
+def load_predictions(audit: "Audit", pf: dict):
+    """(y_true, y_pred, y_prob, n) arrays from a predictions file (any may be None)."""
+    cols = [c for c in (pf.get("y_true"), pf.get("y_pred"), pf.get("y_prob")) if c]
+    frame = read_columns(audit, pf["path"], cols)
+    get = lambda c: frame[c].to_numpy() if c else None  # noqa: E731
+    return get(pf.get("y_true")), get(pf.get("y_pred")), get(pf.get("y_prob")), len(frame)
+
+
+def _better(metric: str, a: float, b: float) -> bool:
+    return a > b if metric in BOUNDED else a < b
+
+
+def _split_target(audit: "Audit", role: str):
+    target = audit.inv.get("target")
+    files = [f for f in audit.files("data", role) if target and f.get("columns") and target in f["columns"]]
+    if not files:
+        return None
+    import numpy as np
+    return np.concatenate([read_columns(audit, f["path"], [target])[target].to_numpy() for f in files])
+
+
+def baseline_score(metric: str, y, train_y, positive) -> tuple[float | None, str]:
+    """The score of a predictor that ignores the features (taken from the training labels when available)."""
+    import numpy as np
+    ref = train_y if train_y is not None and len(train_y) else y
+    where = "the training labels" if ref is train_y else "these labels"
+    if metric == "accuracy":
+        values, counts = np.unique(_labels(ref), return_counts=True)
+        majority = values[np.argmax(counts)]
+        return metric_value("accuracy", y, np.full(len(y), majority)), f"always predicting the majority class of {where}"
+    if metric == "f1":
+        y_l = _labels(y)
+        if len(np.unique(y_l)) > 2:
+            return None, ""
+        return metric_value("f1", y_l, np.full(len(y_l), positive), positive=positive), "predicting the positive class for every row"
+    if metric == "auc":
+        return 0.5, "a constant score (AUC 0.5)"
+    centre = float(np.mean(np.asarray(ref, dtype=float))) if metric == "rmse" else float(np.median(np.asarray(ref, dtype=float)))
+    kind = "mean" if metric == "rmse" else "median"
+    return metric_value(metric, y, np.full(len(y), centre)), f"always predicting the {kind} of {where}"
+
+
+def _id_columns(pf: dict, data: dict, target: str | None) -> list[str]:
+    skip = {pf.get("y_true"), pf.get("y_pred"), pf.get("y_prob"), target}
+    common = [c for c in (pf.get("columns") or []) if c in (data.get("columns") or []) and c not in skip]
+    return [c for c in common if ENTITY_NAME.search(c) or c.lower() in ("id", "index", "idx", "row", "row_id")]
+
+
+def _hashes(frame) -> "object":
+    import numpy as np
+    g = guard()
+    return np.unique(g._row_hashes(frame.reset_index(drop=True)))
+
+
+def check_prediction_rows(audit: "Audit", pf: dict) -> None:
+    """A prediction file labelled test must be made on the test file's rows."""
+    import numpy as np
+    target = audit.inv.get("target")
+    tests = audit.files("data", "test")
+    if not tests:
+        return
+    others = {role: audit.files("data", role) for role in ("val", "train")}
+    test = tests[0]
+    ids = _id_columns(pf, test, target)
+    if ids:
+        pred_ids = _hashes(read_columns(audit, pf["path"], ids))
+        test_ids = _hashes(read_columns(audit, test["path"], ids))
+        in_test = int(np.isin(pred_ids, test_ids).sum())
+        if in_test == len(pred_ids):
+            return
+        where = {}
+        for role, files in others.items():
+            for f in files:
+                if all(c in (f.get("columns") or []) for c in ids):
+                    where[role] = where.get(role, 0) + int(np.isin(pred_ids, _hashes(read_columns(audit, f["path"], ids))).sum())
+        audit.add("claim-wrong-split", "honest-scores", "critical", "proven",
+                  "Predictions labelled 'test' were not made on the test rows",
+                  f"{len(pred_ids) - in_test} of {len(pred_ids)} distinct prediction rows (matched on "
+                  f"{', '.join(ids)}) are not in {test['path']}" +
+                  "".join(f"; {n} are in the {role} split" for role, n in where.items() if n) +
+                  ". A score computed on them is not a test score.",
+                  counts={"prediction_rows": len(pred_ids), "in_test": in_test, **{f"in_{r}": n for r, n in where.items()}},
+                  files=[pf["path"], test["path"]], columns=ids)
+        return
+    if not (target and pf.get("y_true")):
+        return
+    truth = load_predictions(audit, pf)[0]
+    test_y = _split_target(audit, "test")
+    if test_y is not None and len(test_y) == len(truth) and np.array_equal(_labels(test_y), _labels(truth)):
+        return
+    for role in ("val", "train"):
+        other = _split_target(audit, role)
+        if other is not None and len(other) == len(truth) and np.array_equal(_labels(other), _labels(truth)):
+            audit.add("claim-wrong-split", "honest-scores", "critical", "proven",
+                      "Predictions labelled 'test' line up with the wrong split",
+                      f"the {len(truth)} true labels in {pf['path']} match the {role} split row for row, not the test split.",
+                      counts={"prediction_rows": len(truth)}, files=[pf["path"], test["path"]], columns=[target])
+            return
+
+
+@check_function
+def check_honest_scores(audit: "Audit") -> None:
+    if not audit.wants("honest-scores"):
+        return
+    audit.check("baseline-comparison", "honest-scores", "Scores compared with a trivial baseline")
+    claims, ignored = collect_claims(audit)
+    audit.notes += [f"claim ignored: {why}" for why in ignored]
+    preds = [p for p in audit.files("predictions") if p.get("y_true") and (p.get("y_pred") or p.get("y_prob"))]
+    if not claims:
+        audit.could_not("score-recomputation", "no claimed scores found (metrics files, run log, ledger; prose claims "
+                                               "are passed in with --claim)")
+    try:
+        loaded = {p["path"]: load_predictions(audit, p) for p in preds}
+    except NeedsPandas as exc:
+        audit.could_not("score-recomputation", str(exc))
+        audit.could_not("baseline-comparison", str(exc))
+        return
+    checked, unchecked, used, rows_checked = 0, [], {}, set()
+    for claim in claims:
+        pf = _prediction_file_for(claim, preds)
+        label = f"{claim['split'] or 'unlabelled'} {METRIC_LABEL[claim['metric']]} {claim['text']} ({claim['source']})"
+        if pf is None:
+            why = "no predictions for this split" + (" (validation metrics are logged without predictions)"
+                                                     if claim["split"] == "val" else "")
+            unchecked.append((claim, f"{label}: {why}"))
+            continue
+        y, p, s, n = loaded[pf["path"]]
+        task = infer_task(y, audit.inv.get("task"))
+        positive = positive_label(y, audit.inv.get("positive_label")) if task == "classification" else None
+        if claim["metric"] in BOUNDED and task == "regression" or claim["metric"] in ("rmse", "mae") and task == "classification":
+            unchecked.append((claim, f"{label}: metric does not fit a {task} target"))
+            continue
+        source = p if claim["metric"] != "auc" else None
+        value = metric_value(claim["metric"], y, source, scores=s, positive=positive) if (source is not None or s is not None) else None
+        if value is None:
+            unchecked.append((claim, f"{label}: {pf['path']} lacks the column this metric needs"))
+            continue
+        checked += 1
+        used.setdefault(pf["path"], set()).add(claim["metric"])
+        if (claim["split"] == "test" or pf.get("split") == "test") and pf["path"] not in rows_checked:
+            rows_checked.add(pf["path"])
+            check_prediction_rows(audit, pf)
+        diff = claim["value"] - value
+        if abs(diff) <= claim["tolerance"]:
+            continue
+        overstated = _better(claim["metric"], claim["value"], value)
+        name = METRIC_LABEL[claim["metric"]]
+        audit.add("claim-mismatch", "honest-scores", "critical" if overstated else "medium", "proven",
+                  f"Claimed {claim['split'] or ''} {name} is {'better' if overstated else 'worse'} than the predictions give".replace("  ", " "),
+                  f"claimed {claim['text']}, recomputed {value:.4f} from {n:,} rows of {pf['path']}; the difference "
+                  f"{abs(diff):.4f} is beyond the claim's rounding tolerance ({claim['tolerance']:.4g})." +
+                  ("" if overstated else " The claim understates the result; the number is still not reproducible."),
+                  counts={"claimed": claim["value"], "recomputed": round(value, 6), "rows": n,
+                          "tolerance": round(claim["tolerance"], 9)},
+                  files=[pf["path"]] + ([claim["source"].split(":")[0]] if claim["origin"] != "prose" else []),
+                  columns=[c for c in (pf.get("y_true"), pf.get("y_pred") if claim["metric"] != "auc" else pf.get("y_prob")) if c],
+                  source=claim["source"])
+    blocking = [why for claim, why in unchecked if claim["split"] in ("test", None)]
+    if checked and not blocking:
+        audit.ran("score-recomputation", f"{checked} claim(s) recomputed" +
+                  (f"; not checkable: {'; '.join(why for _, why in unchecked)}" if unchecked else ""))
+    elif claims:
+        audit.could_not("score-recomputation", "; ".join(why for _, why in unchecked) or "no claim could be recomputed")
+    # Baseline: every predictions file, on the claimed metrics (or accuracy / RMSE when nothing is claimed).
+    for pf in preds:
+        y, p, s, n = loaded[pf["path"]]
+        task = infer_task(y, audit.inv.get("task"))
+        metrics = used.get(pf["path"]) or ({"accuracy"} if task == "classification" else {"rmse"})
+        train_y = _split_target(audit, "train")
+        positive = positive_label(y, audit.inv.get("positive_label")) if task == "classification" else None
+        for metric in sorted(metrics):
+            model = metric_value(metric, y, p if metric != "auc" else None, scores=s, positive=positive) \
+                if (p is not None or metric == "auc") else None
+            base, how = baseline_score(metric, y, train_y, positive)
+            if model is None or base is None:
+                continue
+            audit.ran("baseline-comparison")
+            margin = BASELINE_MARGIN if metric in BOUNDED else BASELINE_REL_MARGIN * base
+            beats = model > base + margin if metric in BOUNDED else model < base - margin
+            if not beats:
+                name = METRIC_LABEL[metric]
+                audit.add("no-better-than-baseline", "honest-scores", "high", "proven",
+                          f"The model's {name} is no better than a trivial baseline",
+                          f"{name} {model:.4f} on {n:,} rows of {pf['path']} vs. {base:.4f} for {how}; a useful model "
+                          f"must beat it by more than {margin:.4g}.",
+                          counts={"model": round(model, 6), "baseline": round(base, 6), "rows": n},
+                          files=[pf["path"]], columns=[c for c in (pf.get("y_true"), pf.get("y_pred")) if c])
+    if not preds:
+        audit.could_not("baseline-comparison", "no predictions file with true and predicted values")
+
+
 # ------------------------------------------------------------------ output
 def new_audit_folder(root: Path) -> Path:
     base = root / AUDIT_DIR

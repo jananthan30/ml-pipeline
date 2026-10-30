@@ -4,12 +4,12 @@
 
 **Blocked by:** 01
 
-**Status:** ready-for-agent
+**Status:** done (v0.6-audit)
 
-- [ ] Machine-readable claims are parsed, and prose claims can be passed in with a source location
-- [ ] Accuracy, F1, AUC, RMSE and MAE are implemented without scikit-learn and tested against known values
-- [ ] A planted wrong claim gives a proven critical finding and 'not trustworthy'
-- [ ] A claim correct to its stated rounding gives no finding, tested on both sides of the tolerance
-- [ ] A claim with no predictions is 'could not check' and gives 'not enough evidence'
-- [ ] A planted score equal to the trivial baseline is flagged
-- [ ] Every finding has a reproduction command that gives the same result
+- [x] Machine-readable claims are parsed, and prose claims can be passed in with a source location
+- [x] Accuracy, F1, AUC, RMSE and MAE are implemented without scikit-learn and tested against known values
+- [x] A planted wrong claim gives a proven critical finding and 'not trustworthy'
+- [x] A claim correct to its stated rounding gives no finding, tested on both sides of the tolerance
+- [x] A claim with no predictions is 'could not check' and gives 'not enough evidence'
+- [x] A planted score equal to the trivial baseline is flagged
+- [x] Every finding has a reproduction command that gives the same result

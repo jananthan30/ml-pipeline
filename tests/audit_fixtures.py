@@ -134,3 +134,59 @@ def guard_state(root: Path) -> None:
     (state / "PIPELINE.md").write_text("# Pipeline\n- Gate A: approved 2026-10-01\n")
     (state / ".approvals.json").write_text(json.dumps({"gates": {"A": {"at": "2026-10-01", "run": ""}}, "overrides": []}))
     (state / ".guard_state.json").write_text(json.dumps({"test_touches": 0}))
+
+
+# ------------------------------------------------------------------ ticket 02: honest scores
+def wrong_claim(root: Path) -> Path:
+    """The metrics file claims 8 points more accuracy than the saved predictions give."""
+    clean_project(root)
+    preds = pd.read_csv(root / "outputs" / "test_predictions.csv")
+    _json(root / "outputs" / "metrics.json", {"test": {"accuracy": round(_accuracy(preds.y_true, preds.y_pred) + 0.08, 3)}})
+    return root
+
+
+def claim_without_predictions(root: Path) -> Path:
+    """A claimed test score with nothing to recompute it from."""
+    clean_project(root)
+    (root / "outputs" / "test_predictions.csv").unlink()
+    return root
+
+
+def baseline_model(root: Path) -> Path:
+    """The 'model' predicts the majority class for every row, and the claim is honest about it."""
+    clean_project(root)
+    test = pd.read_csv(root / "data" / "test.csv")
+    train = pd.read_csv(root / "data" / "train.csv")
+    majority = int(train["y"].mode()[0])
+    preds = pd.DataFrame({"row_id": test.row_id, "y_true": test.y, "y_pred": majority, "y_prob": 0.5})
+    _write(root / "outputs" / "test_predictions.csv", preds)
+    _json(root / "outputs" / "metrics.json", {"test": {"accuracy": round(_accuracy(preds.y_true, preds.y_pred), 3)}})
+    return root
+
+
+def wrong_split_claim(root: Path) -> Path:
+    """The 'test' predictions were made on the validation rows."""
+    clean_project(root)
+    val = classification_frame(500, 77, id_start=5000)
+    _write(root / "data" / "val.csv", val.drop(columns="_prob"))
+    preds = predictions_for(val, 78)
+    _write(root / "outputs" / "test_predictions.csv", preds)
+    _json(root / "outputs" / "metrics.json", {"test": {"accuracy": round(_accuracy(preds.y_true, preds.y_pred), 3)}})
+    return root
+
+
+def exact_accuracy_project(root: Path, correct: int, total: int, claim: str) -> Path:
+    """Predictions whose accuracy is exactly correct/total, and a metrics file stating ``claim`` verbatim."""
+    clean_project(root)
+    test = pd.read_csv(root / "data" / "test.csv")
+    test = pd.concat([test] * (total // len(test) + 1), ignore_index=True).iloc[:total].copy()
+    test["row_id"] = np.arange(len(test)) + 10_000
+    _write(root / "data" / "test.csv", test)
+    y = test["y"].to_numpy()
+    pred = y.copy()
+    pred[correct:] = 1 - pred[correct:]
+    _write(root / "outputs" / "test_predictions.csv",
+           pd.DataFrame({"row_id": test.row_id, "y_true": y, "y_pred": pred, "y_prob": np.where(pred == 1, 0.8, 0.2)}))
+    path = root / "outputs" / "metrics.json"
+    path.write_text('{"test": {"accuracy": ' + claim + "}}\n")
+    return root
