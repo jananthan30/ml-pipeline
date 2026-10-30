@@ -4,9 +4,9 @@
 
 **Blocked by:** 01
 
-**Status:** ready-for-agent
+**Status:** done (v0.6-audit)
 
-- [ ] A run log with repeated test scoring gives a proven finding
-- [ ] Test data referenced in tuning code gives a suspected finding
-- [ ] A project without a run log or ledger gets 'could not check', not a pass
-- [ ] A single honest final test gives no finding
+- [x] A run log with repeated test scoring gives a proven finding
+- [x] Test data referenced in tuning code gives a suspected finding
+- [x] A project without a run log or ledger gets 'could not check', not a pass
+- [x] A single honest final test gives no finding

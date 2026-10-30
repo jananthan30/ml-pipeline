@@ -537,3 +537,60 @@ def regression_project(root: Path, *, n_train: int = 1000, n_test: int = 500, se
     rmse = float(np.sqrt(np.mean((preds.y_true - preds.y_pred) ** 2)))
     _json(root / "outputs" / "metrics.json", {"test": {"rmse": round(rmse, 3)}})
     return root
+
+
+# ------------------------------------------------------------------ ticket 08: test-set misuse
+def _final_line(root: Path, touch: int) -> str:
+    preds = pd.read_csv(root / "outputs" / "test_predictions.csv")
+    return f"- Step 14 final test: accuracy_score={_accuracy(preds.y_true, preds.y_pred):.4f} (touch {touch}, 2026-10-0{touch})"
+
+
+def honest_final_test(root: Path) -> Path:
+    clean_project(root)
+    (root / "ml_pipeline").mkdir(exist_ok=True)
+    (root / "ml_pipeline" / "PIPELINE.md").write_text("# Pipeline\n- Gate C: approved 2026-10-01\n" + _final_line(root, 1) + "\n")
+    (root / "ml_pipeline" / "runs.jsonl").write_text(
+        "\n".join(json.dumps({"name": n, "kind": k, "metrics": {"val_accuracy": v}})
+                  for n, k, v in (("dummy", "baseline", 0.52), ("logreg", "candidate", 0.77))) + "\n")
+    return root
+
+
+def repeated_test_ledger(root: Path) -> Path:
+    """The test set was scored three times, with two final-test overrides."""
+    clean_project(root)
+    (root / "ml_pipeline").mkdir(exist_ok=True)
+    lines = ["# Pipeline", "- Gate C: approved 2026-10-01", _final_line(root, 1),
+             "- Override: final test - user approved 2026-10-02 - reason: retrained", _final_line(root, 2),
+             "- Override: final test - user approved 2026-10-03 - reason: new features", _final_line(root, 3)]
+    (root / "ml_pipeline" / "PIPELINE.md").write_text("\n".join(lines) + "\n")
+    return root
+
+
+def repeated_test_runs(root: Path) -> Path:
+    """The run log records a test metric for several runs: models were compared on the test set."""
+    clean_project(root)
+    (root / "ml_pipeline").mkdir(exist_ok=True)
+    (root / "ml_pipeline" / "runs.jsonl").write_text(
+        "\n".join(json.dumps({"name": f"model{i}", "kind": "candidate", "metrics": {"val_accuracy": 0.7, "test_auc": 0.8 + i / 100}})
+                  for i in range(4)) + "\n")
+    return root
+
+
+TUNING_CODE = '''import pandas as pd
+from sklearn.model_selection import GridSearchCV
+from sklearn.ensemble import RandomForestClassifier
+
+best = None
+for depth in (3, 5, 8):
+    search = GridSearchCV(RandomForestClassifier(max_depth=depth), {"n_estimators": [50, 100]}, cv=3)
+    search.fit(X_train, y_train)
+    score = search.score(X_test, y_test)
+    if best is None or score > best[0]:
+        best = (score, search)
+'''
+
+
+def test_in_tuning(root: Path) -> Path:
+    clean_project(root)
+    (root / "tune.py").write_text(TUNING_CODE)
+    return root

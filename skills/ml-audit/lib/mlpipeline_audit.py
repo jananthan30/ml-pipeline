@@ -1639,6 +1639,94 @@ def check_weak_spots(audit: "Audit") -> None:
             audit.could_not(check_id, str(exc))
 
 
+# ------------------------------------------------------------------ check family: test-set misuse
+OVERRIDE_FINAL_TEST = re.compile(r"^\s*-\s*Override\s*:\s*final\s+test\b", re.I | re.M)
+TUNING_CODE = re.compile(r"\b(?:GridSearchCV|RandomizedSearchCV|HalvingGridSearchCV|HalvingRandomSearchCV|BayesSearchCV|"
+                         r"TuneSearchCV|ParameterGrid|ParameterSampler)\b|\boptuna\.create_study\b|\bhyperopt\b|"
+                         r"\bfmin\s*\(|\btune\.(?:run|Tuner)\b")
+TEST_NAMES = r"(?:X_test|y_test|x_test|test_X|test_y|Xtest|ytest|df_test|test_df|test_data|X_holdout|y_holdout|holdout\w*)"
+TEST_IN_CALL = re.compile(r"\b(?:predict(?:_proba)?|score|evaluate|fit|\w+_score|\w+_error|\w+_loss)\s*\([^)\n]*\b"
+                          + TEST_NAMES + r"\b")
+
+
+def _code_text(path: Path) -> str:
+    text = path.read_text(encoding="utf-8", errors="replace")
+    if path.suffix.lower() == ".ipynb":
+        try:
+            cells = json.loads(text).get("cells", [])
+            return "\n".join("".join(c.get("source", [])) if isinstance(c.get("source"), list) else str(c.get("source", ""))
+                             for c in cells if c.get("cell_type") == "code")
+        except ValueError:
+            return text
+    return text
+
+
+@check_function
+def check_test_misuse(audit: "Audit") -> None:
+    if not audit.wants("test-misuse"):
+        return
+    audit.check("test-use-log", "test-misuse", "Repeated test scoring in the run log and ledger")
+    audit.check("test-in-tuning-code", "test-misuse", "Test data referenced in tuning code")
+    logs = [f for f in audit.files("claims") if f.get("source") in ("run log", "ledger")]
+    if not logs:
+        audit.could_not("test-use-log", "no run log or ledger (ml_pipeline/runs.jsonl, ml_pipeline/PIPELINE.md) to read; "
+                                        "repeated test use cannot be ruled out")
+    else:
+        finals = overrides = runs_with_test = 0
+        files = []
+        for f in logs:
+            text = (audit.root / f["path"]).read_text(encoding="utf-8", errors="replace")
+            if f["source"] == "ledger":
+                n, k = len(FINAL_TEST.findall(text)), len(OVERRIDE_FINAL_TEST.findall(text))
+                finals, overrides = finals + n, overrides + k
+                if n > 1 or k:
+                    files.append(f["path"])
+            else:
+                count = 0
+                for line in text.splitlines():
+                    try:
+                        run = json.loads(line)
+                    except ValueError:
+                        continue
+                    metrics = run.get("metrics") if isinstance(run, dict) else None
+                    if isinstance(metrics, dict) and any("test" in _tokens(str(k)) for k in metrics):
+                        count += 1
+                runs_with_test += count
+                if count > 1:
+                    files.append(f["path"])
+        if finals > 1 or overrides or runs_with_test > 1:
+            parts = []
+            if finals > 1 or overrides:
+                parts.append(f"the ledger records {finals} final-test scorings and {overrides} final-test override(s)")
+            if runs_with_test > 1:
+                parts.append(f"{runs_with_test} runs in the run log carry a test metric")
+            audit.add("repeated-test-scoring", "test-misuse", "high", "proven", "The test set was scored more than once",
+                      "; ".join(parts) + ". Each extra look lets choices follow the test set, so the final test number "
+                      "is likely optimistic.", counts={"ledger_final_tests": finals, "final_test_overrides": overrides,
+                                                       "runs_with_test_metrics": runs_with_test}, files=files)
+        audit.ran("test-use-log", ", ".join(f["path"] for f in logs) + " read (the guard's state file is never opened)")
+    code = audit.files("code")
+    if not code:
+        audit.could_not("test-in-tuning-code", "no code files")
+        return
+    for f in code:
+        try:
+            text = _code_text(audit.root / f["path"])
+        except OSError:
+            continue
+        if not TUNING_CODE.search(text):
+            continue
+        lines = [text.count("\n", 0, m.start()) + 1 for m in TEST_IN_CALL.finditer(text)]
+        if lines:
+            audit.add("test-in-tuning", "test-misuse", "high", "suspected", f"Test data appears in tuning code ({f['path']})",
+                      f"{f['path']} runs a hyperparameter search and passes test-split data to a fit, predict, or score "
+                      f"call on {len(lines)} line(s). If those scores guide the search or the choice of model, the test "
+                      "set was used for tuning. Read the code to confirm (the tool only sees the pattern).",
+                      counts={"lines": len(lines)}, files=[f["path"]],
+                      source=", ".join(f"{f['path']}:{n}" for n in lines[:10]))
+    audit.ran("test-in-tuning-code", f"{len(code)} code file(s) read as text (never run)")
+
+
 # ------------------------------------------------------------------ trusted scoring (only with the user's trust)
 DEFAULT_TIMEOUT = 300
 PROJECT_INTERPRETERS = (".venv/bin/python", "venv/bin/python", "env/bin/python", ".venv/Scripts/python.exe",
