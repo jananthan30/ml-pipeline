@@ -19,7 +19,7 @@ and, in Claude Code, a hook that makes skipping them impossible:
 ```
 
 The skill activates automatically on any ML training/tuning/evaluation task, or invoke it
-directly with `/ml-pipeline`.
+directly with `/ml-pipeline`. Auditing existing work is a separate skill, `/ml-audit` (below).
 
 **Codex CLI**
 
@@ -34,8 +34,8 @@ codex plugin add ml-pipeline@ml-pipeline
 git clone https://github.com/jananthan30/ml-pipeline && cd ml-pipeline && ./install-other-tools.sh
 ```
 
-Copies the skill into `~/.codex/skills/` and `~/.kimi-code/skills/` and appends an
-enforcement section to each tool's global `AGENTS.md`.
+Copies both skills (pipeline and audit) into `~/.codex/skills/` and `~/.kimi-code/skills/` and
+appends an enforcement section and an audit section to each tool's global `AGENTS.md`.
 
 ## How it works
 
@@ -110,6 +110,62 @@ The hooks stop an agent from skipping steps by accident or by habit, and from th
 (running a hidden script, renaming the test set, editing its own approvals). They are pattern checks,
 not a sandbox: code built specifically to evade them can still run. For a hard boundary, run the agent
 without direct write access to `ml_pipeline/.approvals.json` and `.guard_state.json`.
+
+## Audit an existing project
+
+The gates guard new work. For work that already exists — a saved model, a data folder, a claimed
+score, built before the gates or by someone else — ask the agent to **audit** it ("can I trust this
+model?", or `/ml-audit`). The audit skill runs one read-only tool:
+
+```
+python3 <plugin>/skills/ml-audit/lib/mlpipeline_audit.py <project folder>
+```
+
+It inventories the folder (data and its train/val/test roles, predictions, models, code, claims;
+environment, dependency and version-control folders are skipped), runs every check it has evidence
+for, and writes one new dated folder, `<project>/ml_audit/<date_time>/`, with `report.md`,
+`findings.json` and `inventory.json`. It changes nothing else: no ledger lines, no gates, no approvals,
+no test-touch count. Repeated audits sit side by side.
+
+- **One plain verdict, no score:** *trustworthy*, *not trustworthy*, or *not enough evidence*. One proven
+  critical finding (a claimed score the predictions don't give, rows shared between train and test, a
+  feature that gives the label away) means *not trustworthy*. *Trustworthy* needs the three required
+  checks — score recomputation, train/test overlap, feature–target leakage — to have run, and it covers
+  only what the report lists as checked; "could not check" is never a pass.
+- **Every finding** has a severity, its evidence (proven by the tool, suspected, or agent review), counts,
+  the files and columns involved, and a command that reproduces it. The report holds column names and
+  counts, never raw row values.
+- **Checks:** claimed scores recomputed from saved predictions (accuracy, F1, AUC, RMSE, MAE, no
+  scikit-learn) within the claim's own rounding, and compared with a trivial baseline; data problems
+  (missing values, duplicates, constant columns, conflicting and invalid labels — every row streamed);
+  leakage (identical rows or entities across splits, near-perfect single-feature association, training
+  data later than test data); weak subgroups with intervals and calibration; and signs of test-set reuse
+  in the run log, the ledger, and tuning code.
+- **Prose counts too:** the agent passes scores it finds in a README as `--claim
+  'metric=accuracy,value=0.93,split=test,source=README.md:12'`, and adds its own reading of the code as
+  `--review` findings, labelled as such. Review findings never make the verdict on their own, and the agent
+  never states a number the tool did not compute.
+- **Model files are never loaded by default.** Pickle, joblib and zip-format torch files are scanned
+  statically — the pickle instructions are read, never run — and reported as *no risky imports found*,
+  *risky imports found* (named), or *unverified*. A clean scan lowers the risk; it does not prove the file
+  is safe.
+- **To trust a model,** tell the agent "trust models in `<project folder name>`". Your message is recorded
+  by the hook; the agent then reruns with `--trust <name>`, and the tool loads each model in a child
+  process with the project's own interpreter (code-free modes first, such as torch `weights_only`),
+  predicts the test file, and checks the claims against it. Files that import dangerous names are not
+  loaded even then. Because this views the test labels, its numbers must never be used to choose a model.
+- **Retrain checks need your approval** ("approve audit retrain for `<name>`"). The shuffled-label check
+  gives every near-identical row one random label, trains a nearest-neighbour model on a copy of the
+  training data inside the audit folder, and scores the test copy: above chance means the test rows copy
+  training rows. It never runs project code, and the copies are deleted afterwards.
+
+The guard lets exactly one command through for this: the plugin's own tool, run as one plain command
+with its documented flags. A script with the same name, a training script that mentions "audit", the tool
+chained to another command, an environment prefix, or a `--trust` the user never gave are all denied.
+In Codex and Kimi (no hooks) the read-only, one-command, trust and retrain rules are instructions only.
+
+Not covered yet: production drift and monitoring, fairness review, backdoor or poisoning scans of
+weights, and fixing anything. The audit does not send project data anywhere.
 
 ## Development
 

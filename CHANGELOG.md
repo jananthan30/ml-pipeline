@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.6.0 — audit existing models and data
+
+A new, separate skill, `ml-audit`, checks work that already exists — a saved model, a data folder, a
+claimed score — and reports whether its results can be trusted. It is read-only: its only writes are a
+new dated folder under `<project>/ml_audit/`. Design: `docs/superpowers/specs/2026-10-30-ml-pipeline-audit-design.md`;
+build report: `docs/superpowers/plans/v0.6-audit-REPORT.md`.
+
+### Added
+- **`skills/ml-audit/lib/mlpipeline_audit.py`** — inventory (user-correctable through
+  `ml_audit/inventory.json`), verdict (trustworthy / not trustworthy / not enough evidence, no numeric
+  score), `report.md` + `findings.json` + `inventory.json`, and a reproduction command per finding.
+- **Honest scores:** claims from metrics files (stated precision kept), `runs.jsonl`, the ledger's
+  final-test line and `--claim` for prose; accuracy, F1, AUC, RMSE, MAE without scikit-learn; trivial
+  baseline; test claims made on other rows.
+- **Data problems** streamed over every row; **leakage** (shared rows and entities, give-away features,
+  time order); **weak spots** (subgroups with Bonferroni-corrected intervals, calibration error);
+  **test-set misuse** (ledger and run log proven, tuning code suspected).
+- **Model safety:** a static pickle scanner (joblib arrays and compression, nested object arrays,
+  zip-format torch, memo-fed `STACK_GLOBAL`) that never imports what it reads; unverified is never safe.
+- **Trusted scoring** after the user's "trust models in <project>": child process, project interpreter,
+  code-free modes first, crashes and timeouts become could-not-check findings.
+- **Approved retrain:** a shuffled-label memorization check on copies inside the audit folder, after the
+  user's "approve audit retrain for <project>".
+- **Agent review layer:** `--review` findings, labelled, never proven, never decisive alone.
+- Evals `audit-no-pipeline` and `audit-planted-leak`; a planted-problem / clean-control table
+  (`tests/audit_fixture_table.py`).
+
+### Changed
+- **Guard exception.** `hooks/guard_training.py` allows exactly one shape: an interpreter, the plugin's own
+  audit tool (resolved inside the install folder), known flags with plain data values. Anything else that
+  names the tool is denied (chains, wrappers, environment prefixes, look-alikes, tampering); `--trust` and
+  `--retrain` need the user's recorded message; `ml_audit/.audit_approvals.json` is protected like the
+  guard's own state files.
+- `hooks/record_approval.py` records the two audit approvals from the user's own message.
+- The pipeline skill's description excludes audits; the session context names the audit tool; the
+  installer ships the audit skill to Codex and Kimi with an instructions-only note.
+
 ## 0.5.0 — big data, real approvals, one step at a time, rigorous data work
 
 This release combines two independently built 0.5 lines: big data and hardening (user-only approvals,
