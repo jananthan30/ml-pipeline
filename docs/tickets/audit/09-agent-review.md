@@ -4,8 +4,8 @@
 
 **Blocked by:** 02, 04, 05, 07, 08
 
-**Status:** ready-for-agent
+**Status:** done (v0.6-audit; eval written, not executed)
 
-- [ ] Review findings cannot produce a proven result or change the verdict to 'not trustworthy' on their own
-- [ ] A new eval case with a planted leak: the agent reports 'not trustworthy', does not train, and edits no project files
-- [ ] Codex and Kimi installs receive the skill, and the docs state that the rules are instructions only there
+- [x] Review findings cannot produce a proven result or change the verdict to 'not trustworthy' on their own
+- [x] A new eval case with a planted leak: the agent reports 'not trustworthy', does not train, and edits no project files
+- [x] Codex and Kimi installs receive the skill, and the docs state that the rules are instructions only there

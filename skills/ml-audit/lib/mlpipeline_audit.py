@@ -281,7 +281,7 @@ class Audit:
                    "evidence": evidence, "title": title, "detail": detail, "counts": counts or {},
                    "files": sorted(set(files)), "columns": sorted(set(map(str, columns))),
                    "sampled_rows": sampled, "source": source,
-                   "reproduce": self.reproduce(family) if family in FAMILIES else None}
+                   "reproduce": self.reproduce(family) if family in FAMILIES and evidence != "review" else None}
         self.findings.append(finding)
         return finding
 
@@ -495,6 +495,35 @@ def infer_task(y, configured=None) -> str:
     return "classification" if whole and len(np.unique(values)) <= MAX_CLASSES else "regression"
 
 
+# ------------------------------------------------------------------ records passed in (--claim, --review)
+FIELD_SPLIT = re.compile(r",\s*(?=(?:family|severity|text|source|metric|value|split|evidence)\s*=)", re.I)
+REVIEW_FAMILIES = ("honest-scores", "data-problems", "leakage", "weak-spots", "test-misuse", "model-safety")
+
+
+def parse_fields(raw: str) -> dict[str, str]:
+    """'key=value,key=value' where a value may itself hold commas (only known keys start a new field)."""
+    out = {}
+    for part in FIELD_SPLIT.split(raw):
+        if "=" in part:
+            key, value = part.split("=", 1)
+            out[key.strip().lower()] = value.strip()
+    return out
+
+
+@check_function
+def add_reviews(audit: "Audit") -> None:
+    """The agent's review findings: labelled 'review', never proven, never able to make the verdict on their own."""
+    for raw in audit.args.review or []:
+        fields = parse_fields(raw)
+        family, severity, text = fields.get("family", ""), fields.get("severity", "").lower(), fields.get("text", "")
+        if family not in REVIEW_FAMILIES or severity not in SEVERITIES or not text:
+            audit.notes.append(f"review ignored (needs family= one of {', '.join(REVIEW_FAMILIES)}, severity= one of "
+                               f"{', '.join(SEVERITIES)}, and text=): {raw[:120]}")
+            continue
+        audit.add("agent-review", family, severity, "review", text if len(text) <= 90 else text[:87] + "...",
+                  text, source=fields.get("source") or None)
+
+
 # ------------------------------------------------------------------ claims
 class _Num(float):
     """A JSON number that remembers how it was written, so its stated precision is known."""
@@ -581,7 +610,7 @@ def collect_claims(audit: "Audit") -> tuple[list[dict], list[str]]:
                 else:
                     ignored.append(f"{f['path']}:{line}: metric '{m.group(1)}' is not one the tool recomputes")
     for raw in audit.args.claim or []:
-        fields = dict(part.split("=", 1) for part in raw.split(",") if "=" in part)
+        fields = parse_fields(raw)
         metric = _metric_key(fields.get("metric", ""))
         value = fields.get("value", "").strip()
         if not metric or not re.fullmatch(r"[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?%?", value):

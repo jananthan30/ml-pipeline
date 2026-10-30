@@ -170,6 +170,23 @@ class Skeleton(unittest.TestCase):
 
 
 class SkillBoundaries(unittest.TestCase):
+    def test_codex_and_kimi_installs_receive_the_skill_and_say_rules_are_instructions_only(self):
+        with tempfile.TemporaryDirectory() as home:
+            for d in (".codex", ".kimi-code"):
+                Path(home, d).mkdir()
+            subprocess.run(["bash", str(fx.ROOT / "install-other-tools.sh")], check=True, capture_output=True,
+                           env={**os.environ, "HOME": home})
+            for d in (".codex", ".kimi-code"):
+                skill = Path(home, d, "skills", "ml-audit")
+                self.assertTrue((skill / "SKILL.md").is_file())
+                self.assertTrue((skill / "lib" / "mlpipeline_audit.py").is_file())
+                self.assertTrue(Path(home, d, "skills", "ml-pipeline", "lib", "mlpipeline_guard.py").is_file())
+                agents = Path(home, d, "AGENTS.md").read_text()
+                self.assertIn("ML audit (read-only)", agents)
+                self.assertIn("instructions only", agents)
+                self.assertIn("instructions only", (skill / "SKILL.md").read_text())
+
+
     def test_the_pipeline_skill_excludes_audits_and_the_audit_skill_is_narrow(self):
         root = fx.ROOT
         pipeline = (root / "skills" / "ml-pipeline" / "SKILL.md").read_text().split("---")[1]
