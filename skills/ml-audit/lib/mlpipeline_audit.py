@@ -297,7 +297,7 @@ class Audit:
     def reproduce(self, family: str) -> str:
         """The exact command that reruns this check family (the guard allows it: one plain command)."""
         a = self.args
-        argv = [os.path.realpath(sys.executable), str(TOOL), str(self.root)]
+        argv = [sys.executable, str(TOOL), str(self.root)]  # unresolved: a venv python keeps its packages
         for claim in a.claim or []:
             argv += ["--claim", claim]
         if a.trust:

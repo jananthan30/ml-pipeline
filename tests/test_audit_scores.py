@@ -175,6 +175,7 @@ class Claims(unittest.TestCase):
             for finding in f["findings"]:
                 with self.subTest(fixture=build.__name__, finding=finding["id"]):
                     command = finding["reproduce"]
+                    self.assertEqual(shlex.split(command)[0], sys.executable)  # the venv's python, not its base
                     self.assertTrue(hook.audit_problem({"command": command}, str(proj))[0])
                     self.assertIsNone(hook.audit_problem({"command": command}, str(proj))[1])
                     proc = subprocess.run(shlex.split(command), capture_output=True, text=True, cwd=str(proj))
