@@ -489,7 +489,8 @@ def small_weak_group(root: Path, size: int) -> Path:
     _write(root / "data" / "test.csv", test)
     _write(root / "data" / "train.csv", train)
     preds = pd.read_csv(root / "outputs" / "test_predictions.csv")
-    preds.loc[: size - 1, "y_pred"] = 1 - preds.loc[: size - 1, "y_true"]
+    if size:
+        preds.loc[: size - 1, "y_pred"] = 1 - preds.loc[: size - 1, "y_true"]
     _rewrite_predictions(root, preds)
     return root
 
@@ -571,7 +572,7 @@ def repeated_test_runs(root: Path) -> Path:
     clean_project(root)
     (root / "ml_pipeline").mkdir(exist_ok=True)
     (root / "ml_pipeline" / "runs.jsonl").write_text(
-        "\n".join(json.dumps({"name": f"model{i}", "kind": "candidate", "metrics": {"val_accuracy": 0.7, "test_auc": 0.8 + i / 100}})
+        "\n".join(json.dumps({"name": f"model{i}", "kind": "candidate", "metrics": {"val_accuracy": 0.7, "test_logloss": 0.4 + i / 100}})
                   for i in range(4)) + "\n")
     return root
 
@@ -610,4 +611,23 @@ def near_copies(root: Path, frac: float = 0.4) -> Path:
     copies["row_id"] = np.arange(k) + 70_000
     test = pd.concat([test.iloc[k:], copies], ignore_index=True)
     _write(root / "data" / "test.csv", test)
+    return root
+
+
+def near_baseline(root: Path, margin: float) -> Path:
+    """Predictions whose accuracy is exactly the majority-class accuracy plus ``margin`` (to the nearest row)."""
+    clean_project(root)
+    test = pd.read_csv(root / "data" / "test.csv")
+    train = pd.read_csv(root / "data" / "train.csv")
+    majority = int(train["y"].mode()[0])
+    y = test["y"].to_numpy()
+    pred = np.full(len(y), majority)
+    base = _accuracy(y, pred)
+    fix = int(round(margin * len(y)))
+    wrong = np.flatnonzero(y != majority)[:fix]
+    pred[wrong] = y[wrong]
+    preds = pd.DataFrame({"row_id": test.row_id, "y_true": y, "y_pred": pred})
+    _write(root / "outputs" / "test_predictions.csv", preds)
+    _json(root / "outputs" / "metrics.json", {"test": {"accuracy": round(_accuracy(y, pred), 4)}})
+    assert abs(_accuracy(y, pred) - base - fix / len(y)) < 1e-12
     return root

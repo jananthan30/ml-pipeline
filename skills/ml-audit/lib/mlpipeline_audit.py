@@ -970,6 +970,7 @@ def check_data_problems(audit: "Audit") -> None:
 
 
 # ------------------------------------------------------------------ check family: leakage
+ENTITY_MIN_DISTINCT = 20       # fewer distinct values in the later split: a grouping column, not an entity
 OVERLAP_CRITICAL_FRAC = 0.01   # identical rows shared with training in at least 1% of the later split: critical (high below)
 LEAK_ASSOCIATION = 0.95        # one feature alone removes this share of the label error (or explains this share of variance)
 SPLIT_PAIRS = (("train", "test"), ("train", "val"), ("val", "test"))
@@ -1009,7 +1010,7 @@ def check_overlap(audit: "Audit") -> None:
         return
     entity = audit.inv.get("entity_column")
     audit.check("entity-overlap", "leakage", "Entities shared across splits")
-    entity_ran = False
+    entity_ran, few = False, []
     for early, late in SPLIT_PAIRS:
         if not roles[early] or not roles[late]:
             continue
@@ -1033,7 +1034,10 @@ def check_overlap(audit: "Audit") -> None:
             ea, _ = _file_hashes(audit, roles[early], [entity])
             eb, _ = _file_hashes(audit, roles[late], [entity])
             shared_e = int(np.isin(eb, ea).sum())
-            if shared_e:
+            if len(eb) < ENTITY_MIN_DISTINCT:
+                few.append(f"'{entity}' has {len(eb)} distinct values in the {late} split (under {ENTITY_MIN_DISTINCT}): "
+                           "a grouping column, not an entity")
+            elif shared_e:
                 audit.add("entity-overlap", "leakage", "high", "proven",
                           f"The same {entity} values occur in the {early} and {late} splits",
                           f"{shared_e:,} of {len(eb):,} distinct '{entity}' values in the {late} split also occur in the "
@@ -1042,7 +1046,9 @@ def check_overlap(audit: "Audit") -> None:
                           counts={"shared_entities": shared_e, f"{late}_entities": len(eb)},
                           files=[f["path"] for f in roles[early] + roles[late]], columns=[entity])
     audit.ran("train-test-overlap", "every row of every split compared (identifier columns left out)")
-    if entity_ran:
+    if entity_ran and few:
+        audit.not_applicable("entity-overlap", "; ".join(few))
+    elif entity_ran:
         audit.ran("entity-overlap", f"entity column '{entity}'")
     else:
         audit.could_not("entity-overlap", "no entity column identified (set entity_column in the inventory)")

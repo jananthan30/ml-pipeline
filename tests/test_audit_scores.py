@@ -122,6 +122,13 @@ class Claims(unittest.TestCase):
         _, _, clean = fx.run_audit(fx.clean_project(self.root / "c"))
         self.assertEqual(fx.find(clean, "no-better-than-baseline"), [])
 
+    def test_baseline_margin_on_both_sides(self):
+        # 600 test rows: 5 extra correct rows = +0.0083 (flagged), 7 = +0.0117 (not flagged); margin 0.01
+        _, _, below = fx.run_audit(fx.near_baseline(self.root / "below", 5 / 600))
+        _, _, above = fx.run_audit(fx.near_baseline(self.root / "above", 7 / 600))
+        self.assertEqual(len(fx.find(below, "no-better-than-baseline")), 1)
+        self.assertEqual(fx.find(above, "no-better-than-baseline"), [])
+
     def test_a_test_claim_computed_on_validation_rows_is_caught(self):
         _, _, f = fx.run_audit(fx.wrong_split_claim(self.root / "p"))
         hits = fx.find(f, "claim-wrong-split")
