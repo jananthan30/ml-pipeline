@@ -169,6 +169,28 @@ class Skeleton(unittest.TestCase):
         time.sleep(0)
 
 
+class WithoutPandas(unittest.TestCase):
+    def test_a_python_without_pandas_still_gets_a_report(self):
+        """The inventory, model scan and log checks are standard library; the rest say they could not run."""
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = fx.model_project(Path(tmp) / "p", {"models/a.pkl": fx.DANGEROUS_PICKLE})
+            blocker = Path(tmp) / "block"
+            blocker.mkdir()
+            for name in ("pandas", "numpy"):
+                (blocker / f"{name}.py").write_text("raise ImportError('blocked for this test')\n")
+            proc = subprocess.run([sys.executable, str(fx.TOOL), str(proj)], capture_output=True, text=True,
+                                  env={**os.environ, "PYTHONPATH": str(blocker)}, timeout=120)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            out = Path(next(l.split(": ", 1)[1] for l in proc.stdout.splitlines() if l.startswith("audit folder: ")))
+            f = json.loads((out / "findings.json").read_text())
+            self.assertEqual(f["verdict"], "not enough evidence")
+            self.assertEqual(fx.find(f, "risky-imports")[0]["severity"], "high")
+            for check in f["checks"]:
+                if check["id"] not in ("model-scan", "test-use-log", "test-in-tuning-code"):
+                    self.assertNotEqual(check["status"], "ran", check)
+            self.assertIn("pandas", next(c for c in f["checks"] if c["id"] == "data-problems")["reason"])
+
+
 class SkillBoundaries(unittest.TestCase):
     def test_codex_and_kimi_installs_receive_the_skill_and_say_rules_are_instructions_only(self):
         with tempfile.TemporaryDirectory() as home:

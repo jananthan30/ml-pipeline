@@ -340,13 +340,23 @@ def verdict(audit: Audit) -> tuple[str, str]:
 def run_checks(audit: Audit) -> None:
     for check_id, (family, title) in REQUIRED.items():
         audit.check(check_id, family, title, required=True)
-    trusted_scoring(audit)  # first: its predictions feed the score checks
-    for fn in CHECK_FUNCTIONS:
-        fn(audit)
+    for fn in [trusted_scoring] + CHECK_FUNCTIONS:  # trusted scoring first: its predictions feed the score checks
+        try:
+            fn(audit)
+        except Exception as exc:  # noqa: BLE001 - a failed check is reported as 'could not check'; the audit goes on
+            why = str(exc) if isinstance(exc, NeedsPandas) else (
+                f"needs pandas and numpy ({exc}); run the tool with the project's interpreter"
+                if isinstance(exc, ImportError) else f"the check failed: {type(exc).__name__}: {exc}")
+            for entry in audit.checks.values():
+                if entry["status"] == "not run" and not entry["required"]:
+                    audit.could_not(entry["id"], why)
+            audit.notes.append(f"{fn.__name__}: {why}")
+            audit.last_failure = why
     for check_id in REQUIRED:
         if audit.checks[check_id]["status"] == "not run":
             family = audit.checks[check_id]["family"]
-            audit.could_not(check_id, "not requested (--check)" if not audit.wants(family) else "no check available")
+            audit.could_not(check_id, "not requested (--check)" if not audit.wants(family) else
+                            getattr(audit, "last_failure", None) or "no check available")
 
 
 CHECK_FUNCTIONS: list = []
