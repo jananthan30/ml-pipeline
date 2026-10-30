@@ -30,6 +30,8 @@ def main() -> int:
         "model-selection playbook at "
         f"{os.path.join(root, 'skills', 'ml-pipeline', 'references', 'model-selection.md')} (read at step 3 and before "
         f"Gate B); canary dataset generator at {os.path.join(lib, 'mlpipeline_canary.py')} (honest accuracy ceiling 0.80). "
+        f"Audit tool (ml-audit skill, read-only) at {os.path.join(root, 'skills', 'ml-audit', 'lib', 'mlpipeline_audit.py')}: "
+        "run it as ONE plain command, `python3 <that path> <project folder>`, nothing chained. "
         "Gates count only when the USER approves them in chat (their message is recorded automatically); record each "
         f"finished step as '- Step N done: <result>'. {marimo}."
     )

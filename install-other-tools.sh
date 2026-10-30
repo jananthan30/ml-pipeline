@@ -35,6 +35,19 @@ training split (a slice is a pilot that needs the user's override).
 EOF
 }
 
+audit_section() {
+  local skill_path="$1"
+  cat <<EOF
+
+## ML audit (read-only)
+
+When asked to audit, check, or verify an EXISTING ML project, model, or claimed score, read and follow
+\`$skill_path\`. An audit never trains, fixes, or edits project files and does not start the ML pipeline.
+Here there are no hooks: the read-only rule, the one-command rule, and the user's trust and retrain
+approvals are instructions only - follow them exactly.
+EOF
+}
+
 install_for() {
   local name="$1" home_dir="$2"
   [ -d "$home_dir" ] || { echo "skip: $name not found ($home_dir missing)"; return 0; }
@@ -43,8 +56,15 @@ install_for() {
   mkdir -p "$home_dir/skills"
   cp -R "$HERE/skills/ml-pipeline" "$home_dir/skills/ml-pipeline"
   find "$home_dir/skills/ml-pipeline" -name __pycache__ -type d -prune -exec rm -rf {} +
+  # the audit skill and its tool (it finds the guard library at ../../ml-pipeline/lib)
+  rm -rf "$home_dir/skills/ml-audit"
+  cp -R "$HERE/skills/ml-audit" "$home_dir/skills/ml-audit"
+  find "$home_dir/skills/ml-audit" -name __pycache__ -type d -prune -exec rm -rf {} +
   if ! grep -q "ML pipeline enforcement" "$home_dir/AGENTS.md" 2>/dev/null; then
     enforcement_section "$home_dir/skills/ml-pipeline/SKILL.md" >> "$home_dir/AGENTS.md"
+  fi
+  if ! grep -q "ML audit (read-only)" "$home_dir/AGENTS.md" 2>/dev/null; then
+    audit_section "$home_dir/skills/ml-audit/SKILL.md" >> "$home_dir/AGENTS.md"
   fi
   echo "installed: $name ($home_dir)"
 }

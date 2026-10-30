@@ -19,7 +19,7 @@ jobs:
         with:
           python-version: "3.10"
       - name: Hook and canary tests (stdlib only)
-        run: python -m unittest tests.test_guard_training tests.test_hook_data_work tests.test_gate_records tests.test_record_approval tests.test_post_tool_warn tests.test_session_start tests.test_mlpipeline_canary -v
+        run: python -m unittest tests.test_guard_training tests.test_hook_data_work tests.test_gate_records tests.test_record_approval tests.test_post_tool_warn tests.test_session_start tests.test_mlpipeline_canary tests.test_audit_hook -v
       - name: Hook audit probe (must report 0 wrong)
         run: python tests/probe_hook_audit.py | tee probe.txt && grep -q "^0 of " probe.txt
 
@@ -45,3 +45,5 @@ jobs:
           ./install-other-tools.sh
           test -f "$HOME/.codex/skills/ml-pipeline/lib/mlpipeline_guard.py"
           test -f "$HOME/.codex/skills/ml-pipeline/references/model-selection.md"
+          test -f "$HOME/.codex/skills/ml-audit/lib/mlpipeline_audit.py"
+          test -f "$HOME/.codex/skills/ml-audit/SKILL.md"

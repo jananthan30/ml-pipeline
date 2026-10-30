@@ -148,6 +148,23 @@ def main() -> None:
         user_says(said, d)
         cases.append((f"ledger {label}", want, "Write", write(d / "train.py", TRAIN), d))
 
+    # --- the audit tool's exception (v0.6): only the exact invocation of the plugin's own tool passes
+    tool = Path(__file__).resolve().parents[1] / "skills" / "ml-audit" / "lib" / "mlpipeline_audit.py"
+    score_test = "acc = accuracy_score(y_test, model.predict(X_test))\n"
+    aud = project("audit", ledger=["# Pipeline"], files={
+        "mlpipeline_audit.py": score_test, "train_audit.py": "# audit-ready\n" + TRAIN, "train.py": TRAIN})
+    cases += [
+        ("audit: exact invocation of the plugin's tool", "ALLOW", "Bash", {"command": f"python3 {tool} {aud}"}, aud),
+        ("audit: look-alike script with the same name", "DENY", "Bash", {"command": "python3 mlpipeline_audit.py ."}, aud),
+        ("audit: training script mentioning audit", "DENY", "Bash", {"command": "python3 train_audit.py --audit"}, aud),
+        ("audit: tool chained to a training script", "DENY", "Bash",
+         {"command": f"python3 {tool} {aud} && python3 train.py"}, aud),
+        ("audit: tool chained to a harmless command", "DENY", "Bash", {"command": f"python3 {tool} {aud}; echo ok"}, aud),
+        ("audit: environment prefix", "DENY", "Bash", {"command": f"PYTHONPATH=. python3 {tool} {aud}"}, aud),
+        ("audit: --trust without the user's approval", "DENY", "Bash",
+         {"command": f"python3 {tool} {aud} --trust audit"}, aud),
+    ]
+
     wrong = 0
     print(f"{'case':46} {'should':7} {'does':6} {'':3}")
     for label, want, tool, tool_input, cwd in cases:

@@ -4,12 +4,12 @@
 
 **Blocked by:** The combined v0.5 line
 
-**Status:** ready-for-agent
+**Status:** done (v0.6-audit)
 
-- [ ] The inventory lists data, code, models, predictions and claims, and skips environment, dependency and version-control folders
-- [ ] The user can correct the inventory and rerun
-- [ ] Output goes to a new dated subfolder, with a report, a findings file and the inventory
-- [ ] Hashing every file before and after shows only the audit folder changed
-- [ ] The training guard allows the exact tool invocation and denies a look-alike script, a training script mentioning audit, and the tool chained to another command
-- [ ] The audit adds no ledger lines and does not touch the guard's approval or state files
-- [ ] The pipeline skill does not fire on an audit request
+- [x] The inventory lists data, code, models, predictions and claims, and skips environment, dependency and version-control folders
+- [x] The user can correct the inventory and rerun
+- [x] Output goes to a new dated subfolder, with a report, a findings file and the inventory
+- [x] Hashing every file before and after shows only the audit folder changed
+- [x] The training guard allows the exact tool invocation and denies a look-alike script, a training script mentioning audit, and the tool chained to another command
+- [x] The audit adds no ledger lines and does not touch the guard's approval or state files
+- [x] The pipeline skill does not fire on an audit request

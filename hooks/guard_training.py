@@ -919,6 +919,172 @@ def decide(found: dict[str, str | None], gates: dict[str, bool] | None, steps: d
     return GATE_A_MSG.format(found["model"] or found["transformer"]) + _proof_hint(gates, "A")
 
 
+# ------------------------------------------------------------------ the audit tool's exception
+# The audit scores saved predictions and (when trusted) models on test data, which is what this guard denies before
+# Gate C. So exactly one command shape is let through: an interpreter, the plugin's OWN audit tool (resolved inside
+# this plugin's install folder), and known flags with plain data values - one command, nothing chained, no shell
+# expansion, no environment settings. Any other command that names the tool is denied; look-alikes elsewhere are
+# judged like any other script. ``--trust`` and ``--retrain`` also need the user's own chat approval.
+PLUGIN_ROOT = Path(__file__).resolve().parents[1]
+AUDIT_TOOL = PLUGIN_ROOT / "skills" / "ml-audit" / "lib" / "mlpipeline_audit.py"
+AUDIT_NAME = re.compile(r"mlpipeline_audit", re.I)
+AUDIT_FAMILIES = {"inventory", "honest-scores", "data-problems", "leakage", "model-safety", "weak-spots", "test-misuse",
+                  "retrain"}
+_AUDIT_NAME_VALUE = re.compile(r"^[\w.-]{1,200}$")
+AUDIT_FLAGS = {"--claim": None, "--review": None, "--trust": _AUDIT_NAME_VALUE, "--retrain": _AUDIT_NAME_VALUE,
+               "--check": re.compile("^(?:" + "|".join(sorted(AUDIT_FAMILIES)) + ")$"),
+               "--sample-rows": re.compile(r"^\d{1,9}$"), "--timeout": re.compile(r"^\d{1,9}$")}
+PY_SAFE_FLAGS = {"-I", "-B", "-u", "-E", "-s"}
+INTERPRETER = re.compile(r"^python(?:\d+(?:\.\d+)?)?$")
+_UNQUOTED_META = set(";&|<>()$`\\\n\r*?[]{}~!#")
+_DOUBLE_QUOTED_META = set("$`\\!\n\r")
+AUDIT_APPROVALS = ".audit_approvals.json"
+AUDIT_SHAPE_MSG = (
+    "ml-pipeline: the audit tool runs only as one plain command: `python3 <plugin>/skills/ml-audit/lib/mlpipeline_audit.py "
+    "<folder> [--claim ...] [--review ...] [--check ...]` - the plugin's own copy, nothing chained before or after it, "
+    "no pipes, redirection, variables, substitutions, or environment settings, and only its documented flags."
+)
+AUDIT_APPROVAL_MSG = (
+    "ml-pipeline: `{0} {1}` needs the user's own approval in chat. Explain what it does and ask; their reply (for "
+    "example '{2} {1}') is recorded automatically, then run the same command again."
+)
+AUDIT_TAMPER_MSG = "ml-pipeline: the plugin's audit tool is not editable from a session; read it, don't change it."
+
+
+def _plain_words(command: str) -> list[str] | None:
+    """Shell words of a command made of plain words and quotes only, or None (any operator, expansion, or escape)."""
+    words, cur, quote, have = [], [], None, False
+    for ch in command:
+        if quote == "'":
+            if ch == "'":
+                quote = None
+            elif ch in "\n\r":
+                return None
+            else:
+                cur.append(ch)
+        elif quote == '"':
+            if ch == '"':
+                quote = None
+            elif ch in _DOUBLE_QUOTED_META:
+                return None
+            else:
+                cur.append(ch)
+        elif ch in "'\"":
+            quote, have = ch, True
+        elif ch in " \t":
+            if have or cur:
+                words.append("".join(cur))
+            cur, have = [], False
+        elif ch in _UNQUOTED_META:
+            return None
+        else:
+            cur.append(ch)
+            have = True
+    if quote is not None:
+        return None
+    if have or cur:
+        words.append("".join(cur))
+    return words
+
+
+def _real_interpreter(word: str, cwd: str) -> bool:
+    """A python interpreter by name (PATH), or a path to a binary called python (not a script wrapper)."""
+    if not INTERPRETER.match(os.path.basename(word)) or "=" in word:
+        return False
+    if "/" not in word:
+        return True
+    path = Path(word) if os.path.isabs(word) else Path(cwd or ".") / word
+    real = path.resolve()
+    if not real.is_file() or real.suffix.lower() in {".py", ".sh", ".txt"}:
+        return False
+    with real.open("rb") as fh:
+        return fh.read(2) != b"#!"
+
+
+def audit_invocation(command: str, cwd: str) -> dict | None:
+    """The parsed exact invocation of the plugin's audit tool, or None. Any doubt (or error) means None."""
+    try:
+        if not AUDIT_TOOL.is_file():
+            return None
+        words = _plain_words(command.strip())
+        if not words or len(words) < 3 or not _real_interpreter(words[0], cwd):
+            return None
+        rest = words[1:]
+        while rest and rest[0] in PY_SAFE_FLAGS:
+            rest = rest[1:]
+        if len(rest) < 2:
+            return None
+        tool = Path(rest[0]) if os.path.isabs(rest[0]) else Path(cwd or ".") / rest[0]
+        if tool.resolve() != AUDIT_TOOL.resolve():
+            return None
+        folder, flags, args, i = None, [], rest[1:], 0
+        while i < len(args):
+            arg = args[i]
+            if arg.startswith("--"):
+                name, eq, value = arg.partition("=")
+                if name not in AUDIT_FLAGS:
+                    return None
+                if not eq:
+                    i += 1
+                    if i >= len(args):
+                        return None
+                    value = args[i]
+                check = AUDIT_FLAGS[name]
+                if check is not None and not check.match(value):
+                    return None
+                flags.append((name, value))
+            elif arg.startswith("-") or folder is not None or not arg:
+                return None
+            else:
+                folder = arg
+            i += 1
+        if folder is None:
+            return None
+        return {"folder": folder, "flags": flags}
+    except Exception:  # noqa: BLE001 - never exempt a command we could not fully read
+        return None
+
+
+def audit_approved(kind: str, name: str, folder: str, cwd: str) -> bool:
+    """The user approved ``kind`` ('trust' or 'retrain') for project ``name`` in chat (hooks/record_approval.py),
+    and ``name`` is the audited folder's own name."""
+    base = Path(cwd or ".")
+    target = (Path(folder) if os.path.isabs(folder) else base / folder).resolve()
+    if target.name != name:
+        return False
+    for state in {base.resolve() / "ml_audit", target / "ml_audit"}:
+        try:
+            data = json.loads((state / AUDIT_APPROVALS).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if any(isinstance(e, dict) and e.get("project") == name for e in data.get(kind) or []):
+            return True
+    return False
+
+
+def audit_problem(tool_input: dict, cwd: str) -> tuple[bool, str | None]:
+    """(exact audit invocation?, denial reason). Exact invocations skip the training checks: the tool takes no code."""
+    target = str(tool_input.get("file_path") or tool_input.get("notebook_path") or "")
+    if target:
+        try:
+            path = Path(target) if os.path.isabs(target) else Path(cwd or ".") / target
+            if path.resolve() == AUDIT_TOOL.resolve():
+                return False, AUDIT_TAMPER_MSG
+        except OSError:
+            pass
+    command = tool_input.get("command") if isinstance(tool_input.get("command"), str) else None
+    if command is None:
+        return False, None
+    parsed = audit_invocation(command, cwd)
+    if parsed is None:
+        return False, (AUDIT_SHAPE_MSG if AUDIT_NAME.search(command) else None)
+    for flag, kind, phrase in (("--trust", "trust", "trust models in"), ("--retrain", "retrain", "approve audit retrain for")):
+        for name, value in parsed["flags"]:
+            if name == flag and require_proof() and not audit_approved(kind, value, parsed["folder"], cwd):
+                return True, AUDIT_APPROVAL_MSG.format(flag, value, phrase)
+    return True, None
+
+
 # ------------------------------------------------------------------ self-disable
 SWITCH = r"ML_PIPELINE_(?:ENFORCE|FILE|REQUIRE_USER_APPROVAL)"
 # Assigning a switch (`X=0`, `"X": "0"`, `environ["X"] = ...`, `setenv X`), never reading it
@@ -930,7 +1096,8 @@ SELF_DISABLE = re.compile(
 # ------------------------------------------------------------------ tamper protection
 # The state files by name, by the library's constants and writers, and by common string-splitting.
 PROTECTED_NAME = re.compile(
-    r"\.guard_state\.json|\.approvals\.json|\bAPPROVALS_FILE\b|\bSTATE_FILE\b|\b_write_state\s*\(|\brecord_approval\b|"
+    r"\.guard_state\.json|\.approvals\.json|\.audit_approvals\.json|\bAPPROVALS_FILE\b|\bAUDIT_APPROVALS_FILE\b|"
+    r"\bSTATE_FILE\b|\b_write_state\s*\(|\brecord_approval\b|"
     r"[\"'][^\"'\n]*(?:\.appr|approvals?\.js|guard_st|_state\.js)[^\"'\n]*[\"']"
 )
 READ_ONLY_TOOL = re.compile(r"^\s*(?:cat|less|more|head|tail|jq|ls|stat|wc|file|grep|egrep|fgrep|rg|sort|uniq|cut|column|"
@@ -1097,8 +1264,15 @@ def main() -> int:
         # Reading (cat, grep, jq, ...) changes nothing and runs nothing.
         if command is not None and read_only_command(command):
             return _emit(None)
+        # The audit tool: its exact invocation is allowed (it takes no code); anything else naming it is denied.
+        exact_audit, reason = audit_problem(tool_input, cwd)
+        if reason or exact_audit:
+            return _emit(reason)
         # Shell commands are judged with the local scripts, notebooks and modules they run.
         executed = executed_sources(command, cwd) if command is not None else []
+        # A script that runs the audit tool would hide its command line from the shape check above.
+        if any(AUDIT_NAME.search(source) for source in executed):
+            return _emit(AUDIT_SHAPE_MSG)
         # 0. Only the user switches enforcement or the approval rule off; settings files included.
         if suffix not in PROSE_SUFFIXES and any(SELF_DISABLE.search(t) for t in [text, *executed]):
             return _emit(SELF_DISABLE_MSG)
