@@ -78,16 +78,21 @@ class Skeleton(unittest.TestCase):
         proj = self.project()
         _, out, _ = fx.run_audit(proj)
         inv = json.loads((out / "inventory.json").read_text())
-        self.assertFalse(inv["corrected_by_user"])
+        self.assertFalse(inv["corrected"])
         (proj / "ml_audit" / "inventory.json").write_text(json.dumps(
-            {"files": [{"path": "data/test.csv", "role": "val"}], "target": "x3"}))
+            {"files": [{"path": "data/test.csv", "role": "val"}], "target": "x3", "time_column": None}))
         _, out2, _ = fx.run_audit(proj)
         inv2 = json.loads((out2 / "inventory.json").read_text())
-        self.assertTrue(inv2["corrected_by_user"])
+        self.assertTrue(inv2["corrected"])
         self.assertEqual(inv2["target"], "x3")
         self.assertEqual({f["path"]: f.get("role") for f in inv2["files"]}["data/test.csv"], "val")
+        self.assertIn({"what": "target", "guessed": "y", "corrected": "x3"}, inv2["corrections"])
+        self.assertIn({"what": "data/test.csv role", "guessed": "test", "corrected": "val"}, inv2["corrections"])
+        self.assertEqual(len(inv2["corrections"]), 2)  # time_column was already null: not a change
         report = (out2 / "report.md").read_text()
-        self.assertIn("corrected", report.lower())
+        self.assertIn("target: `y` -> `x3`", report)
+        self.assertIn("data/test.csv role: `test` -> `val`", report)
+        self.assertNotIn("by the user", report)
 
     def test_output_goes_to_a_new_dated_subfolder_each_run(self):
         proj = self.project()

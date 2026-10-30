@@ -211,7 +211,7 @@ INVENTORY_KEYS = ("target", "task", "positive_label", "time_column", "entity_col
 def build_inventory(root: Path) -> dict:
     paths, skipped = walk(root)
     files = [classify(p, root) for p in paths]
-    inv = {"version": VERSION, "project": root.name, "corrected_by_user": False, "files": files,
+    inv = {"version": VERSION, "project": root.name, "corrected": False, "corrections": [], "files": files,
            "skipped_folders": skipped, "not_opened": sorted(NEVER_OPEN),
            "task": None, "positive_label": None, "group_columns": None, "allowed_labels": None}
     inv.update(guess_columns(files))
@@ -222,10 +222,13 @@ def build_inventory(root: Path) -> dict:
 
 
 def apply_correction(inv: dict, user: dict, root: Path) -> dict:
-    """The user's ``ml_audit/inventory.json`` overrides what was guessed: top-level keys, and file entries by path."""
-    inv = dict(inv, corrected_by_user=True, correction_notes=[])
+    """``ml_audit/inventory.json`` overrides what was guessed: top-level keys, and file entries by path. Every change is
+    listed (guessed -> corrected), because the file can be written by anyone, and a change can move the verdict."""
+    inv = dict(inv, corrected=True, corrections=[], correction_notes=[])
     for key in INVENTORY_KEYS:
         if key in user:
+            if user[key] != inv.get(key):
+                inv["corrections"].append({"what": key, "guessed": inv.get(key), "corrected": user[key]})
             inv[key] = user[key]
     by_path = {f["path"]: f for f in inv["files"]}
     for entry in user.get("files") or []:
@@ -240,9 +243,14 @@ def apply_correction(inv: dict, user: dict, root: Path) -> dict:
             else:
                 inv["correction_notes"].append(f"{entry['path']}: listed in the correction but not found")
                 continue
-        current.update({k: v for k, v in entry.items() if k not in ("path", "size", "columns")})
+        for k, v in entry.items():
+            if k not in ("path", "size", "columns") and current.get(k) != v:
+                inv["corrections"].append({"what": f"{entry['path']} {k}", "guessed": current.get(k), "corrected": v})
+                current[k] = v
     if user.get("exclude"):
         excluded = set(user["exclude"])
+        inv["corrections"] += [{"what": f"{p} excluded", "guessed": "included", "corrected": "excluded"}
+                               for p in sorted(excluded) if p in {f["path"] for f in inv["files"]}]
         inv["files"] = [f for f in inv["files"] if f["path"] not in excluded]
     return inv
 
@@ -2164,9 +2172,13 @@ def report_markdown(audit: Audit, result: str, why: str) -> str:
             lines.append(f"- reproduce: `{f['reproduce']}`")
         lines.append("")
     lines += ["## Inventory", ""]
-    if inv.get("corrected_by_user"):
-        lines.append("The inventory was corrected by the user (`ml_audit/inventory.json`).")
+    if inv.get("corrected"):
+        lines.append("The inventory was corrected through `ml_audit/inventory.json`. Changes from what the tool guessed "
+                     "(check each one: a correction can change the verdict):")
+        lines += [f"- {c['what']}: `{c['guessed']}` -> `{c['corrected']}`" for c in inv.get("corrections") or []]
         lines += [f"- {n}" for n in inv.get("correction_notes") or []]
+        if not inv.get("corrections"):
+            lines.append("- no value differs from the guess")
     else:
         lines.append("Guessed from file names and headers. To correct it, copy this audit's `inventory.json` to "
                      "`ml_audit/inventory.json`, edit it, and run the audit again.")
