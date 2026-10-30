@@ -4,9 +4,9 @@
 
 **Blocked by:** 02
 
-**Status:** ready-for-agent
+**Status:** done (v0.6-audit)
 
-- [ ] A planted weak subgroup is found and reported with its size and interval
-- [ ] Groups under the minimum size are not reported as problems
-- [ ] A deliberately miscalibrated fixture is flagged, and a calibrated control is not
-- [ ] Regression projects skip calibration with a clear note
+- [x] A planted weak subgroup is found and reported with its size and interval
+- [x] Groups under the minimum size are not reported as problems
+- [x] A deliberately miscalibrated fixture is flagged, and a calibrated control is not
+- [x] Regression projects skip calibration with a clear note

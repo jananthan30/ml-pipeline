@@ -459,3 +459,81 @@ def missing_class_project(root: Path) -> Path:
     _pickle_project_object(root, "gonemodel", GONE_MODULE, "Gone", "models/gone.pkl")
     (root / "gonemodel.py").unlink()
     return root
+
+
+# ------------------------------------------------------------------ ticket 07: weak spots
+def _rewrite_predictions(root: Path, preds: pd.DataFrame) -> None:
+    _write(root / "outputs" / "test_predictions.csv", preds)
+    _json(root / "outputs" / "metrics.json", {"test": {"accuracy": round(_accuracy(preds.y_true, preds.y_pred), 3)}})
+
+
+def weak_subgroup(root: Path) -> Path:
+    """The model guesses at random for one region; the claim is honest about the overall accuracy."""
+    clean_project(root)
+    test = pd.read_csv(root / "data" / "test.csv")
+    preds = pd.read_csv(root / "outputs" / "test_predictions.csv")
+    west = (test["region"] == "west").to_numpy()
+    preds.loc[west, "y_pred"] = np.random.default_rng(3).integers(0, 2, int(west.sum()))
+    _rewrite_predictions(root, preds)
+    return root
+
+
+def small_weak_group(root: Path, size: int) -> Path:
+    """A 'site' level of ``size`` test rows on which every prediction is wrong."""
+    clean_project(root)
+    test = pd.read_csv(root / "data" / "test.csv")
+    train = pd.read_csv(root / "data" / "train.csv")
+    site = np.where(np.arange(len(test)) < size, "s9", np.where(np.arange(len(test)) % 2, "s1", "s2"))
+    test.insert(6, "site", site)
+    train.insert(6, "site", np.where(np.arange(len(train)) % 2, "s1", "s2"))
+    _write(root / "data" / "test.csv", test)
+    _write(root / "data" / "train.csv", train)
+    preds = pd.read_csv(root / "outputs" / "test_predictions.csv")
+    preds.loc[: size - 1, "y_pred"] = 1 - preds.loc[: size - 1, "y_true"]
+    _rewrite_predictions(root, preds)
+    return root
+
+
+def miscalibrated(root: Path) -> Path:
+    """Over-confident probabilities: same ranking and labels, pushed towards 0 and 1."""
+    clean_project(root)
+    preds = pd.read_csv(root / "outputs" / "test_predictions.csv")
+    p = preds["y_prob"].clip(1e-6, 1 - 1e-6)
+    preds["y_prob"] = (1 / (1 + np.exp(-4 * np.log(p / (1 - p))))).round(6)
+    _rewrite_predictions(root, preds)
+    return root
+
+
+def constant_probability(root: Path, offset: float) -> Path:
+    """Exactly half the test rows are positive and every probability is 0.5 + offset: calibration error = offset."""
+    clean_project(root)
+    preds = pd.read_csv(root / "outputs" / "test_predictions.csv")
+    n = len(preds)
+    preds["y_true"] = np.arange(n) % 2
+    test = pd.read_csv(root / "data" / "test.csv")
+    test["y"] = preds["y_true"].to_numpy()
+    _write(root / "data" / "test.csv", test)
+    preds["y_prob"] = 0.5 + offset
+    preds["y_pred"] = np.where(np.arange(n) % 4 == 0, 1 - preds["y_true"], preds["y_true"])
+    _rewrite_predictions(root, preds)
+    return root
+
+
+def regression_project(root: Path, *, n_train: int = 1000, n_test: int = 500, seed: int = 21) -> Path:
+    """A clean regression project: honest predictions and a correct RMSE claim."""
+    root.mkdir(parents=True, exist_ok=True)
+    rng = np.random.default_rng(seed)
+    def frame(n, start):
+        x = rng.normal(size=(n, 3))
+        y = 2.0 * x[:, 0] - x[:, 1] + rng.normal(0, 1.0, n)
+        return pd.DataFrame({"row_id": np.arange(start, start + n), "x0": x[:, 0].round(6), "x1": x[:, 1].round(6),
+                             "x2": x[:, 2].round(6), "group": rng.choice(["g1", "g2", "g3"], n), "target": y.round(6)})
+    train, test = frame(n_train, 0), frame(n_test, n_train)
+    _write(root / "data" / "train.csv", train)
+    _write(root / "data" / "test.csv", test)
+    pred = (2.0 * test.x0 - test.x1 + rng.normal(0, 0.3, n_test)).round(6)
+    preds = pd.DataFrame({"row_id": test.row_id, "y_true": test.target, "y_pred": pred})
+    _write(root / "outputs" / "test_predictions.csv", preds)
+    rmse = float(np.sqrt(np.mean((preds.y_true - preds.y_pred) ** 2)))
+    _json(root / "outputs" / "metrics.json", {"test": {"rmse": round(rmse, 3)}})
+    return root

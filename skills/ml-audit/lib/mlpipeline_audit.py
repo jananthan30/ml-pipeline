@@ -269,6 +269,9 @@ class Audit:
         if entry["status"] != "ran":
             entry["status"], entry["reason"] = "could not check", reason
 
+    def not_applicable(self, check_id: str, reason: str) -> None:
+        self.checks[check_id]["status"], self.checks[check_id]["reason"] = "not applicable", reason
+
     # -- findings
     def add(self, code: str, family: str, severity: str, evidence: str, title: str, detail: str, *,
             counts: dict | None = None, files=(), columns=(), sampled: int | None = None, source: str | None = None) -> dict:
@@ -1472,6 +1475,168 @@ def check_model_safety(audit: "Audit") -> None:
                       f"every one of its {len(result['imports'])} imports is on the safe list. {NOT_PROOF} "
                       "The file was not loaded.", counts={"imports": len(result["imports"])}, files=[f["path"]])
     audit.ran("model-scan", f"{len(models)} file(s) scanned statically and not loaded. {NOT_PROOF}")
+
+
+# ------------------------------------------------------------------ check family: hidden weak spots
+MIN_GROUP_SIZE = 30            # a subgroup smaller than this is never reported as a problem
+MAX_GROUP_LEVELS = 20          # columns with more levels than this are not used to form subgroups
+SUBGROUP_GAP = 0.05            # accuracy gap (or MAE gap relative to the rest) a subgroup must show, with its interval above 0
+CALIBRATION_ECE = 0.10         # expected calibration error (10 equal-width bins) from which probabilities are flagged
+MIN_CALIBRATION_ROWS = 100
+
+
+def _aligned_frame(audit: "Audit", pf: dict):
+    """The predictions joined to the test rows' columns: by a shared id column, else row by row when the labels line up."""
+    import numpy as np
+    target = audit.inv.get("target")
+    preds = read_columns(audit, pf["path"])
+    tests = audit.files("data", "test")
+    if not tests:
+        return preds, "the predictions file only"
+    test = tests[0]
+    ids = _id_columns(pf, test, target)
+    data = read_columns(audit, test["path"])
+    extra = [c for c in data.columns if c not in preds.columns]
+    if ids:
+        joined = preds.merge(data[ids + extra].drop_duplicates(ids), on=ids, how="left")
+        return joined, f"joined to {test['path']} on {', '.join(ids)}"
+    if target and pf.get("y_true") and len(data) == len(preds) and \
+            np.array_equal(_labels(data[target].to_numpy()), _labels(preds[pf["y_true"]].to_numpy())):
+        for c in extra:
+            preds[c] = data[c].to_numpy()
+        return preds, f"aligned row by row with {test['path']} (the labels match in order)"
+    return preds, "the predictions file only (no id column to join on the test file)"
+
+
+def _group_columns(audit: "Audit", frame, pf: dict) -> list[str]:
+    g = guard()
+    configured = audit.inv.get("group_columns")
+    if configured:
+        return [c for c in configured if c in frame.columns]
+    skip = {pf.get("y_true"), pf.get("y_pred"), pf.get("y_prob"), audit.inv.get("target"), audit.inv.get("time_column")}
+    out = []
+    for col in frame.columns:
+        if col in skip or ID_COLUMN.search(str(col)):
+            continue
+        kind = g._column_kind(frame[col])
+        levels = frame[col].nunique(dropna=True)
+        if kind in ("categorical", "bool") and 2 <= levels <= MAX_GROUP_LEVELS:
+            out.append(col)
+    return out
+
+
+def check_subgroups(audit: "Audit", pf: dict, frame, how: str, task: str) -> None:
+    import numpy as np
+    y, p = frame[pf["y_true"]].to_numpy(), frame[pf["y_pred"]].to_numpy()
+    if task == "classification":
+        per_row = (_labels(y) == _labels(p)).astype(float) if _labels(y).dtype == _labels(p).dtype else \
+            (_labels(y).astype(str) == _labels(p).astype(str)).astype(float)
+        name, worse = "accuracy", -1.0     # lower accuracy is worse
+    else:
+        per_row = np.abs(np.asarray(y, dtype=float) - np.asarray(p, dtype=float))
+        name, worse = "mean absolute error", 1.0
+    from statistics import NormalDist
+    columns = _group_columns(audit, frame, pf)
+    groups = [(col, level, idx) for col in columns for level, idx in frame.groupby(col, dropna=True).indices.items()]
+    judged = sum(1 for _, _, idx in groups if len(idx) >= MIN_GROUP_SIZE and len(frame) - len(idx) >= MIN_GROUP_SIZE)
+    # Bonferroni: the interval holds for all judged groups at once, so testing many groups does not manufacture a finding
+    z = NormalDist().inv_cdf(1 - 0.025 / max(judged, 1))
+    small, tested = 0, 0
+    for col, level, idx in groups:
+        n_g = len(idx)
+        rest = np.ones(len(frame), dtype=bool)
+        rest[idx] = False
+        if n_g < MIN_GROUP_SIZE:
+            small += 1
+            continue
+        if rest.sum() < MIN_GROUP_SIZE:
+            continue
+        tested += 1
+        g_vals, r_vals = per_row[idx], per_row[rest]
+        gap = worse * (g_vals.mean() - r_vals.mean())        # > 0: the group is worse than the rest
+        se = float(np.sqrt(g_vals.var(ddof=1) / n_g + r_vals.var(ddof=1) / len(r_vals)))
+        low, high = gap - z * se, gap + z * se
+        needed = SUBGROUP_GAP if task == "classification" else SUBGROUP_GAP * r_vals.mean()
+        if gap >= needed and low > 0:
+            audit.add("weak-subgroup", "weak-spots", "medium", "proven",
+                      f"The model is weaker where {col} = {level}",
+                      f"{name} {g_vals.mean():.3f} on {n_g:,} rows where {col} = {level}, against {r_vals.mean():.3f} "
+                      f"on the other {len(r_vals):,} rows; gap {gap:.3f}, 95% interval {low:.3f} to {high:.3f} "
+                      f"(Bonferroni-corrected over {judged} groups) "
+                      f"(predictions {how}). Groups under {MIN_GROUP_SIZE} rows are never reported.",
+                      counts={"group_rows": n_g, "group_metric": round(float(g_vals.mean()), 6),
+                              "rest_metric": round(float(r_vals.mean()), 6), "gap": round(float(gap), 6),
+                              "gap_interval_95": [round(float(low), 6), round(float(high), 6)]},
+                      files=[pf["path"]], columns=[col])
+    note = f"{tested} subgroup(s) of {len(columns)} column(s) compared ({how})"
+    if small:
+        note += f"; {small} group(s) with fewer than {MIN_GROUP_SIZE} rows not judged"
+    if columns:
+        audit.ran("subgroups", note)
+    else:
+        audit.could_not("subgroups", f"no categorical column with 2-{MAX_GROUP_LEVELS} levels next to the predictions "
+                                     f"({how}); set group_columns in the inventory")
+
+
+def expected_calibration_error(y_pos, prob, bins: int = 10) -> float:
+    import numpy as np
+    prob = np.asarray(prob, dtype=float)
+    idx = np.minimum((prob * bins).astype(int), bins - 1)
+    total = 0.0
+    for b in np.unique(idx):
+        m = idx == b
+        total += m.sum() / len(prob) * abs(prob[m].mean() - y_pos[m].mean())
+    return float(total)
+
+
+def check_calibration(audit: "Audit", pf: dict, frame, task: str) -> None:
+    import numpy as np
+    if task == "regression":
+        audit.not_applicable("calibration", "regression target: calibration applies to predicted class probabilities")
+        return
+    if not pf.get("y_prob"):
+        audit.could_not("calibration", f"{pf['path']} has no probability column")
+        return
+    y = frame[pf["y_true"]].to_numpy()
+    if len(np.unique(_labels(y))) != 2:
+        audit.not_applicable("calibration", "more than two classes: per-class calibration is not checked")
+        return
+    if len(y) < MIN_CALIBRATION_ROWS:
+        audit.could_not("calibration", f"fewer than {MIN_CALIBRATION_ROWS} rows with probabilities")
+        return
+    positive = positive_label(y, audit.inv.get("positive_label"))
+    prob = frame[pf["y_prob"]].to_numpy(dtype=float)
+    ece = expected_calibration_error((_labels(y) == positive).astype(float), prob)
+    if ece >= CALIBRATION_ECE:
+        audit.add("miscalibrated", "weak-spots", "medium", "proven", "Predicted probabilities do not match how often the outcome happens",
+                  f"expected calibration error {ece:.3f} over {len(y):,} rows of {pf['path']} (10 equal-width bins; "
+                  f"flagged from {CALIBRATION_ECE:.2f}). The labels may still be right, but the probabilities cannot be "
+                  "read as chances.", counts={"expected_calibration_error": round(ece, 6), "rows": len(y)},
+                  files=[pf["path"]], columns=[pf["y_prob"]])
+    audit.ran("calibration", f"{pf['path']}: expected calibration error {ece:.3f} on {len(y):,} rows")
+
+
+@check_function
+def check_weak_spots(audit: "Audit") -> None:
+    if not audit.wants("weak-spots"):
+        return
+    audit.check("subgroups", "weak-spots", "Subgroups where the model is weaker")
+    audit.check("calibration", "weak-spots", "Calibration of predicted probabilities")
+    preds = [p for p in audit.files("predictions") if p.get("y_true") and p.get("y_pred")]
+    preds = [p for p in preds if p.get("split") == "test"] or preds
+    if not preds:
+        for check_id in ("subgroups", "calibration"):
+            audit.could_not(check_id, "no predictions file with true and predicted values")
+        return
+    try:
+        pf = preds[0]
+        frame, how = _aligned_frame(audit, pf)
+        task = infer_task(frame[pf["y_true"]].to_numpy(), audit.inv.get("task"))
+        check_subgroups(audit, pf, frame, how, task)
+        check_calibration(audit, pf, frame, task)
+    except NeedsPandas as exc:
+        for check_id in ("subgroups", "calibration"):
+            audit.could_not(check_id, str(exc))
 
 
 # ------------------------------------------------------------------ trusted scoring (only with the user's trust)
